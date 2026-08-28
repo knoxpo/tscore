@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "compiler/parser",
+    "compiler/ast",
+    "compiler/types",
+    "compiler/ir",
+    "compiler/optimizer",
+    "runtime/scheduler",
+    "runtime/task",
+    "runtime/actor",
+    "runtime/channel",
+    "runtime/realm",
+    "runtime/memory",
+    "runtime/gc",
+    "runtime/io",
+    "platform/arm64",
+    "platform/riscv64",
+    "platform/linux",
+    "platform/macos",
+    "std/collections",
+    "std/async",
+    "std/parallel",
+    "std/runtime",
+    "cli",
+    "benchmarks/harness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/knoxpo/typescript-core"
+
+[workspace.dependencies]
+# compiler
+tsc-parser = { path = "compiler/parser" }
+tsc-ast = { path = "compiler/ast" }
+tsc-types = { path = "compiler/types" }
+tsc-ir = { path = "compiler/ir" }
+tsc-optimizer = { path = "compiler/optimizer" }
+# runtime
+tsr-scheduler = { path = "runtime/scheduler" }
+tsr-task = { path = "runtime/task" }
+tsr-actor = { path = "runtime/actor" }
+tsr-channel = { path = "runtime/channel" }
+tsr-realm = { path = "runtime/realm" }
+tsr-memory = { path = "runtime/memory" }
+tsr-gc = { path = "runtime/gc" }
+tsr-io = { path = "runtime/io" }
+# platform
+tsp-arm64 = { path = "platform/arm64" }
+tsp-riscv64 = { path = "platform/riscv64" }
+tsp-linux = { path = "platform/linux" }
+tsp-macos = { path = "platform/macos" }
+# std
+tss-collections = { path = "std/collections" }
+tss-async = { path = "std/async" }
+tss-parallel = { path = "std/parallel" }
+tss-runtime = { path = "std/runtime" }
+# external — oxc pinned exact (see docs: subset gate wraps these in tsc-ast)
+oxc_allocator = "=0.133.0"
+oxc_parser = "=0.133.0"
+oxc_ast = "=0.133.0"
+oxc_span = "=0.133.0"
+oxc_syntax = "=0.133.0"
+oxc_diagnostics = "=0.133.0"
+crossbeam-deque = "0.8"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

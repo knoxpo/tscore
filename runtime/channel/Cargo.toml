@@ -1,0 +1,8 @@
+[package]
+name = "tsr-channel"
+description = "Channels with backpressure (stub until M2/M3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

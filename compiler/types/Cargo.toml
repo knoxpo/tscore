@@ -1,0 +1,8 @@
+[package]
+name = "tsc-types"
+description = "Type analysis (stub until M5 typed IR)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

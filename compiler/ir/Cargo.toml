@@ -1,0 +1,8 @@
+[package]
+name = "tsc-ir"
+description = "Bytecode contract: opcodes, FunctionProto, Chunk, disassembler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

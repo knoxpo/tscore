@@ -1,0 +1,10 @@
+[package]
+name = "tsr-io"
+description = "Native I/O: console, time (event loop is M2+)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tsr-realm.workspace = true
+tsr-memory.workspace = true

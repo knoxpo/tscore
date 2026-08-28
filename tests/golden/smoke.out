@@ -1,0 +1,11 @@
+counter: 3
+squares: [ 0, 1, 4, 9, 16 ] len: 5
+sum: 30
+tscore 0.2
+bit: 31 1024 4294967289
+cmp: true object function
+tern: big
+math: 3 9 12
+str: 3 98
+parallel: [ 2, 4, 6 ]
+hits: 5

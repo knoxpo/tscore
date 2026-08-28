@@ -1,0 +1,8 @@
+[package]
+name = "tsb-harness"
+description = "Benchmark harness and speedup reporting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -1,0 +1,17 @@
+[package]
+name = "tscore"
+description = "TypeScript Core CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tscore"
+path = "src/main.rs"
+
+[dependencies]
+tsc-parser.workspace = true
+tsc-ir.workspace = true
+tsr-realm.workspace = true
+tsr-io.workspace = true
+tss-parallel.workspace = true

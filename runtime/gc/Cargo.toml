@@ -1,0 +1,10 @@
+[package]
+name = "tsr-gc"
+description = "Stop-the-realm mark-sweep collector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tsr-memory.workspace = true
+tsc-ir.workspace = true

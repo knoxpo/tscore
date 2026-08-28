@@ -1,0 +1,10 @@
+[package]
+name = "tsc-parser"
+description = "TypeScript parsing + M1 subset gate (OXC wrapper)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tsc-ast.workspace = true
+tsc-ir.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "tsc-optimizer"
+description = "Bytecode/IR optimizer (stub until M5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

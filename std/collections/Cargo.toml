@@ -1,0 +1,8 @@
+[package]
+name = "tss-collections"
+description = "Std collections (stub until M2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

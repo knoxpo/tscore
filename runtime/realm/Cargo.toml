@@ -1,0 +1,11 @@
+[package]
+name = "tsr-realm"
+description = "Realm: heap + globals + bytecode interpreter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tsc-ir.workspace = true
+tsr-memory.workspace = true
+tsr-gc.workspace = true

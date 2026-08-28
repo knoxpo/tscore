@@ -1,0 +1,10 @@
+[package]
+name = "tsr-scheduler"
+description = "Work-stealing multicore scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-deque.workspace = true
+parking_lot.workspace = true

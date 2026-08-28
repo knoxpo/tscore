@@ -1,0 +1,8 @@
+[package]
+name = "tsp-macos"
+description = "macOS platform layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
