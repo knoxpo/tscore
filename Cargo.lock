@@ -56,6 +56,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "417bef24afe1460300965a25ff4a24b8b45ad011948302ec221e8a0a81eb2c79"
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -648,6 +657,7 @@ version = "0.1.0"
 dependencies = [
  "tsc-ir",
  "tsc-parser",
+ "tsr-actor",
  "tsr-io",
  "tsr-realm",
  "tss-parallel",
@@ -672,6 +682,13 @@ version = "0.1.0"
 [[package]]
 name = "tsr-actor"
 version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "tsr-io",
+ "tsr-memory",
+ "tsr-realm",
+ "tsr-task",
+]
 
 [[package]]
 name = "tsr-channel"

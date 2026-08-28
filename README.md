@@ -10,9 +10,10 @@ const results = await parallel.map(records, processRecord);
 // runtime handles: partitioning, work stealing, core placement, isolation
 ```
 
-**Status:** M1 "Multicore Proof" complete — custom bytecode interpreter
-(register machine, per-realm isolated heaps, mark-sweep GC) + work-stealing
-scheduler, ARM64 macOS/Linux.
+**Status:** M2 "Actors + Heap Isolation" complete (M1 "Multicore Proof"
+before it) — custom bytecode interpreter (register machine, per-realm
+isolated heaps, mark-sweep GC), work-stealing scheduler, actor runtime.
+ARM64 macOS/Linux.
 
 ## M1 results (Apple M5 Max, median of runs)
 
@@ -26,6 +27,25 @@ Output is bit-identical at every worker count (clone-at-spawn semantics).
 Single-core absolute speed vs V8 is an explicit non-goal at M1 — the claim
 under test is the multicore programming model; see
 [benchmark methodology](docs/architecture/benchmark-methodology.md).
+
+## Actors (M2)
+
+```typescript
+const counter = actor(() => {
+    let n = 0;
+    return {
+        add: (msg) => { n = n + msg.by; },
+        get: () => n,
+    };
+});
+counter.post({ type: "add", by: 2 });   // fire-and-forget
+counter.send({ type: "get" });          // blocking reply
+```
+
+Each actor owns an isolated realm (heap + GC) on a dedicated thread with a
+bounded mailbox; messages cross realms as structured clones, handler
+failures stay inside the actor. See
+[actors spec](docs/specifications/actors-m2.md).
 
 ## Try it
 

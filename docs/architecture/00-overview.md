@@ -69,6 +69,7 @@ console/time, actors, Node compatibility, full ECMAScript.
 ## Specifications
 
 - [language-subset-m1.md](../specifications/language-subset-m1.md)
+- [actors-m2.md](../specifications/actors-m2.md)
 - [bytecode.md](../specifications/bytecode.md)
 - [concurrency-semantics.md](../specifications/concurrency-semantics.md)
 - [memory-ownership.md](../specifications/memory-ownership.md)
