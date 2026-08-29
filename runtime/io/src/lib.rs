@@ -10,7 +10,7 @@ use tsr_realm::{Realm, RtError};
 
 fn num_arg(args: &[Value], i: usize, who: &str) -> Result<f64, RtError> {
     match args.get(i) {
-        Some(Value::Number(n)) => Ok(*n),
+        Some(v) if v.is_number() => Ok(v.as_number()),
         v => Err(RtError::new(format!(
             "{who}: expected number, got {}",
             v.map_or("nothing", |v| v.type_of())
@@ -29,21 +29,21 @@ pub fn install(realm: &mut Realm) {
         // ponytail: lock stdout per call; enough until output-heavy workloads
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{line}");
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     });
     realm.set_global_obj("console", vec![("log", log)]);
 
     macro_rules! math1 {
         ($realm:ident, $name:literal, $f:expr) => {
             ($name, $realm.add_native(move |_, args| {
-                Ok(Value::Number($f(num_arg(args, 0, $name)?)))
+                Ok(Value::number($f(num_arg(args, 0, $name)?)))
             }))
         };
     }
     macro_rules! math2 {
         ($realm:ident, $name:literal, $f:expr) => {
             ($name, $realm.add_native(move |_, args| {
-                Ok(Value::Number($f(
+                Ok(Value::number($f(
                     num_arg(args, 0, $name)?,
                     num_arg(args, 1, $name)?,
                 )))
@@ -67,7 +67,7 @@ pub fn install(realm: &mut Realm) {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as f64;
-        Ok(Value::Number(ms))
+        Ok(Value::number(ms))
     });
     realm.set_global_obj("Date", vec![("now", now_ms)]);
 
@@ -77,15 +77,16 @@ pub fn install(realm: &mut Realm) {
         use std::time::Instant;
         static START: OnceLock<Instant> = OnceLock::new();
         let start = *START.get_or_init(Instant::now);
-        Ok(Value::Number(start.elapsed().as_secs_f64() * 1000.0))
+        Ok(Value::number(start.elapsed().as_secs_f64() * 1000.0))
     });
     realm.set_global_obj("performance", vec![("now", perf_now)]);
 
     // hidden helper: `s.charCodeAt(i)` compiles to `__charCodeAt(s, i)`
     let char_code_at = realm.add_native(|realm, args| {
-        let s = match args.first() {
-            Some(Value::Str(r)) => realm.heap.str_at(*r).clone(),
-            v => {
+        let s = match args.first().and_then(|v| v.as_str_ref()) {
+            Some(r) => realm.heap.str_at(r).clone(),
+            None => {
+                let v = args.first();
                 return Err(RtError::new(format!(
                     "charCodeAt on {}",
                     v.map_or("nothing", |v| v.type_of())
@@ -94,8 +95,8 @@ pub fn install(realm: &mut Realm) {
         };
         let i = num_arg(args, 1, "charCodeAt")? as usize;
         Ok(match s.chars().nth(i) {
-            Some(c) => Value::Number(c as u32 as f64),
-            None => Value::Number(f64::NAN),
+            Some(c) => Value::number(c as u32 as f64),
+            None => Value::number(f64::NAN),
         })
     });
     realm.set_global("__charCodeAt", char_code_at);

@@ -16,13 +16,16 @@ dominates a simple interpreter.
 ## Values
 
 ```rust
-enum Value { Number(f64), Bool(bool), Null, Undefined,
-             Str(Gc<Str>), Object(Gc<Obj>), Array(Gc<Arr>), Closure(Gc<Closure>) }
+struct Value(u64);   // NaN-boxed
 ```
 
-Tagged enum (16 bytes), **not** NaN-boxed at M1. `Value` sits behind a small
-API so NaN-boxing is a drop-in later optimization. `Gc<T>` handles are valid
-only within their owning realm.
+**NaN-boxed, 8 bytes.** Real doubles use every bit pattern whose top 16
+bits are ≤ 0xFFF8; tags 0xFFF9..=0xFFFF encode null/undefined/bool, string,
+object, array, closure, cell, and native-fn values with a 32-bit payload
+(heap ref / native index). `Value::number` canonicalizes NaN inputs, so
+payload NaNs cannot collide with tags. Off-hot-path code decodes through
+`Value::kind() -> Kind` (an enum view); hot paths use `is_number`/`as_*`
+accessors. Heap refs are valid only within their owning realm.
 
 ## Functions and closures
 

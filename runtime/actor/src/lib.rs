@@ -30,7 +30,7 @@ struct ActorHandle {
 pub fn install(realm: &mut Realm) {
     let spawn = realm.add_native(|realm, args| {
         let setup = match args.first() {
-            Some(&f @ Value::Closure(_)) => f,
+            Some(&f) if f.as_closure().is_some() => f,
             _ => return Err(RtError::new("actor(setupFn): expected a function")),
         };
         let pv_setup = clone_out(&realm.heap, setup).map_err(RtError::new)?;
@@ -53,19 +53,19 @@ pub fn install(realm: &mut Realm) {
         let post = realm.add_native(move |realm, args| {
             let msg = message_arg(realm, args, &h)?;
             h.tx.send(Msg::Deliver(msg, None)).map_err(|_| stopped(&h))?;
-            Ok(Value::Undefined)
+            Ok(Value::UNDEFINED)
         });
         let h = handle.clone();
         let stop = realm.add_native(move |_, _| {
             let _ = h.tx.send(Msg::Stop); // already stopped is fine
-            Ok(Value::Undefined)
+            Ok(Value::UNDEFINED)
         });
 
         let mut obj = tsr_memory::Obj::default();
         obj.set(Arc::from("send"), send);
         obj.set(Arc::from("post"), post);
         obj.set(Arc::from("stop"), stop);
-        Ok(Value::Object(realm.heap.alloc_obj(obj)))
+        Ok(Value::object(realm.heap.alloc_obj(obj)))
     });
     realm.set_global("actor", spawn);
 }
@@ -76,7 +76,7 @@ fn message_arg(
     h: &ActorHandle,
 ) -> Result<PortableValue, RtError> {
     match args.first() {
-        Some(&v @ Value::Object(_)) => clone_out(&realm.heap, v).map_err(RtError::new),
+        Some(&v) if v.as_object().is_some() => clone_out(&realm.heap, v).map_err(RtError::new),
         _ => Err(RtError::new(format!(
             "actor '{}': message must be an object with a 'type' field",
             h.name
@@ -117,7 +117,7 @@ fn actor_main(
 
     let setup = rehydrate(&pv_setup, &mut realm.heap);
     let handlers = match call_value(&mut realm, setup, &[]) {
-        Ok(v @ Value::Object(_)) => v,
+        Ok(v) if v.as_object().is_some() => v,
         Ok(v) => {
             let _ = ready_tx.send(Err(format!(
                 "setup must return an object of handlers, got {}",
@@ -160,17 +160,14 @@ fn deliver(
     pv: &PortableValue,
 ) -> Result<PortableValue, String> {
     let msg = rehydrate(pv, &mut realm.heap);
-    let msg_type = match msg {
-        Value::Object(r) => match realm.heap.obj(r).get("type") {
-            Some(Value::Str(s)) => realm.heap.str_at(s).clone(),
-            _ => return Err("message has no string 'type' field".into()),
+    let msg_type = match msg.as_object() {
+        Some(r) => match realm.heap.obj(r).get("type").and_then(|v| v.as_str_ref()) {
+            Some(s) => realm.heap.str_at(s).clone(),
+            None => return Err("message has no string 'type' field".into()),
         },
-        _ => return Err("message must be an object".into()),
+        None => return Err("message must be an object".into()),
     };
-    let handler = match handlers {
-        Value::Object(r) => realm.heap.obj(r).get(&msg_type),
-        _ => None,
-    };
+    let handler = handlers.as_object().and_then(|r| realm.heap.obj(r).get(&msg_type));
     let Some(handler) = handler else {
         return Err(format!("no handler for message type '{msg_type}'"));
     };
@@ -180,13 +177,13 @@ fn deliver(
 
 /// Actor display name = sorted handler names, for error messages.
 fn actor_name(realm: &Realm, handlers: Value) -> String {
-    match handlers {
-        Value::Object(r) => {
+    match handlers.as_object() {
+        Some(r) => {
             let mut names: Vec<&str> =
                 realm.heap.obj(r).fields.iter().map(|(k, _)| &**k).collect();
             names.sort_unstable();
             format!("{{{}}}", names.join(","))
         }
-        _ => "<actor>".into(),
+        None => "<actor>".into(),
     }
 }

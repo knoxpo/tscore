@@ -45,9 +45,9 @@ pub fn install(realm: &mut Realm, workers: Option<usize>) {
 
     // runtime.cpu.count
     let mut cpu = tsr_memory::Obj::default();
-    cpu.set(Arc::from("count"), Value::Number(n_workers as f64));
+    cpu.set(Arc::from("count"), Value::number(n_workers as f64));
     let cpu_ref = realm.heap.alloc_obj(cpu);
-    realm.set_global_obj("runtime", vec![("cpu", Value::Object(cpu_ref))]);
+    realm.set_global_obj("runtime", vec![("cpu", Value::object(cpu_ref))]);
 }
 
 
@@ -56,9 +56,11 @@ fn run_parallel(
     args: &[Value],
     collect: bool,
 ) -> Result<Value, RtError> {
-    let (arr, f) = match (args.first(), args.get(1)) {
-        (Some(&Value::Array(a)), Some(&f @ Value::Closure(_))) => (a, f),
-        (Some(&Value::Array(_)), Some(&Value::Native(_))) => {
+    let arr = args.first().and_then(|v| v.as_array());
+    let f = args.get(1).copied();
+    let (arr, f) = match (arr, f) {
+        (Some(a), Some(f)) if f.as_closure().is_some() => (a, f),
+        (Some(_), Some(_)) => {
             return Err(RtError::new(
                 "parallel.map: callback must be a TypeScript function",
             ))
@@ -73,9 +75,9 @@ fn run_parallel(
     let n_items = realm.heap.arr(arr).len();
     if n_items == 0 {
         return Ok(if collect {
-            Value::Array(realm.heap.alloc_arr(Vec::new()))
+            Value::array(realm.heap.alloc_arr(Vec::new()))
         } else {
-            Value::Undefined
+            Value::UNDEFINED
         });
     }
 
@@ -134,7 +136,7 @@ fn run_parallel(
         return Err(RtError::new(e));
     }
     if !collect {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     }
     let slots = Arc::try_unwrap(results)
         .map_err(|_| RtError::new("internal: result refs leaked"))?
@@ -144,7 +146,7 @@ fn run_parallel(
         .into_iter()
         .map(|s| rehydrate(&s.expect("chunk skipped without error"), &mut realm.heap))
         .collect();
-    Ok(Value::Array(realm.heap.alloc_arr(vals)))
+    Ok(Value::array(realm.heap.alloc_arr(vals)))
 }
 
 /// Execute one chunk in a fresh scratch realm. The realm (arena) drops at
@@ -164,7 +166,7 @@ fn run_chunk(
     let mut out = Vec::with_capacity(if collect { chunk.len() } else { 0 });
     for (i, item) in chunk {
         let v = rehydrate(item, &mut realm.heap);
-        let r = call_value(&mut realm, f, &[v, Value::Number(*i as f64)])
+        let r = call_value(&mut realm, f, &[v, Value::number(*i as f64)])
             .map_err(|e| e.msg)?;
         if collect {
             out.push((*i, clone_out(&realm.heap, r)?));

@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tsc_ir::FunctionProto;
-use tsr_memory::{Closure, Heap, Obj, Value};
+use tsr_memory::{Closure, Heap, Kind, Obj, Value};
 
 /// Realm-independent value tree. `Send + Sync`: safe to hand to any worker.
 #[derive(Clone, Debug)]
@@ -33,13 +33,13 @@ fn clone_rec(
     v: Value,
     visiting: &mut HashSet<(u8, u32)>,
 ) -> Result<PortableValue, String> {
-    Ok(match v {
-        Value::Number(n) => PortableValue::Number(n),
-        Value::Bool(b) => PortableValue::Bool(b),
-        Value::Null => PortableValue::Null,
-        Value::Undefined => PortableValue::Undefined,
-        Value::Str(r) => PortableValue::Str(heap.str_at(r).clone()),
-        Value::Array(r) => {
+    Ok(match v.kind() {
+        Kind::Number(n) => PortableValue::Number(n),
+        Kind::Bool(b) => PortableValue::Bool(b),
+        Kind::Null => PortableValue::Null,
+        Kind::Undefined => PortableValue::Undefined,
+        Kind::Str(r) => PortableValue::Str(heap.str_at(r).clone()),
+        Kind::Array(r) => {
             if !visiting.insert((0, r)) {
                 return Err("cannot capture cyclic data across realms".into());
             }
@@ -51,7 +51,7 @@ fn clone_rec(
             visiting.remove(&(0, r));
             PortableValue::Array(items)
         }
-        Value::Object(r) => {
+        Kind::Object(r) => {
             if !visiting.insert((1, r)) {
                 return Err("cannot capture cyclic data across realms".into());
             }
@@ -64,7 +64,7 @@ fn clone_rec(
             visiting.remove(&(1, r));
             PortableValue::Object(fields)
         }
-        Value::Closure(r) => {
+        Kind::Closure(r) => {
             if !visiting.insert((2, r)) {
                 return Err("cannot capture cyclic closure across realms".into());
             }
@@ -78,8 +78,8 @@ fn clone_rec(
             visiting.remove(&(2, r));
             pv
         }
-        Value::Cell(_) => return Err("internal: cell escaped registers".into()),
-        Value::Native(_) => {
+        Kind::Cell(_) => return Err("internal: cell escaped registers".into()),
+        Kind::Native(_) => {
             return Err(
                 "cannot capture a native function across realms (reference it \
                  by global name inside the callback instead)"
@@ -92,14 +92,14 @@ fn clone_rec(
 /// Allocate a realm-local copy of a portable tree.
 pub fn rehydrate(pv: &PortableValue, heap: &mut Heap) -> Value {
     match pv {
-        PortableValue::Number(n) => Value::Number(*n),
-        PortableValue::Bool(b) => Value::Bool(*b),
-        PortableValue::Null => Value::Null,
-        PortableValue::Undefined => Value::Undefined,
-        PortableValue::Str(s) => Value::Str(heap.alloc_str(s.clone())),
+        PortableValue::Number(n) => Value::number(*n),
+        PortableValue::Bool(b) => Value::bool(*b),
+        PortableValue::Null => Value::NULL,
+        PortableValue::Undefined => Value::UNDEFINED,
+        PortableValue::Str(s) => Value::str_ref(heap.alloc_str(s.clone())),
         PortableValue::Array(items) => {
             let vals: Vec<Value> = items.iter().map(|x| rehydrate(x, heap)).collect();
-            Value::Array(heap.alloc_arr(vals))
+            Value::array(heap.alloc_arr(vals))
         }
         PortableValue::Object(fields) => {
             let mut obj = Obj::default();
@@ -107,7 +107,7 @@ pub fn rehydrate(pv: &PortableValue, heap: &mut Heap) -> Value {
                 let v = rehydrate(x, heap);
                 obj.set(k.clone(), v);
             }
-            Value::Object(heap.alloc_obj(obj))
+            Value::object(heap.alloc_obj(obj))
         }
         PortableValue::Closure { proto, upvals } => {
             let cells: Vec<u32> = upvals
@@ -117,7 +117,7 @@ pub fn rehydrate(pv: &PortableValue, heap: &mut Heap) -> Value {
                     heap.alloc_cell(v)
                 })
                 .collect();
-            Value::Closure(heap.alloc_closure(Closure {
+            Value::closure(heap.alloc_closure(Closure {
                 proto: proto.clone(),
                 upvals: cells,
             }))
@@ -133,21 +133,21 @@ mod tests {
     fn roundtrip_nested() {
         let mut a = Heap::new();
         let s = a.alloc_str(Arc::from("hi"));
-        let inner = a.alloc_arr(vec![Value::Number(1.0), Value::Str(s)]);
+        let inner = a.alloc_arr(vec![Value::number(1.0), Value::str_ref(s)]);
         let mut obj = Obj::default();
-        obj.set(Arc::from("xs"), Value::Array(inner));
-        obj.set(Arc::from("ok"), Value::Bool(true));
+        obj.set(Arc::from("xs"), Value::array(inner));
+        obj.set(Arc::from("ok"), Value::bool(true));
         let o = a.alloc_obj(obj);
 
-        let pv = clone_out(&a, Value::Object(o)).unwrap();
+        let pv = clone_out(&a, Value::object(o)).unwrap();
         let mut b = Heap::new();
         let v = rehydrate(&pv, &mut b);
-        let Value::Object(r) = v else { panic!() };
+        let Some(r) = v.as_object() else { panic!() };
         let xs = b.obj(r).get("xs").unwrap();
-        let Value::Array(xr) = xs else { panic!() };
+        let Some(xr) = xs.as_array() else { panic!() };
         assert_eq!(b.arr(xr).len(), 2);
         // mutation isolation: heap a untouched by heap b writes
-        b.arr_mut(xr).push(Value::Number(3.0));
+        b.arr_mut(xr).push(Value::number(3.0));
         assert_eq!(a.arr(inner).len(), 2);
     }
 
@@ -155,15 +155,15 @@ mod tests {
     fn cycle_detected() {
         let mut h = Heap::new();
         let arr = h.alloc_arr(vec![]);
-        h.arr_mut(arr).push(Value::Array(arr));
-        assert!(clone_out(&h, Value::Array(arr)).unwrap_err().contains("cyclic"));
+        h.arr_mut(arr).push(Value::array(arr));
+        assert!(clone_out(&h, Value::array(arr)).unwrap_err().contains("cyclic"));
     }
 
     #[test]
     fn sibling_references_are_not_cycles() {
         let mut h = Heap::new();
-        let shared = h.alloc_arr(vec![Value::Number(1.0)]);
-        let outer = h.alloc_arr(vec![Value::Array(shared), Value::Array(shared)]);
-        clone_out(&h, Value::Array(outer)).unwrap();
+        let shared = h.alloc_arr(vec![Value::number(1.0)]);
+        let outer = h.alloc_arr(vec![Value::array(shared), Value::array(shared)]);
+        clone_out(&h, Value::array(outer)).unwrap();
     }
 }

@@ -62,23 +62,31 @@ pub fn install(realm: &mut Realm) {
                 return Err(RtError::cancelled());
             }
         }
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     });
     realm.set_global_obj("Runtime", vec![("checkCancellation", check)]);
 }
 
 fn task_scope(realm: &mut Realm, args: &[Value]) -> Result<Value, RtError> {
     let cb = match args.first() {
-        Some(&f @ Value::Closure(_)) => f,
+        Some(&f) if f.as_closure().is_some() => f,
         _ => return Err(RtError::new("task.scope(fn): expected a function")),
     };
     let timeout_ms = match args.get(1) {
-        Some(&Value::Object(r)) => match realm.heap.obj(r).get("timeout") {
-            Some(Value::Number(n)) if n > 0.0 => Some(n),
-            Some(_) => return Err(RtError::new("task.scope: timeout must be a positive number")),
-            None => None,
-        },
-        None | Some(&Value::Undefined) => None,
+        Some(v) if v.as_object().is_some() => {
+            let r = v.as_object().unwrap();
+            match realm.heap.obj(r).get("timeout") {
+                Some(t) if t.is_number() && t.as_number() > 0.0 => Some(t.as_number()),
+                Some(_) => {
+                    return Err(RtError::new(
+                        "task.scope: timeout must be a positive number",
+                    ))
+                }
+                None => None,
+            }
+        }
+        None => None,
+        Some(v) if *v == Value::UNDEFINED => None,
         _ => return Err(RtError::new("task.scope: options must be an object")),
     };
 
@@ -109,12 +117,12 @@ fn task_scope(realm: &mut Realm, args: &[Value]) -> Result<Value, RtError> {
     let s = scope.clone();
     let cancel = realm.add_native(move |_, _| {
         s.cancel_children();
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     });
     let mut obj = tsr_memory::Obj::default();
     obj.set(Arc::from("spawn"), spawn);
     obj.set(Arc::from("cancel"), cancel);
-    let scope_obj = Value::Object(realm.heap.alloc_obj(obj));
+    let scope_obj = Value::object(realm.heap.alloc_obj(obj));
 
     // callback runs synchronously in the caller's realm
     let cb_result = call_value(realm, cb, &[scope_obj]);
@@ -138,7 +146,7 @@ fn spawn_child(
     scope: &Arc<ScopeState>,
 ) -> Result<Value, RtError> {
     let f = match args.first() {
-        Some(&f @ Value::Closure(_)) => f,
+        Some(&f) if f.as_closure().is_some() => f,
         _ => return Err(RtError::new("scope.spawn(fn): expected a function")),
     };
     if scope.finished.load(Ordering::SeqCst) {
@@ -179,7 +187,7 @@ fn spawn_child(
     let c = child.clone();
     let cancel = realm.add_native(move |_, _| {
         c.cancel.store(true, Ordering::SeqCst);
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     });
     let c = child;
     let join = realm.add_native(move |realm, _| {
@@ -194,7 +202,7 @@ fn spawn_child(
     let mut obj = tsr_memory::Obj::default();
     obj.set(Arc::from("cancel"), cancel);
     obj.set(Arc::from("join"), join);
-    Ok(Value::Object(realm.heap.alloc_obj(obj)))
+    Ok(Value::object(realm.heap.alloc_obj(obj)))
 }
 
 /// Run one child task in a scratch realm wired to its cancel flag.

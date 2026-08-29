@@ -93,7 +93,7 @@ impl Realm {
         f: impl Fn(&mut Realm, &[Value]) -> Result<Value, RtError> + Send + Sync + 'static,
     ) -> Value {
         self.natives.push(Arc::new(f));
-        Value::Native((self.natives.len() - 1) as u32)
+        Value::native((self.natives.len() - 1) as u32)
     }
 
     pub fn set_global(&mut self, name: &str, v: Value) {
@@ -107,11 +107,11 @@ impl Realm {
             obj.set(Arc::from(k), v);
         }
         let r = self.heap.alloc_obj(obj);
-        self.set_global(name, Value::Object(r));
+        self.set_global(name, Value::object(r));
     }
 
     pub fn alloc_string(&mut self, s: &str) -> Value {
-        Value::Str(self.heap.alloc_str(Arc::from(s)))
+        Value::str_ref(self.heap.alloc_str(Arc::from(s)))
     }
 }
 

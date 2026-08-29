@@ -12,8 +12,27 @@ use tsc_ir::FunctionProto;
 /// Index into one of the realm heap's arenas.
 pub type Ref = u32;
 
+/// NaN-boxed value: 8 bytes. Real doubles occupy every bit pattern whose
+/// top 16 bits are ≤ 0xFFF8 (hardware NaNs are 0x7FF8/0xFFF8-prefixed and
+/// user code cannot craft payload NaNs — `Value::number` canonicalizes any
+/// NaN input). Tags 0xFFF9..=0xFFFF encode non-number values with a 32-bit
+/// payload (heap `Ref` / native index / singleton id).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Value(u64);
+
+const TAG_SHIFT: u32 = 48;
+const TAG_SPECIAL: u64 = 0xFFF9; // payload: 0 null, 1 undefined, 2 false, 3 true
+const TAG_STR: u64 = 0xFFFA;
+const TAG_OBJ: u64 = 0xFFFB;
+const TAG_ARR: u64 = 0xFFFC;
+const TAG_CLOSURE: u64 = 0xFFFD;
+const TAG_CELL: u64 = 0xFFFE;
+const TAG_NATIVE: u64 = 0xFFFF;
+const CANON_NAN: u64 = 0x7FF8_0000_0000_0000;
+
+/// Decoded view of a [`Value`] for match sites off the hot path.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Value {
+pub enum Kind {
     Number(f64),
     Bool(bool),
     Null,
@@ -25,6 +44,131 @@ pub enum Value {
     Cell(Ref),
     /// Index into the realm's native function table.
     Native(u32),
+}
+
+impl Value {
+    pub const NULL: Value = Value((TAG_SPECIAL << TAG_SHIFT) | 0);
+    pub const UNDEFINED: Value = Value((TAG_SPECIAL << TAG_SHIFT) | 1);
+    pub const FALSE: Value = Value((TAG_SPECIAL << TAG_SHIFT) | 2);
+    pub const TRUE: Value = Value((TAG_SPECIAL << TAG_SHIFT) | 3);
+
+    #[inline(always)]
+    pub fn number(n: f64) -> Value {
+        if n.is_nan() {
+            Value(CANON_NAN)
+        } else {
+            Value(n.to_bits())
+        }
+    }
+
+    /// For values already known non-NaN (int-derived); skips the
+    /// canonicalization branch.
+    #[inline(always)]
+    pub fn number_unchecked(n: f64) -> Value {
+        debug_assert!(!n.is_nan());
+        Value(n.to_bits())
+    }
+
+    #[inline(always)]
+    pub fn bool(b: bool) -> Value {
+        if b { Value::TRUE } else { Value::FALSE }
+    }
+
+    #[inline(always)]
+    fn tagged(tag: u64, payload: u32) -> Value {
+        Value((tag << TAG_SHIFT) | payload as u64)
+    }
+
+    #[inline(always)]
+    pub fn str_ref(r: Ref) -> Value {
+        Value::tagged(TAG_STR, r)
+    }
+    #[inline(always)]
+    pub fn object(r: Ref) -> Value {
+        Value::tagged(TAG_OBJ, r)
+    }
+    #[inline(always)]
+    pub fn array(r: Ref) -> Value {
+        Value::tagged(TAG_ARR, r)
+    }
+    #[inline(always)]
+    pub fn closure(r: Ref) -> Value {
+        Value::tagged(TAG_CLOSURE, r)
+    }
+    #[inline(always)]
+    pub fn cell(r: Ref) -> Value {
+        Value::tagged(TAG_CELL, r)
+    }
+    #[inline(always)]
+    pub fn native(i: u32) -> Value {
+        Value::tagged(TAG_NATIVE, i)
+    }
+
+    #[inline(always)]
+    fn tag(self) -> u64 {
+        self.0 >> TAG_SHIFT
+    }
+    #[inline(always)]
+    fn payload(self) -> u32 {
+        self.0 as u32
+    }
+
+    #[inline(always)]
+    pub fn is_number(self) -> bool {
+        self.tag() < TAG_SPECIAL
+    }
+    #[inline(always)]
+    pub fn as_number(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+    #[inline(always)]
+    pub fn as_closure(self) -> Option<Ref> {
+        (self.tag() == TAG_CLOSURE).then(|| self.payload())
+    }
+    #[inline(always)]
+    pub fn as_cell(self) -> Option<Ref> {
+        (self.tag() == TAG_CELL).then(|| self.payload())
+    }
+    #[inline(always)]
+    pub fn as_array(self) -> Option<Ref> {
+        (self.tag() == TAG_ARR).then(|| self.payload())
+    }
+    #[inline(always)]
+    pub fn as_object(self) -> Option<Ref> {
+        (self.tag() == TAG_OBJ).then(|| self.payload())
+    }
+    #[inline(always)]
+    pub fn as_str_ref(self) -> Option<Ref> {
+        (self.tag() == TAG_STR).then(|| self.payload())
+    }
+
+    #[inline(always)]
+    pub fn kind(self) -> Kind {
+        if self.is_number() {
+            return Kind::Number(self.as_number());
+        }
+        let p = self.payload();
+        match self.tag() {
+            TAG_SPECIAL => match p {
+                0 => Kind::Null,
+                1 => Kind::Undefined,
+                2 => Kind::Bool(false),
+                _ => Kind::Bool(true),
+            },
+            TAG_STR => Kind::Str(p),
+            TAG_OBJ => Kind::Object(p),
+            TAG_ARR => Kind::Array(p),
+            TAG_CLOSURE => Kind::Closure(p),
+            TAG_CELL => Kind::Cell(p),
+            _ => Kind::Native(p),
+        }
+    }
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.kind().fmt(f)
+    }
 }
 
 #[derive(Debug)]
@@ -124,49 +268,60 @@ impl Heap {
 }
 
 impl Value {
+    #[inline(always)]
     pub fn truthy(self, heap: &Heap) -> bool {
-        match self {
-            Value::Bool(b) => b,
-            Value::Number(n) => n != 0.0 && !n.is_nan(),
-            Value::Null | Value::Undefined => false,
-            Value::Str(r) => !heap.str_at(r).is_empty(),
+        if self.is_number() {
+            let n = self.as_number();
+            return n != 0.0 && !n.is_nan();
+        }
+        match self.kind() {
+            Kind::Bool(b) => b,
+            Kind::Null | Kind::Undefined => false,
+            Kind::Str(r) => !heap.str_at(r).is_empty(),
             _ => true,
         }
     }
 
     pub fn type_of(self) -> &'static str {
-        match self {
-            Value::Number(_) => "number",
-            Value::Bool(_) => "boolean",
-            Value::Null => "object",
-            Value::Undefined => "undefined",
-            Value::Str(_) => "string",
-            Value::Object(_) | Value::Array(_) | Value::Cell(_) => "object",
-            Value::Closure(_) | Value::Native(_) => "function",
+        match self.kind() {
+            Kind::Number(_) => "number",
+            Kind::Bool(_) => "boolean",
+            Kind::Null => "object",
+            Kind::Undefined => "undefined",
+            Kind::Str(_) => "string",
+            Kind::Object(_) | Kind::Array(_) | Kind::Cell(_) => "object",
+            Kind::Closure(_) | Kind::Native(_) => "function",
         }
     }
 
-    /// `===` semantics (strings by content, references by identity).
+    /// `===` semantics (numbers by f64 compare — NaN≠NaN, ±0 equal;
+    /// strings by content; references by identity).
+    #[inline(always)]
     pub fn strict_eq(self, other: Value, heap: &Heap) -> bool {
-        match (self, other) {
-            (Value::Str(a), Value::Str(b)) => a == b || heap.str_at(a) == heap.str_at(b),
-            (a, b) => a == b,
+        if self.is_number() || other.is_number() {
+            return self.is_number()
+                && other.is_number()
+                && self.as_number() == other.as_number();
         }
+        if let (Some(a), Some(b)) = (self.as_str_ref(), other.as_str_ref()) {
+            return a == b || heap.str_at(a) == heap.str_at(b);
+        }
+        self == other
     }
 
     pub fn display(self, heap: &Heap) -> String {
-        match self {
-            Value::Number(n) => fmt_number(n),
-            Value::Bool(b) => b.to_string(),
-            Value::Null => "null".into(),
-            Value::Undefined => "undefined".into(),
-            Value::Str(r) => heap.str_at(r).to_string(),
-            Value::Array(r) => {
+        match self.kind() {
+            Kind::Number(n) => fmt_number(n),
+            Kind::Bool(b) => b.to_string(),
+            Kind::Null => "null".into(),
+            Kind::Undefined => "undefined".into(),
+            Kind::Str(r) => heap.str_at(r).to_string(),
+            Kind::Array(r) => {
                 let items: Vec<String> =
                     heap.arr(r).iter().map(|v| v.display(heap)).collect();
                 format!("[ {} ]", items.join(", "))
             }
-            Value::Object(r) => {
+            Kind::Object(r) => {
                 let fields: Vec<String> = heap
                     .obj(r)
                     .fields
@@ -175,8 +330,8 @@ impl Value {
                     .collect();
                 format!("{{ {} }}", fields.join(", "))
             }
-            Value::Closure(_) | Value::Native(_) => "[Function]".into(),
-            Value::Cell(_) => "[Cell]".into(),
+            Kind::Closure(_) | Kind::Native(_) => "[Function]".into(),
+            Kind::Cell(_) => "[Cell]".into(),
         }
     }
 }

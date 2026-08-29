@@ -5,7 +5,7 @@
 //! realms (parallel chunks) never collect — they drop wholesale.
 //! Per-realm heaps mean this never synchronizes across threads.
 
-use tsr_memory::{Heap, Ref, Value};
+use tsr_memory::{Heap, Kind, Ref, Value};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GcStats {
@@ -41,28 +41,28 @@ pub fn collect<'a>(
     work.extend(globals.copied());
 
     while let Some(v) = work.pop() {
-        match v {
-            Value::Str(r) => {
+        match v.kind() {
+            Kind::Str(r) => {
                 m.strs[r as usize] = true;
             }
-            Value::Object(r) => {
+            Kind::Object(r) => {
                 if !mark(&mut m.objs, r) {
                     work.extend(heap.objs[r as usize].fields.iter().map(|(_, v)| *v));
                 }
             }
-            Value::Array(r) => {
+            Kind::Array(r) => {
                 if !mark(&mut m.arrs, r) {
                     work.extend_from_slice(&heap.arrs[r as usize]);
                 }
             }
-            Value::Closure(r) => {
+            Kind::Closure(r) => {
                 if !mark(&mut m.closures, r) {
                     work.extend(
-                        heap.closures[r as usize].upvals.iter().map(|&c| Value::Cell(c)),
+                        heap.closures[r as usize].upvals.iter().map(|&c| Value::cell(c)),
                     );
                 }
             }
-            Value::Cell(r) => {
+            Kind::Cell(r) => {
                 if !mark(&mut m.cells, r) {
                     work.push(heap.cells[r as usize]);
                 }
@@ -85,7 +85,7 @@ pub fn collect<'a>(
         heap.closures[r as usize].upvals = Vec::new();
     });
     freed += sweep(&m.cells, &mut heap.free_cells, |r| {
-        heap.cells[r as usize] = Value::Undefined;
+        heap.cells[r as usize] = Value::UNDEFINED;
     });
 
     let total = heap.strs.len()
@@ -128,14 +128,14 @@ mod tests {
     #[test]
     fn collects_garbage_keeps_live() {
         let mut heap = Heap::new();
-        let live_arr = heap.alloc_arr(vec![Value::Number(7.0)]);
+        let live_arr = heap.alloc_arr(vec![Value::number(7.0)]);
         for i in 0..1000 {
             heap.alloc_str(Arc::from(format!("garbage {i}").as_str()));
         }
         let live_str = heap.alloc_str(Arc::from("keep"));
-        heap.arr_mut(live_arr).push(Value::Str(live_str));
+        heap.arr_mut(live_arr).push(Value::str_ref(live_str));
 
-        let roots = [Value::Array(live_arr)];
+        let roots = [Value::array(live_arr)];
         let mut stats = GcStats::default();
         collect(&mut heap, &roots, [].iter(), &mut stats);
 
@@ -153,7 +153,7 @@ mod tests {
     fn closure_cycle_via_cells_is_collected() {
         let mut heap = Heap::new();
         // cell -> closure -> cell (cycle), unreachable from roots
-        let cell = heap.alloc_cell(Value::Undefined);
+        let cell = heap.alloc_cell(Value::UNDEFINED);
         let proto = Arc::new(tsc_ir::FunctionProto {
             name: Arc::from("f"),
             arity: 0,
@@ -165,7 +165,7 @@ mod tests {
             spans: vec![],
         });
         let clo = heap.alloc_closure(tsr_memory::Closure { proto, upvals: vec![cell] });
-        *heap.cell_mut(cell) = Value::Closure(clo);
+        *heap.cell_mut(cell) = Value::closure(clo);
 
         let mut stats = GcStats::default();
         collect(&mut heap, &[], [].iter(), &mut stats);

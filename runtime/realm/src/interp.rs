@@ -1,22 +1,22 @@
-//! Register-machine bytecode interpreter.
+//! Register-machine bytecode interpreter over NaN-boxed values.
 
 use crate::{Realm, RtError};
 use std::sync::Arc;
 use tsc_ir::{Const, FunctionProto, Op, UpvalSrc};
-use tsr_memory::{to_int32, to_uint32, Closure, Value};
+use tsr_memory::{to_int32, to_uint32, Closure, Kind, Value};
 
 /// Call any callable value with the given arguments (entry point for the
 /// CLI and for natives like `parallel.map` that re-enter the interpreter).
 pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, RtError> {
     let base = realm.stack.len();
-    match f {
-        Value::Native(i) => {
+    match f.kind() {
+        Kind::Native(i) => {
             let native = realm.natives[i as usize].clone();
             native(realm, args)
         }
-        Value::Closure(c) => {
+        Kind::Closure(c) => {
             let proto = realm.heap.closure(c).proto.clone();
-            realm.stack.resize(base + proto.n_regs as usize, Value::Undefined);
+            realm.stack.resize(base + proto.n_regs as usize, Value::UNDEFINED);
             let n = (proto.arity as usize).min(args.len());
             realm.stack[base..base + n].copy_from_slice(&args[..n]);
             let result = run_frame(realm, Some(c), &proto, base);
@@ -30,7 +30,7 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
 /// Run the top-level chunk in the realm.
 pub fn run_main(realm: &mut Realm, main: &Arc<FunctionProto>) -> Result<Value, RtError> {
     let base = realm.stack.len();
-    realm.stack.resize(base + main.n_regs as usize, Value::Undefined);
+    realm.stack.resize(base + main.n_regs as usize, Value::UNDEFINED);
     let result = run_frame(realm, None, main, base);
     realm.stack.truncate(base);
     result
@@ -60,12 +60,15 @@ macro_rules! num_bin {
     ($realm:ident, $proto:ident, $pc:ident, $ins:ident, $base:ident, $f:expr) => {{
         let b = reg!($realm, $base + $ins.b as usize);
         let c = reg!($realm, $base + $ins.c as usize);
-        match (b, c) {
-            (Value::Number(x), Value::Number(y)) => {
-                set_reg!($realm, $base + $ins.a as usize, Value::Number($f(x, y)));
-            }
-            _ => return Err(err($proto, $pc, format!(
-                "cannot apply arithmetic to {} and {}", b.type_of(), c.type_of()))),
+        if b.is_number() && c.is_number() {
+            set_reg!(
+                $realm,
+                $base + $ins.a as usize,
+                Value::number($f(b.as_number(), c.as_number()))
+            );
+        } else {
+            return Err(err($proto, $pc, format!(
+                "cannot apply arithmetic to {} and {}", b.type_of(), c.type_of())));
         }
     }};
 }
@@ -74,7 +77,22 @@ macro_rules! int_bin {
     ($realm:ident, $ins:ident, $base:ident, $f:expr) => {{
         let x = to_num(reg!($realm, $base + $ins.b as usize));
         let y = to_num(reg!($realm, $base + $ins.c as usize));
-        set_reg!($realm, $base + $ins.a as usize, Value::Number($f(x, y)));
+        // int-derived results are never NaN
+        set_reg!($realm, $base + $ins.a as usize, Value::number_unchecked($f(x, y)));
+    }};
+}
+
+/// Evaluate a comparison; errors on non-number/non-string operand mixes.
+macro_rules! cmp_eval {
+    ($realm:ident, $proto:ident, $pc:ident, $b:ident, $c:ident, $nf:expr, $sf:expr) => {{
+        if $b.is_number() && $c.is_number() {
+            $nf(&$b.as_number(), &$c.as_number())
+        } else if let (Some(x), Some(y)) = ($b.as_str_ref(), $c.as_str_ref()) {
+            $sf(&*$realm.heap.str_at(x).clone(), &*$realm.heap.str_at(y).clone())
+        } else {
+            return Err(err($proto, $pc, format!(
+                "cannot compare {} and {}", $b.type_of(), $c.type_of())));
+        }
     }};
 }
 
@@ -82,15 +100,8 @@ macro_rules! cmp_bin {
     ($realm:ident, $proto:ident, $pc:ident, $ins:ident, $base:ident, $nf:expr, $sf:expr) => {{
         let b = reg!($realm, $base + $ins.b as usize);
         let c = reg!($realm, $base + $ins.c as usize);
-        let r = match (b, c) {
-            (Value::Number(x), Value::Number(y)) => $nf(&x, &y),
-            (Value::Str(x), Value::Str(y)) => {
-                $sf(&*$realm.heap.str_at(x).clone(), &*$realm.heap.str_at(y).clone())
-            }
-            _ => return Err(err($proto, $pc, format!(
-                "cannot compare {} and {}", b.type_of(), c.type_of()))),
-        };
-        set_reg!($realm, $base + $ins.a as usize, Value::Bool(r));
+        let r = cmp_eval!($realm, $proto, $pc, b, c, $nf, $sf);
+        set_reg!($realm, $base + $ins.a as usize, Value::bool(r));
     }};
 }
 
@@ -98,24 +109,18 @@ macro_rules! cmp_skip {
     ($realm:ident, $proto:ident, $pc:ident, $ins:ident, $base:ident, $nf:expr, $sf:expr) => {{
         let b = reg!($realm, $base + $ins.b as usize);
         let c = reg!($realm, $base + $ins.c as usize);
-        let r = match (b, c) {
-            (Value::Number(x), Value::Number(y)) => $nf(&x, &y),
-            (Value::Str(x), Value::Str(y)) => {
-                $sf(&*$realm.heap.str_at(x).clone(), &*$realm.heap.str_at(y).clone())
-            }
-            _ => return Err(err($proto, $pc, format!(
-                "cannot compare {} and {}", b.type_of(), c.type_of()))),
-        };
-        if r {
+        if cmp_eval!($realm, $proto, $pc, b, c, $nf, $sf) {
             $pc += 1;
         }
     }};
 }
 
+#[inline(always)]
 fn to_num(v: Value) -> f64 {
-    match v {
-        Value::Number(n) => n,
-        _ => f64::NAN,
+    if v.is_number() {
+        v.as_number()
+    } else {
+        f64::NAN
     }
 }
 
@@ -160,34 +165,34 @@ fn run_frame(
         let a = base + ins.a as usize;
         match ins.op {
             Op::LoadConst => {
-                realm.stack[a] = match &proto.consts[ins.bx() as usize] {
-                    Const::Number(n) => Value::Number(*n),
+                let v = match &proto.consts[ins.bx() as usize] {
+                    Const::Number(n) => Value::number(*n),
                     Const::Str(s) => {
-                        let r = realm.heap.alloc_str(s.clone());
-                        Value::Str(r)
+                        let s = s.clone();
+                        Value::str_ref(realm.heap.alloc_str(s))
                     }
-                }
+                };
+                set_reg!(realm, a, v);
             }
-            Op::LoadInt => realm.stack[a] = Value::Number(ins.sbx() as f64),
-            Op::LoadBool => realm.stack[a] = Value::Bool(ins.b != 0),
-            Op::LoadNull => realm.stack[a] = Value::Null,
-            Op::LoadUndef => realm.stack[a] = Value::Undefined,
-            Op::Move => realm.stack[a] = reg!(realm, base + ins.b as usize),
+            Op::LoadInt => set_reg!(realm, a, Value::number_unchecked(ins.sbx() as f64)),
+            Op::LoadBool => set_reg!(realm, a, Value::bool(ins.b != 0)),
+            Op::LoadNull => set_reg!(realm, a, Value::NULL),
+            Op::LoadUndef => set_reg!(realm, a, Value::UNDEFINED),
+            Op::Move => set_reg!(realm, a, reg!(realm, base + ins.b as usize)),
 
             Op::Add => {
                 let b = reg!(realm, base + ins.b as usize);
                 let c = reg!(realm, base + ins.c as usize);
-                realm.stack[a] = match (b, c) {
-                    (Value::Number(x), Value::Number(y)) => Value::Number(x + y),
-                    (Value::Str(_), _) | (_, Value::Str(_)) => {
-                        let s = format!("{}{}", b.display(&realm.heap), c.display(&realm.heap));
-                        realm.alloc_string(&s)
-                    }
-                    _ => {
-                        return Err(err(proto, pc, format!(
-                            "cannot add {} and {}", b.type_of(), c.type_of())))
-                    }
-                };
+                if b.is_number() && c.is_number() {
+                    set_reg!(realm, a, Value::number(b.as_number() + c.as_number()));
+                } else if b.as_str_ref().is_some() || c.as_str_ref().is_some() {
+                    let s = format!("{}{}", b.display(&realm.heap), c.display(&realm.heap));
+                    let v = realm.alloc_string(&s);
+                    set_reg!(realm, a, v);
+                } else {
+                    return Err(err(proto, pc, format!(
+                        "cannot add {} and {}", b.type_of(), c.type_of())));
+                }
             }
             Op::Sub => num_bin!(realm, proto, pc, ins, base, |x: f64, y: f64| x - y),
             Op::Mul => num_bin!(realm, proto, pc, ins, base, |x: f64, y: f64| x * y),
@@ -196,9 +201,10 @@ fn run_frame(
             Op::Pow => num_bin!(realm, proto, pc, ins, base, |x: f64, y: f64| x.powf(y)),
             Op::Neg => {
                 let b = reg!(realm, base + ins.b as usize);
-                match b {
-                    Value::Number(n) => realm.stack[a] = Value::Number(-n),
-                    _ => return Err(err(proto, pc, format!("cannot negate {}", b.type_of()))),
+                if b.is_number() {
+                    set_reg!(realm, a, Value::number(-b.as_number()));
+                } else {
+                    return Err(err(proto, pc, format!("cannot negate {}", b.type_of())));
                 }
             }
 
@@ -216,18 +222,18 @@ fn run_frame(
             }),
             Op::BitNot => {
                 let x = to_num(reg!(realm, base + ins.b as usize));
-                set_reg!(realm, a, Value::Number(!to_int32(x) as f64));
+                set_reg!(realm, a, Value::number_unchecked(!to_int32(x) as f64));
             }
 
             Op::Eq => {
                 let b = reg!(realm, base + ins.b as usize);
                 let c = reg!(realm, base + ins.c as usize);
-                set_reg!(realm, a, Value::Bool(b.strict_eq(c, &realm.heap)));
+                set_reg!(realm, a, Value::bool(b.strict_eq(c, &realm.heap)));
             }
             Op::Ne => {
                 let b = reg!(realm, base + ins.b as usize);
                 let c = reg!(realm, base + ins.c as usize);
-                set_reg!(realm, a, Value::Bool(!b.strict_eq(c, &realm.heap)));
+                set_reg!(realm, a, Value::bool(!b.strict_eq(c, &realm.heap)));
             }
             Op::EqSkip => {
                 let b = reg!(realm, base + ins.b as usize);
@@ -253,7 +259,7 @@ fn run_frame(
             Op::Ge => cmp_bin!(realm, proto, pc, ins, base, |x, y| f64::ge(x, y), str::ge),
             Op::Not => {
                 let b = reg!(realm, base + ins.b as usize);
-                set_reg!(realm, a, Value::Bool(!b.truthy(&realm.heap)));
+                set_reg!(realm, a, Value::bool(!b.truthy(&realm.heap)));
             }
 
             Op::Jump => {
@@ -264,61 +270,55 @@ fn run_frame(
                 pc = (pc as i64 + ins.sbx() as i64) as usize;
             }
             Op::JumpIfFalse => {
-                if !realm.stack[a].truthy(&realm.heap) {
+                if !reg!(realm, a).truthy(&realm.heap) {
                     pc = (pc as i64 + ins.sbx() as i64) as usize;
                 }
             }
             Op::JumpIfTrue => {
-                if realm.stack[a].truthy(&realm.heap) {
+                if reg!(realm, a).truthy(&realm.heap) {
                     pc = (pc as i64 + ins.sbx() as i64) as usize;
                 }
             }
 
             Op::Call => {
-                let f = realm.stack[a];
+                let f = reg!(realm, a);
                 let argc = ins.b as usize;
-                match f {
-                    Value::Closure(c) => {
-                        realm.safepoint().map_err(|e| at(e, proto, pc))?;
-                        let callee = realm.heap.closure(c).proto.clone();
-                        let new_base = a + 1;
-                        let need = new_base + callee.n_regs as usize;
-                        if realm.stack.len() < need {
-                            realm.stack.resize(need, Value::Undefined);
-                        }
-                        // missing args become undefined; other registers are
-                        // def-before-use by the emitter (stale values only
-                        // over-retain during GC, never misread)
-                        for r in argc..callee.arity as usize {
-                            realm.stack[new_base + r] = Value::Undefined;
-                        }
-                        let result = run_frame(realm, Some(c), &callee, new_base)?;
-                        set_reg!(realm, a, result);
+                if let Some(c) = f.as_closure() {
+                    realm.safepoint().map_err(|e| at(e, proto, pc))?;
+                    let callee = realm.heap.closure(c).proto.clone();
+                    let new_base = a + 1;
+                    let need = new_base + callee.n_regs as usize;
+                    if realm.stack.len() < need {
+                        realm.stack.resize(need, Value::UNDEFINED);
                     }
-                    Value::Native(i) => {
-                        let native = realm.natives[i as usize].clone();
-                        // args on the Rust stack: no per-call Vec alloc
-                        let mut buf = [Value::Undefined; 8];
-                        let result = if argc <= 8 {
-                            buf[..argc]
-                                .copy_from_slice(&realm.stack[a + 1..a + 1 + argc]);
-                            native(realm, &buf[..argc])
-                        } else {
-                            let args: Vec<Value> =
-                                realm.stack[a + 1..a + 1 + argc].to_vec();
-                            native(realm, &args)
-                        }
-                        .map_err(|e| err(proto, pc, e.msg))?;
-                        set_reg!(realm, a, result);
+                    // missing args become undefined; other registers are
+                    // def-before-use by the emitter (stale values only
+                    // over-retain during GC, never misread)
+                    for r in argc..callee.arity as usize {
+                        set_reg!(realm, new_base + r, Value::UNDEFINED);
                     }
-                    _ => {
-                        return Err(err(proto, pc, format!(
-                            "{} is not a function", f.type_of())))
+                    let result = run_frame(realm, Some(c), &callee, new_base)?;
+                    set_reg!(realm, a, result);
+                } else if let Kind::Native(i) = f.kind() {
+                    let native = realm.natives[i as usize].clone();
+                    // args on the Rust stack: no per-call Vec alloc
+                    let mut buf = [Value::UNDEFINED; 8];
+                    let result = if argc <= 8 {
+                        buf[..argc].copy_from_slice(&realm.stack[a + 1..a + 1 + argc]);
+                        native(realm, &buf[..argc])
+                    } else {
+                        let args: Vec<Value> = realm.stack[a + 1..a + 1 + argc].to_vec();
+                        native(realm, &args)
                     }
+                    .map_err(|e| err(proto, pc, e.msg))?;
+                    set_reg!(realm, a, result);
+                } else {
+                    return Err(err(proto, pc, format!(
+                        "{} is not a function", f.type_of())));
                 }
             }
-            Op::Return => return Ok(realm.stack[a]),
-            Op::Halt => return Ok(Value::Undefined),
+            Op::Return => return Ok(reg!(realm, a)),
+            Op::Halt => return Ok(Value::UNDEFINED),
 
             Op::Closure => {
                 let child = proto.protos[ins.bx() as usize].clone();
@@ -326,11 +326,11 @@ fn run_frame(
                 for u in &child.upvals {
                     let cell = match *u {
                         UpvalSrc::ParentLocal(reg) => {
-                            match reg!(realm, base + reg as usize) {
-                                Value::Cell(r) => r,
-                                v => {
-                                    return Err(err(proto, pc, format!(
-                                        "internal: captured slot holds {}", v.type_of())))
+                            match reg!(realm, base + reg as usize).as_cell() {
+                                Some(r) => r,
+                                None => {
+                                    return Err(err(proto, pc,
+                                        "internal: captured slot is not a cell".into()))
                                 }
                             }
                         }
@@ -342,24 +342,20 @@ fn run_frame(
                     upvals.push(cell);
                 }
                 let r = realm.heap.alloc_closure(Closure { proto: child, upvals });
-                set_reg!(realm, a, Value::Closure(r));
+                set_reg!(realm, a, Value::closure(r));
             }
             Op::NewCell => {
-                let init = realm.stack[a];
+                let init = reg!(realm, a);
                 let r = realm.heap.alloc_cell(init);
-                set_reg!(realm, a, Value::Cell(r));
+                set_reg!(realm, a, Value::cell(r));
             }
-            Op::LoadCell => match reg!(realm, base + ins.b as usize) {
-                Value::Cell(r) => realm.stack[a] = *realm.heap.cell(r),
-                v => return Err(err(proto, pc, format!(
-                    "internal: LoadCell on {}", v.type_of()))),
+            Op::LoadCell => match reg!(realm, base + ins.b as usize).as_cell() {
+                Some(r) => set_reg!(realm, a, *realm.heap.cell(r)),
+                None => return Err(err(proto, pc, "internal: LoadCell on non-cell".into())),
             },
-            Op::StoreCell => match realm.stack[a] {
-                Value::Cell(r) => {
-                    *realm.heap.cell_mut(r) = reg!(realm, base + ins.b as usize)
-                }
-                v => return Err(err(proto, pc, format!(
-                    "internal: StoreCell on {}", v.type_of()))),
+            Op::StoreCell => match reg!(realm, a).as_cell() {
+                Some(r) => *realm.heap.cell_mut(r) = reg!(realm, base + ins.b as usize),
+                None => return Err(err(proto, pc, "internal: StoreCell on non-cell".into())),
             },
             Op::GetUpval => {
                 let c = closure.expect("GetUpval outside closure");
@@ -374,106 +370,119 @@ fn run_frame(
 
             Op::NewObject => {
                 let r = realm.heap.alloc_obj(Default::default());
-                set_reg!(realm, a, Value::Object(r));
+                set_reg!(realm, a, Value::object(r));
             }
             Op::NewArray => {
                 let r = realm.heap.alloc_arr(Vec::with_capacity(ins.b as usize));
-                set_reg!(realm, a, Value::Array(r));
+                set_reg!(realm, a, Value::array(r));
             }
             Op::GetField => {
                 let obj = reg!(realm, base + ins.b as usize);
                 let name = const_str(proto, ins.c as usize);
-                realm.stack[a] = get_field(realm, obj, name)
-                    .map_err(|e| err(proto, pc, e.msg))?;
+                let v = get_field(realm, obj, name).map_err(|e| err(proto, pc, e.msg))?;
+                set_reg!(realm, a, v);
             }
             Op::SetField => {
                 let name = const_str_arc(proto, ins.b as usize);
                 let v = reg!(realm, base + ins.c as usize);
-                match realm.stack[a] {
-                    Value::Object(r) => realm.heap.obj_mut(r).set(name, v),
-                    t => return Err(err(proto, pc, format!(
-                        "cannot set property on {}", t.type_of()))),
+                match reg!(realm, a).as_object() {
+                    Some(r) => realm.heap.obj_mut(r).set(name, v),
+                    None => return Err(err(proto, pc, format!(
+                        "cannot set property on {}", reg!(realm, a).type_of()))),
                 }
             }
             Op::GetIndex => {
                 let obj = reg!(realm, base + ins.b as usize);
                 let idx = reg!(realm, base + ins.c as usize);
-                realm.stack[a] = match (obj, idx) {
-                    (Value::Array(r), Value::Number(n)) => {
-                        realm.heap.arr(r).get(n as usize).copied()
-                            .unwrap_or(Value::Undefined)
+                let v = if idx.is_number() {
+                    match obj.as_array() {
+                        Some(r) => realm
+                            .heap
+                            .arr(r)
+                            .get(idx.as_number() as usize)
+                            .copied()
+                            .unwrap_or(Value::UNDEFINED),
+                        None => return Err(err(proto, pc, format!(
+                            "cannot index {} with number", obj.type_of()))),
                     }
-                    (Value::Object(_), Value::Str(s)) => {
-                        let name = realm.heap.str_at(s).clone();
-                        get_field(realm, obj, &name)
-                            .map_err(|e| err(proto, pc, e.msg))?
-                    }
-                    _ => return Err(err(proto, pc, format!(
-                        "cannot index {} with {}", obj.type_of(), idx.type_of()))),
+                } else if let (Some(_), Some(s)) = (obj.as_object(), idx.as_str_ref()) {
+                    let name = realm.heap.str_at(s).clone();
+                    get_field(realm, obj, &name).map_err(|e| err(proto, pc, e.msg))?
+                } else {
+                    return Err(err(proto, pc, format!(
+                        "cannot index {} with {}", obj.type_of(), idx.type_of())));
                 };
+                set_reg!(realm, a, v);
             }
             Op::SetIndex => {
                 let idx = reg!(realm, base + ins.b as usize);
                 let v = reg!(realm, base + ins.c as usize);
-                match (realm.stack[a], idx) {
-                    (Value::Array(r), Value::Number(n)) => {
-                        let arr = realm.heap.arr_mut(r);
-                        let i = n as usize;
-                        if i < arr.len() {
-                            arr[i] = v;
-                        } else if i == arr.len() {
-                            arr.push(v);
-                        } else {
-                            return Err(err(proto, pc,
-                                "sparse arrays not supported in M1".into()));
+                let target = reg!(realm, a);
+                if idx.is_number() {
+                    match target.as_array() {
+                        Some(r) => {
+                            let arr = realm.heap.arr_mut(r);
+                            let i = idx.as_number() as usize;
+                            if i < arr.len() {
+                                arr[i] = v;
+                            } else if i == arr.len() {
+                                arr.push(v);
+                            } else {
+                                return Err(err(proto, pc,
+                                    "sparse arrays not supported in M1".into()));
+                            }
                         }
+                        None => return Err(err(proto, pc, format!(
+                            "cannot index-assign {} with number", target.type_of()))),
                     }
-                    (Value::Object(r), Value::Str(s)) => {
-                        let name = realm.heap.str_at(s).clone();
-                        realm.heap.obj_mut(r).set(name, v);
-                    }
-                    (t, i) => return Err(err(proto, pc, format!(
-                        "cannot index-assign {} with {}", t.type_of(), i.type_of()))),
+                } else if let (Some(r), Some(s)) = (target.as_object(), idx.as_str_ref()) {
+                    let name = realm.heap.str_at(s).clone();
+                    realm.heap.obj_mut(r).set(name, v);
+                } else {
+                    return Err(err(proto, pc, format!(
+                        "cannot index-assign {} with {}", target.type_of(), idx.type_of())));
                 }
             }
             Op::Len => {
                 let b = reg!(realm, base + ins.b as usize);
-                realm.stack[a] = match b {
-                    Value::Array(r) => Value::Number(realm.heap.arr(r).len() as f64),
-                    Value::Str(r) => {
-                        // ponytail: byte length == char length for ASCII benchmarks;
-                        // UTF-16 length when strings grow up
-                        Value::Number(realm.heap.str_at(r).chars().count() as f64)
-                    }
-                    _ => return Err(err(proto, pc, format!(
-                        "{} has no length", b.type_of()))),
+                let v = if let Some(r) = b.as_array() {
+                    Value::number(realm.heap.arr(r).len() as f64)
+                } else if let Some(r) = b.as_str_ref() {
+                    // ponytail: char count; UTF-16 length when strings grow up
+                    Value::number(realm.heap.str_at(r).chars().count() as f64)
+                } else {
+                    return Err(err(proto, pc, format!("{} has no length", b.type_of())));
                 };
+                set_reg!(realm, a, v);
             }
             Op::ArrayPush => {
                 let v = reg!(realm, base + ins.b as usize);
-                match realm.stack[a] {
-                    Value::Array(r) => realm.heap.arr_mut(r).push(v),
-                    t => return Err(err(proto, pc, format!(
-                        "cannot push onto {}", t.type_of()))),
+                match reg!(realm, a).as_array() {
+                    Some(r) => realm.heap.arr_mut(r).push(v),
+                    None => return Err(err(proto, pc, format!(
+                        "cannot push onto {}", reg!(realm, a).type_of()))),
                 }
             }
 
             Op::GetGlobal => {
                 let name = const_str(proto, ins.bx() as usize);
-                realm.stack[a] = *realm.globals.get(name).ok_or_else(|| {
+                let v = *realm.globals.get(name).ok_or_else(|| {
                     err(proto, pc, format!("{name} is not defined"))
                 })?;
+                set_reg!(realm, a, v);
             }
 
             Op::Concat => {
                 let b = reg!(realm, base + ins.b as usize);
                 let c = reg!(realm, base + ins.c as usize);
                 let s = format!("{}{}", b.display(&realm.heap), c.display(&realm.heap));
-                set_reg!(realm, a, realm.alloc_string(&s));
+                let v = realm.alloc_string(&s);
+                set_reg!(realm, a, v);
             }
             Op::TypeOf => {
                 let b = reg!(realm, base + ins.b as usize);
-                set_reg!(realm, a, realm.alloc_string(b.type_of()));
+                let v = realm.alloc_string(b.type_of());
+                set_reg!(realm, a, v);
             }
         }
         pc += 1;
@@ -481,13 +490,13 @@ fn run_frame(
 }
 
 fn get_field(realm: &mut Realm, obj: Value, name: &str) -> Result<Value, RtError> {
-    match obj {
-        Value::Object(r) => Ok(realm.heap.obj(r).get(name).unwrap_or(Value::Undefined)),
-        Value::Array(r) if name == "length" => {
-            Ok(Value::Number(realm.heap.arr(r).len() as f64))
+    match obj.kind() {
+        Kind::Object(r) => Ok(realm.heap.obj(r).get(name).unwrap_or(Value::UNDEFINED)),
+        Kind::Array(r) if name == "length" => {
+            Ok(Value::number(realm.heap.arr(r).len() as f64))
         }
-        Value::Str(r) if name == "length" => {
-            Ok(Value::Number(realm.heap.str_at(r).chars().count() as f64))
+        Kind::Str(r) if name == "length" => {
+            Ok(Value::number(realm.heap.str_at(r).chars().count() as f64))
         }
         _ => Err(RtError::new(format!(
             "cannot read property '{name}' of {}", obj.type_of()))),
