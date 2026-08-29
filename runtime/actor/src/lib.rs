@@ -95,6 +95,7 @@ fn spawn_actor(pv_setup: PortableValue) -> Result<ActorHandle, RtError> {
 
     std::thread::Builder::new()
         .name("tscore-actor".into())
+        .stack_size(32 << 20)
         .spawn(move || actor_main(pv_setup, rx, ready_tx))
         .map_err(|e| RtError::new(format!("cannot spawn actor thread: {e}")))?;
 

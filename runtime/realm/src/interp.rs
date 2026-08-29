@@ -19,7 +19,7 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
             realm.stack.resize(base + proto.n_regs as usize, Value::UNDEFINED);
             let n = (proto.arity as usize).min(args.len());
             realm.stack[base..base + n].copy_from_slice(&args[..n]);
-            let result = run_frame(realm, Some(c), &proto, base);
+            let result = run_frame(realm, Some(c), &proto, base, 0);
             realm.stack.truncate(base);
             result
         }
@@ -31,7 +31,7 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
 pub fn run_main(realm: &mut Realm, main: &Arc<FunctionProto>) -> Result<Value, RtError> {
     let base = realm.stack.len();
     realm.stack.resize(base + main.n_regs as usize, Value::UNDEFINED);
-    let result = run_frame(realm, None, main, base);
+    let result = run_frame(realm, None, main, base, 0);
     realm.stack.truncate(base);
     result
 }
@@ -152,11 +152,16 @@ fn const_str_arc(proto: &FunctionProto, idx: usize) -> Arc<str> {
     }
 }
 
+/// Matches Node's ~10k default; also keeps Rust stack use bounded on
+/// worker/actor threads (which get 16MB stacks).
+const MAX_CALL_DEPTH: u32 = 10_000;
+
 fn run_frame(
     realm: &mut Realm,
     closure: Option<tsr_memory::Ref>,
     proto: &FunctionProto,
     base: usize,
+    depth: u32,
 ) -> Result<Value, RtError> {
     let mut pc: usize = 0;
     loop {
@@ -285,6 +290,10 @@ fn run_frame(
                 let argc = ins.b as usize;
                 if let Some(c) = f.as_closure() {
                     realm.safepoint().map_err(|e| at(e, proto, pc))?;
+                    if depth >= MAX_CALL_DEPTH {
+                        return Err(err(proto, pc,
+                            "stack overflow: maximum call depth exceeded".into()));
+                    }
                     let callee = realm.heap.closure(c).proto.clone();
                     let new_base = a + 1;
                     let need = new_base + callee.n_regs as usize;
@@ -297,7 +306,7 @@ fn run_frame(
                     for r in argc..callee.arity as usize {
                         set_reg!(realm, new_base + r, Value::UNDEFINED);
                     }
-                    let result = run_frame(realm, Some(c), &callee, new_base)?;
+                    let result = run_frame(realm, Some(c), &callee, new_base, depth + 1)?;
                     set_reg!(realm, a, result);
                 } else if let Kind::Native(i) = f.kind() {
                     let native = realm.natives[i as usize].clone();

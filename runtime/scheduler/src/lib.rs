@@ -115,6 +115,7 @@ impl Pool {
                 let shared = shared.clone();
                 std::thread::Builder::new()
                     .name(format!("tscore-worker-{i}"))
+                    .stack_size(32 << 20)
                     .spawn(move || {
                         #[cfg(target_os = "macos")]
                         tsp_macos::prefer_performance_cores();

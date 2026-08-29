@@ -68,13 +68,24 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let mut realm = tsr_realm::Realm::new();
-    tsr_io::install(&mut realm);
-    tss_parallel::install(&mut realm, workers);
-    tsr_actor::install(&mut realm);
-    tss_async::install(&mut realm);
+    // dedicated 64MB-stack thread: 10k interpreter call depth needs more
+    // Rust stack than the default main thread provides
+    let result = std::thread::Builder::new()
+        .name("tscore-main".into())
+        .stack_size(64 << 20)
+        .spawn(move || {
+            let mut realm = tsr_realm::Realm::new();
+            tsr_io::install(&mut realm);
+            tss_parallel::install(&mut realm, workers);
+            tsr_actor::install(&mut realm);
+            tss_async::install(&mut realm);
+            tsr_realm::interp::run_main(&mut realm, &chunk.main)
+        })
+        .expect("spawn main realm thread")
+        .join()
+        .expect("main realm thread panicked");
 
-    match tsr_realm::interp::run_main(&mut realm, &chunk.main) {
+    match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             match e.span {
