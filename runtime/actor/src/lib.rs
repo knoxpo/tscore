@@ -6,18 +6,17 @@
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::sync::Arc;
-use tsr_memory::Value;
+use tsr_memory::{PromiseError, Value};
 use tsr_realm::interp::call_value;
-use tsr_realm::{Realm, RtError};
+use tsr_realm::{Completer, Realm, RtError};
 use tsr_task::portable::{clone_out, rehydrate};
 use tsr_task::PortableValue;
 
-/// ponytail: fixed mailbox bound = free backpressure; configurable at M3
-const MAILBOX_CAP: usize = 1024;
+const DEFAULT_MAILBOX_CAP: usize = 1024;
 
 enum Msg {
-    /// (message, reply slot — Some for send, None for post)
-    Deliver(PortableValue, Option<Sender<Result<PortableValue, String>>>),
+    /// (message, reply completer — Some for send, None for post)
+    Deliver(PortableValue, Option<Completer>),
     Stop,
 }
 
@@ -33,21 +32,31 @@ pub fn install(realm: &mut Realm) {
             Some(&f) if f.as_closure().is_some() => f,
             _ => return Err(RtError::new("actor(setupFn): expected a function")),
         };
+        let mailbox_cap = match args.get(1).and_then(|v| v.as_object()) {
+            Some(r) => match realm.heap.obj(r).get("mailbox") {
+                Some(v) if v.is_number() && v.as_number() >= 1.0 => {
+                    v.as_number() as usize
+                }
+                Some(_) => {
+                    return Err(RtError::new(
+                        "actor: mailbox capacity must be a positive number",
+                    ))
+                }
+                None => DEFAULT_MAILBOX_CAP,
+            },
+            None => DEFAULT_MAILBOX_CAP,
+        };
         let pv_setup = clone_out(&realm.heap, setup).map_err(RtError::new)?;
-        let handle = Arc::new(spawn_actor(pv_setup)?);
+        let handle = Arc::new(spawn_actor(pv_setup, mailbox_cap)?);
 
         // handle object: { send, post, stop } natives capturing the mailbox
         let h = handle.clone();
         let send = realm.add_native(move |realm, args| {
             let msg = message_arg(realm, args, &h)?;
-            let (reply_tx, reply_rx) = bounded(1);
-            h.tx.send(Msg::Deliver(msg, Some(reply_tx)))
+            let (promise, completer) = realm.promise_pair();
+            h.tx.send(Msg::Deliver(msg, Some(completer)))
                 .map_err(|_| stopped(&h))?;
-            match reply_rx.recv() {
-                Ok(Ok(pv)) => Ok(rehydrate(&pv, &mut realm.heap)),
-                Ok(Err(e)) => Err(RtError::new(format!("actor '{}': {e}", h.name))),
-                Err(_) => Err(stopped(&h)),
-            }
+            Ok(promise) // settles when the actor replies
         });
         let h = handle.clone();
         let post = realm.add_native(move |realm, args| {
@@ -89,8 +98,8 @@ fn stopped(h: &ActorHandle) -> RtError {
 }
 
 /// Boot the actor thread; blocks until setup ran (or failed) inside it.
-fn spawn_actor(pv_setup: PortableValue) -> Result<ActorHandle, RtError> {
-    let (tx, rx) = bounded::<Msg>(MAILBOX_CAP);
+fn spawn_actor(pv_setup: PortableValue, mailbox_cap: usize) -> Result<ActorHandle, RtError> {
+    let (tx, rx) = bounded::<Msg>(mailbox_cap);
     let (ready_tx, ready_rx) = bounded::<Result<String, String>>(1);
 
     std::thread::Builder::new()
@@ -114,7 +123,9 @@ fn actor_main(
     let mut realm = Realm::new();
     tsr_io::install(&mut realm);
     install(&mut realm); // actors can spawn actors
-    // note: no `parallel` inside actors at M2 — would nest cleanly, add on ask
+    tsr_channel::install(&mut realm);
+    tss_parallel::install(&mut realm, None); // parallel.* inside handlers
+    tss_async::install(&mut realm); // task.scope inside handlers
 
     let setup = rehydrate(&pv_setup, &mut realm.heap);
     let handlers = match call_value(&mut realm, setup, &[]) {
@@ -142,9 +153,12 @@ fn actor_main(
             Msg::Deliver(pv, reply) => {
                 let result = deliver(&mut realm, handlers, &pv);
                 match (reply, result) {
-                    (Some(tx), r) => {
-                        let _ = tx.send(r);
-                    }
+                    (Some(completer), Ok(pv)) => completer.settle(Ok(pv)),
+                    (Some(completer), Err(e)) => completer.settle(Err(PromiseError {
+                        msg: format!("actor '{name}': {e}"),
+                        cancelled: false,
+                        span: None,
+                    })),
                     (None, Err(e)) => {
                         eprintln!("actor '{name}': posted message failed: {e}");
                     }
@@ -172,7 +186,10 @@ fn deliver(
     let Some(handler) = handler else {
         return Err(format!("no handler for message type '{msg_type}'"));
     };
-    let result = call_value(realm, handler, &[msg]).map_err(|e| e.msg)?;
+    // async handlers return a promise: drive this actor's event loop
+    let result = call_value(realm, handler, &[msg])
+        .and_then(|v| tss_parallel::settle_if_promise(realm, v))
+        .map_err(|e| e.msg)?;
     clone_out(&realm.heap, result)
 }
 

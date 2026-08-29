@@ -10,8 +10,8 @@ const results = await parallel.map(records, processRecord);
 // runtime handles: partitioning, work stealing, core placement, isolation
 ```
 
-**Status:** M3 "Structured Concurrency" complete (M1 Multicore Proof, M2
-Actors before it) — custom bytecode interpreter (register machine, per-realm
+**Status:** M3 complete INCLUDING async/await, Promises, per-realm event
+loops, and channels (M1 Multicore Proof, M2 Actors before it) — custom bytecode interpreter (register machine, per-realm
 isolated heaps, mark-sweep GC), work-stealing scheduler, actor runtime.
 ARM64 macOS/Linux.
 
@@ -46,6 +46,19 @@ Each actor owns an isolated realm (heap + GC) on a dedicated thread with a
 bounded mailbox; messages cross realms as structured clones, handler
 failures stay inside the actor. See
 [actors spec](docs/specifications/actors-m2.md).
+
+## Async/await + channels (M3 completion)
+
+```typescript
+const hashes = await parallel.map(seeds, hashStream);   // spec API, for real
+const reply  = await db.send({ type: "get-user", id: 42 });
+const ch = Channel.create({ capacity: 1024 });
+await Channel.send(ch, event);                          // backpressure: parks when full
+await sleep(100);
+```
+
+Top-level await, async functions/arrows, async actor handlers, channels
+portable across realms. See [async spec](docs/specifications/async-await-m3.md).
 
 ## Structured concurrency (M3)
 

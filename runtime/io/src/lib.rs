@@ -81,6 +81,19 @@ pub fn install(realm: &mut Realm) {
     });
     realm.set_global_obj("performance", vec![("now", perf_now)]);
 
+    // sleep(ms) -> Promise<undefined>
+    // ponytail: thread per sleep; timer wheel when timer counts matter
+    let sleep = realm.add_native(|realm, args| {
+        let ms = num_arg(args, 0, "sleep")?.max(0.0);
+        let (promise, completer) = realm.promise_pair();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_micros((ms * 1000.0) as u64));
+            completer.settle(Ok(tsr_task::PortableValue::Undefined));
+        });
+        Ok(promise)
+    });
+    realm.set_global("sleep", sleep);
+
     // hidden helper: `s.charCodeAt(i)` compiles to `__charCodeAt(s, i)`
     let char_code_at = realm.add_native(|realm, args| {
         let s = match args.first().and_then(|v| v.as_str_ref()) {

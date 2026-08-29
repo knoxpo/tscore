@@ -211,10 +211,13 @@ fn run_child(pv_fn: &PortableValue, cancel: &Arc<AtomicBool>) -> Result<Portable
     realm.gc_enabled = false; // scratch realm: drops wholesale
     realm.cancel = Some(cancel.clone());
     tsr_io::install(&mut realm);
+    tsr_channel::install(&mut realm);
     tss_parallel::install(&mut realm, None);
     install(&mut realm); // nested scopes cascade cancellation
     let f = rehydrate(pv_fn, &mut realm.heap);
-    match call_value(&mut realm, f, &[]) {
+    match call_value(&mut realm, f, &[])
+        .and_then(|v| tss_parallel::settle_if_promise(&mut realm, v))
+    {
         Ok(v) => clone_out(&realm.heap, v)
             .map_err(|msg| Failure { msg, cancelled: false }),
         Err(e) => Err(Failure { msg: e.msg, cancelled: e.cancelled }),

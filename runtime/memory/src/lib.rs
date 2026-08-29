@@ -29,6 +29,9 @@ const TAG_CLOSURE: u64 = 0xFFFD;
 const TAG_CELL: u64 = 0xFFFE;
 const TAG_NATIVE: u64 = 0xFFFF;
 const CANON_NAN: u64 = 0x7FF8_0000_0000_0000;
+/// TAG_SPECIAL payloads: 0 null, 1 undefined, 2 false, 3 true, 4..8 reserved,
+/// >= FOREIGN_BASE = foreign arena ref + FOREIGN_BASE.
+const FOREIGN_BASE: u32 = 8;
 
 /// Decoded view of a [`Value`] for match sites off the hot path.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,6 +47,8 @@ pub enum Kind {
     Cell(Ref),
     /// Index into the realm's native function table.
     Native(u32),
+    /// Index into the realm's foreign arena (promises, coroutines, handles).
+    Foreign(Ref),
 }
 
 impl Value {
@@ -103,6 +108,10 @@ impl Value {
     pub fn native(i: u32) -> Value {
         Value::tagged(TAG_NATIVE, i)
     }
+    #[inline(always)]
+    pub fn foreign(r: Ref) -> Value {
+        Value::tagged(TAG_SPECIAL, r + FOREIGN_BASE)
+    }
 
     #[inline(always)]
     fn tag(self) -> u64 {
@@ -141,6 +150,11 @@ impl Value {
     pub fn as_str_ref(self) -> Option<Ref> {
         (self.tag() == TAG_STR).then(|| self.payload())
     }
+    #[inline(always)]
+    pub fn as_foreign(self) -> Option<Ref> {
+        (self.tag() == TAG_SPECIAL && self.payload() >= FOREIGN_BASE)
+            .then(|| self.payload() - FOREIGN_BASE)
+    }
 
     #[inline(always)]
     pub fn kind(self) -> Kind {
@@ -153,7 +167,11 @@ impl Value {
                 0 => Kind::Null,
                 1 => Kind::Undefined,
                 2 => Kind::Bool(false),
-                _ => Kind::Bool(true),
+                3 => Kind::Bool(true),
+                _ => {
+                    debug_assert!(p >= FOREIGN_BASE);
+                    Kind::Foreign(p - FOREIGN_BASE)
+                }
             },
             TAG_STR => Kind::Str(p),
             TAG_OBJ => Kind::Object(p),
@@ -169,6 +187,52 @@ impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.kind().fmt(f)
     }
+}
+
+/// Error payload for rejected promises (tsr-memory cannot see RtError).
+#[derive(Clone, Debug)]
+pub struct PromiseError {
+    pub msg: String,
+    pub cancelled: bool,
+    /// Source byte offset where the error originated, when known.
+    pub span: Option<u32>,
+}
+
+#[derive(Debug)]
+pub enum PromiseState {
+    Pending,
+    Fulfilled(Value),
+    Rejected(PromiseError),
+}
+
+#[derive(Debug)]
+pub struct Promise {
+    pub state: PromiseState,
+    /// Coroutine refs (foreign arena) resumed when this settles.
+    pub reactions: Vec<Ref>,
+}
+
+/// A suspended async-function frame: registers + resume point.
+#[derive(Debug)]
+pub struct Coroutine {
+    pub closure: Option<Ref>,
+    pub proto: Arc<FunctionProto>,
+    pub regs: Vec<Value>,
+    pub resume_pc: usize,
+    /// Register receiving the awaited value on resume.
+    pub dst: u8,
+    /// The promise (foreign ref) this coroutine settles.
+    pub promise: Ref,
+}
+
+pub enum Foreign {
+    Promise(Promise),
+    Coroutine(Coroutine),
+    /// Opaque shared handle (channels, actor refs) — kind name for display
+    /// and downcasting at the owning crate.
+    Handle(&'static str, Arc<dyn std::any::Any + Send + Sync>),
+    /// Cleared by the sweep; slot on the free list.
+    Free,
 }
 
 #[derive(Debug)]
@@ -202,6 +266,7 @@ pub struct Heap {
     pub arrs: Vec<Vec<Value>>,
     pub closures: Vec<Closure>,
     pub cells: Vec<Value>,
+    pub foreigns: Vec<Foreign>,
     // free lists rebuilt by the sweep (tsr-gc); alloc reuses them.
     // ponytail: non-moving collector — no compaction, refs stay stable
     pub free_strs: Vec<Ref>,
@@ -209,6 +274,7 @@ pub struct Heap {
     pub free_arrs: Vec<Ref>,
     pub free_closures: Vec<Ref>,
     pub free_cells: Vec<Ref>,
+    pub free_foreigns: Vec<Ref>,
     pub allocs_since_gc: usize,
     pub gc_threshold: usize,
 }
@@ -221,11 +287,13 @@ impl Default for Heap {
             arrs: Vec::new(),
             closures: Vec::new(),
             cells: Vec::new(),
+            foreigns: Vec::new(),
             free_strs: Vec::new(),
             free_objs: Vec::new(),
             free_arrs: Vec::new(),
             free_closures: Vec::new(),
             free_cells: Vec::new(),
+            free_foreigns: Vec::new(),
             allocs_since_gc: 0,
             gc_threshold: 1 << 18, // 256k allocations between collections
         }
@@ -261,6 +329,28 @@ impl Heap {
     alloc!(alloc_arr, arr, arr_mut, arrs, free_arrs, Vec<Value>);
     alloc!(alloc_closure, closure, closure_mut, closures, free_closures, Closure);
     alloc!(alloc_cell, cell, cell_mut, cells, free_cells, Value);
+    alloc!(alloc_foreign, foreign, foreign_mut, foreigns, free_foreigns, Foreign);
+
+    pub fn alloc_promise(&mut self) -> Ref {
+        self.alloc_foreign(Foreign::Promise(Promise {
+            state: PromiseState::Pending,
+            reactions: Vec::new(),
+        }))
+    }
+
+    pub fn promise(&self, r: Ref) -> &Promise {
+        match self.foreign(r) {
+            Foreign::Promise(p) => p,
+            _ => panic!("foreign {r} is not a promise"),
+        }
+    }
+
+    pub fn promise_mut(&mut self, r: Ref) -> &mut Promise {
+        match self.foreign_mut(r) {
+            Foreign::Promise(p) => p,
+            _ => panic!("foreign {r} is not a promise"),
+        }
+    }
 
     pub fn needs_gc(&self) -> bool {
         self.allocs_since_gc >= self.gc_threshold
@@ -284,6 +374,7 @@ impl Value {
 
     pub fn type_of(self) -> &'static str {
         match self.kind() {
+            Kind::Foreign(_) => "object",
             Kind::Number(_) => "number",
             Kind::Bool(_) => "boolean",
             Kind::Null => "object",
@@ -332,6 +423,12 @@ impl Value {
             }
             Kind::Closure(_) | Kind::Native(_) => "[Function]".into(),
             Kind::Cell(_) => "[Cell]".into(),
+            Kind::Foreign(r) => match heap.foreign(r) {
+                Foreign::Promise(_) => "[Promise]".into(),
+                Foreign::Coroutine(_) => "[Coroutine]".into(),
+                Foreign::Handle(kind, _) => format!("[{kind}]"),
+                Foreign::Free => "[Freed]".into(),
+            },
         }
     }
 }

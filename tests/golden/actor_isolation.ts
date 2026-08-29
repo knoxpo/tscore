@@ -6,7 +6,7 @@ const mutator = actor(() => ({
     },
 }));
 const payload = { type: "mutate", data: [1, 2, 3] };
-console.log("handler saw:", mutator.send(payload));
+console.log("handler saw:", await mutator.send(payload));
 console.log("caller kept:", payload.data.length);
 mutator.stop();
 
@@ -20,14 +20,14 @@ const outer = actor(() => {
         };
     });
     return {
-        churn: (m: { type: string, n: number }) => {
+        churn: async (m: { type: string, n: number }) => {
             for (let i = 0; i < m.n; i++) {
                 const garbage = { tag: `g${i}`, arr: [i, i, i] };
                 inner.post({ type: "bump", by: garbage.arr.length > 0 ? 1 : 0 });
             }
-            return inner.send({ type: "total" });
+            return await inner.send({ type: "total" });
         },
     };
 });
-console.log("nested total:", outer.send({ type: "churn", n: 100000 }));
+console.log("nested total:", await outer.send({ type: "churn", n: 100000 }));
 outer.stop();

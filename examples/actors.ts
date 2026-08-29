@@ -22,8 +22,8 @@ for (let i = 0; i < 100; i++) {
     store.post({ type: "put", value: `item-${i}` });
 }
 
-console.log("counter:", counter.send({ type: "get" }));
-console.log("store:", store.send({ type: "size" }));
-console.log("counter again:", counter.send({ type: "get" }));
+console.log("counter:", await counter.send({ type: "get" }));
+console.log("store:", await store.send({ type: "size" }));
+console.log("counter again:", await counter.send({ type: "get" }));
 counter.stop();
 store.stop();

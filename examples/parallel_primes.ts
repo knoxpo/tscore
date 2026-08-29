@@ -19,7 +19,7 @@ for (let i = 0; i < 200; i++) {
 }
 
 const t0 = performance.now();
-const counts = parallel.map(ranges, countPrimes);
+const counts = await parallel.map(ranges, countPrimes);
 let total = 0;
 for (const c of counts) total += c;
 const t1 = performance.now();

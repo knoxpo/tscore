@@ -108,6 +108,9 @@ pub enum Op {
     // misc
     Concat, // A = str(B) + str(C)
     TypeOf, // A = typeof B
+    /// A = await A. Non-promise/settled: falls through inline. Pending:
+    /// suspends the (async) frame. Only emitted inside is_async protos.
+    Await,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +132,8 @@ pub enum UpvalSrc {
 pub struct FunctionProto {
     pub name: Arc<str>,
     pub arity: u8,
+    /// Async functions run as coroutines; calls return a promise.
+    pub is_async: bool,
     pub n_regs: u8,
     pub code: Vec<Instr>,
     pub consts: Vec<Const>,

@@ -7,7 +7,53 @@ pub mod interp;
 
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
-use tsr_memory::{Heap, Value};
+use tsr_memory::{Heap, PromiseError, Value};
+use tsr_task::PortableValue;
+
+/// Cross-thread completion event for a pinned promise.
+pub struct Wake {
+    pub promise: tsr_memory::Ref,
+    pub result: Result<PortableValue, PromiseError>,
+}
+
+/// Send-able, settle-exactly-once handle for completing a realm promise
+/// from another thread. Dropping without settling reports an error (so a
+/// lost completer surfaces instead of deadlocking).
+pub struct Completer {
+    promise: tsr_memory::Ref,
+    tx: crossbeam_channel::Sender<Wake>,
+    settled: bool,
+}
+
+impl Completer {
+    pub fn settle(mut self, result: Result<PortableValue, PromiseError>) {
+        self.settled = true;
+        let _ = self.tx.send(Wake { promise: self.promise, result });
+    }
+
+    pub fn fail(self, msg: impl Into<String>) {
+        self.settle(Err(PromiseError {
+            msg: msg.into(),
+            cancelled: false,
+            span: None,
+        }));
+    }
+}
+
+impl Drop for Completer {
+    fn drop(&mut self) {
+        if !self.settled {
+            let _ = self.tx.send(Wake {
+                promise: self.promise,
+                result: Err(PromiseError {
+                    msg: "internal: completer dropped without settling".into(),
+                    cancelled: false,
+                    span: None,
+                }),
+            });
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RtError {
@@ -48,10 +94,24 @@ pub struct Realm {
     pub gc_stats: tsr_gc::GcStats,
     /// Cooperative cancellation flag, checked at interpreter safepoints.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Coroutines (foreign refs) ready to resume.
+    pub microtasks: std::collections::VecDeque<tsr_memory::Ref>,
+    /// Foreign refs kept alive across GC (main promise, cross-thread
+    /// completions in flight).
+    pub pinned: rustc_hash::FxHashSet<tsr_memory::Ref>,
+    /// Promises with an outstanding cross-thread Completer.
+    pub external_pending: usize,
+    /// While waiting for wakes, help execute pool work (set by
+    /// tss-parallel::install; the pred returns true when a wake arrived).
+    /// Without it, `--workers 1` (zero pool threads) would deadlock.
+    pub idle_helper: Option<fn(&dyn Fn() -> bool)>,
+    pub wake_tx: crossbeam_channel::Sender<Wake>,
+    pub wake_rx: crossbeam_channel::Receiver<Wake>,
 }
 
 impl Realm {
     pub fn new() -> Self {
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded();
         Realm {
             heap: Heap::new(),
             globals: FxHashMap::default(),
@@ -62,6 +122,12 @@ impl Realm {
             gc_enabled: true,
             gc_stats: tsr_gc::GcStats::default(),
             cancel: None,
+            microtasks: std::collections::VecDeque::new(),
+            pinned: rustc_hash::FxHashSet::default(),
+            external_pending: 0,
+            idle_helper: None,
+            wake_tx: wake_tx.clone(),
+            wake_rx,
         }
     }
 
@@ -77,12 +143,30 @@ impl Realm {
         Ok(())
     }
 
+    /// Allocate a pending promise + a Send-able completer for it. The
+    /// promise stays pinned (GC root) until its Wake is processed.
+    pub fn promise_pair(&mut self) -> (Value, Completer) {
+        let promise = self.heap.alloc_promise();
+        self.pinned.insert(promise);
+        self.external_pending += 1;
+        (
+            Value::foreign(promise),
+            Completer { promise, tx: self.wake_tx.clone(), settled: false },
+        )
+    }
+
     pub fn maybe_gc(&mut self) {
         if self.gc_enabled && self.heap.needs_gc() {
+            let extra: Vec<Value> = self
+                .microtasks
+                .iter()
+                .chain(self.pinned.iter())
+                .map(|&r| Value::foreign(r))
+                .collect();
             tsr_gc::collect(
                 &mut self.heap,
                 &self.stack,
-                self.globals.values(),
+                self.globals.values().chain(extra.iter()),
                 &mut self.gc_stats,
             );
         }

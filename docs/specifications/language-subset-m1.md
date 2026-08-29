@@ -17,6 +17,7 @@ code, not discipline.
   `break`, `continue`, `return`
 - Property access: dot + computed index; `arr.length`, `arr.push(x)`
 - Template literals
+- `async` functions/arrows and `await` (incl. top-level) — see async-await-m3.md
 - TypeScript annotations, `interface`, `type` — **parsed and stripped**, never checked
 - Globals: `console.log`, `Math.{floor,sqrt,abs,min,max,imul}`,
   `Date.now()`, `performance.now()`, `parallel.map`, `parallel.for`
@@ -25,7 +26,7 @@ code, not discipline.
 
 `class` / prototypes / `this` / `new` — objects are plain maps ·
 `try`/`catch`/`throw` (runtime error aborts the task; removes unwinding from
-the interpreter) · `async`/`await`, Promises, generators, iterator protocol ·
+the interpreter) · generators, iterator protocol, `.then` (await-only promises) ·
 `Map`/`Set`, `Symbol`, regex, getters/setters · destructuring, spread,
 default params, `var`, `with`, `eval` · modules (single-file entry only).
 

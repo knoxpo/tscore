@@ -26,7 +26,7 @@ console.log("math:", Math.floor(3.7), Math.sqrt(81), Math.imul(3, 4));
 console.log("str:", "abc".length, "abc".charCodeAt(1));
 
 // higher-order + parallel stub
-const doubled = parallel.map([1, 2, 3], (x: number) => x * 2);
+const doubled = await parallel.map([1, 2, 3], (x: number) => x * 2);
 console.log("parallel:", doubled);
 
 // while/break/continue

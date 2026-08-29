@@ -13,7 +13,7 @@ function hashStream(seed: number): number {
 const seeds: number[] = [];
 for (let i = 1; i <= 256; i++) seeds.push(i);
 const t0 = performance.now();
-const hashes = parallel.map(seeds, hashStream);
+const hashes = await parallel.map(seeds, hashStream);
 let checksum = 0;
 for (const h of hashes) checksum = (checksum + h) % 4294967296;
 const t1 = performance.now();

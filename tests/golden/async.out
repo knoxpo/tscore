@@ -1,0 +1,3 @@
+order: fast slow
+async fib: 144
+async map: [ 2, 4, 6, 8 ]

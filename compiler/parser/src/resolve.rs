@@ -179,6 +179,7 @@ impl Resolver {
                 self.expr(&l.right);
             }
             Expression::UnaryExpression(u) => self.expr(&u.argument),
+            Expression::AwaitExpression(a) => self.expr(&a.argument),
             Expression::UpdateExpression(u) => {
                 if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &u.argument {
                     self.reference(&id.name);

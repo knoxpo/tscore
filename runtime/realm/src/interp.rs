@@ -3,7 +3,10 @@
 use crate::{Realm, RtError};
 use std::sync::Arc;
 use tsc_ir::{Const, FunctionProto, Op, UpvalSrc};
-use tsr_memory::{to_int32, to_uint32, Closure, Kind, Value};
+use tsr_memory::{
+    to_int32, to_uint32, Closure, Coroutine, Foreign, Kind, PromiseError, PromiseState,
+    Value,
+};
 
 /// Call any callable value with the given arguments (entry point for the
 /// CLI and for natives like `parallel.map` that re-enter the interpreter).
@@ -19,7 +22,16 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
             realm.stack.resize(base + proto.n_regs as usize, Value::UNDEFINED);
             let n = (proto.arity as usize).min(args.len());
             realm.stack[base..base + n].copy_from_slice(&args[..n]);
-            let result = run_frame(realm, Some(c), &proto, base, 0);
+            if proto.is_async {
+                let p = start_async(realm, Some(c), proto, base);
+                realm.stack.truncate(base);
+                return Ok(Value::foreign(p));
+            }
+            let result = match run_frame(realm, Some(c), &proto, base, 0, 0) {
+                Ok(FrameResult::Return(v)) => Ok(v),
+                Ok(FrameResult::Await { .. }) => unreachable!("await in sync frame"),
+                Err(e) => Err(e),
+            };
             realm.stack.truncate(base);
             result
         }
@@ -28,12 +40,206 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
 }
 
 /// Run the top-level chunk in the realm.
+/// Run the main chunk to completion: starts it as a coroutine (main is
+/// compiled async for top-level await), then drives the event loop until
+/// its promise settles.
 pub fn run_main(realm: &mut Realm, main: &Arc<FunctionProto>) -> Result<Value, RtError> {
     let base = realm.stack.len();
     realm.stack.resize(base + main.n_regs as usize, Value::UNDEFINED);
-    let result = run_frame(realm, None, main, base, 0);
+    let main_promise = start_async(realm, None, main.clone(), base);
     realm.stack.truncate(base);
+    realm.pinned.insert(main_promise);
+    let result = drive(realm, main_promise);
+    realm.pinned.remove(&main_promise);
     result
+}
+
+/// Event loop: drain microtasks and cross-thread wakes until the given
+/// promise settles.
+pub fn drive(realm: &mut Realm, main_promise: tsr_memory::Ref) -> Result<Value, RtError> {
+    let rx = realm.wake_rx.clone();
+    loop {
+        while let Some(co) = realm.microtasks.pop_front() {
+            resume(realm, co);
+        }
+        while let Ok(wake) = rx.try_recv() {
+            process_wake(realm, wake);
+        }
+        if !realm.microtasks.is_empty() {
+            continue;
+        }
+        match &realm.heap.promise(main_promise).state {
+            PromiseState::Fulfilled(v) => return Ok(*v),
+            PromiseState::Rejected(e) => {
+                return Err(RtError {
+                    msg: e.msg.clone(),
+                    span: e.span,
+                    cancelled: e.cancelled,
+                })
+            }
+            PromiseState::Pending => {
+                if realm.external_pending == 0 {
+                    return Err(RtError::new(
+                        "deadlock: pending promises that nothing can settle",
+                    ));
+                }
+                // help the pool while waiting (a zero-thread pool would
+                // otherwise never run the jobs we're waiting on)
+                if let Some(help) = realm.idle_helper {
+                    help(&|| !rx.is_empty());
+                    while let Ok(wake) = rx.try_recv() {
+                        process_wake(realm, wake);
+                    }
+                } else {
+                    match rx.recv() {
+                        Ok(wake) => process_wake(realm, wake),
+                        Err(_) => {
+                            return Err(RtError::new("internal: wake channel closed"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn process_wake(realm: &mut Realm, wake: crate::Wake) {
+    realm.external_pending = realm.external_pending.saturating_sub(1);
+    let result = match wake.result {
+        Ok(pv) => Ok(tsr_task::portable::rehydrate(&pv, &mut realm.heap)),
+        Err(e) => Err(e),
+    };
+    settle(realm, wake.promise, result);
+    realm.pinned.remove(&wake.promise);
+}
+
+/// Start an async function whose argument window is already populated at
+/// `base`. Runs the body synchronously to its first await; returns the
+/// promise (foreign ref) it will settle.
+#[cold]
+fn start_async(
+    realm: &mut Realm,
+    closure: Option<tsr_memory::Ref>,
+    proto: Arc<FunctionProto>,
+    base: usize,
+) -> tsr_memory::Ref {
+    let promise = realm.heap.alloc_promise();
+    // the promise is otherwise unreachable while the body runs — a GC at
+    // any safepoint inside would free it
+    realm.pinned.insert(promise);
+    match run_frame(realm, closure, &proto, base, 0, 0) {
+        Ok(FrameResult::Return(v)) => settle(realm, promise, Ok(v)),
+        Err(e) => settle(
+            realm,
+            promise,
+            Err(PromiseError { msg: e.msg, cancelled: e.cancelled, span: e.span }),
+        ),
+        Ok(FrameResult::Await { awaited, dst, resume_pc }) => {
+            let regs = realm.stack[base..base + proto.n_regs as usize].to_vec();
+            let co = realm.heap.alloc_foreign(Foreign::Coroutine(Coroutine {
+                closure,
+                proto,
+                regs,
+                resume_pc,
+                dst,
+                promise,
+            }));
+            realm.heap.promise_mut(awaited).reactions.push(co);
+        }
+    }
+    realm.pinned.remove(&promise);
+    promise
+}
+
+/// Resume a suspended coroutine (its awaited value is already in
+/// `regs[dst]`); settle or re-suspend.
+fn resume(realm: &mut Realm, co_ref: tsr_memory::Ref) {
+    let Foreign::Coroutine(mut co) =
+        std::mem::replace(realm.heap.foreign_mut(co_ref), Foreign::Free)
+    else {
+        return; // already consumed
+    };
+    realm.heap.free_foreigns.push(co_ref);
+    // the coroutine left the arena: its promise is only reachable through
+    // this Rust local until we settle/re-suspend — pin it across execution
+    realm.pinned.insert(co.promise);
+    let base = realm.stack.len();
+    realm.stack.extend_from_slice(&co.regs);
+    let result = run_frame(realm, co.closure, &co.proto.clone(), base, 0, co.resume_pc);
+    match result {
+        Ok(FrameResult::Return(v)) => {
+            realm.stack.truncate(base);
+            settle(realm, co.promise, Ok(v));
+            realm.pinned.remove(&co.promise);
+        }
+        Err(e) => {
+            realm.stack.truncate(base);
+            settle(
+                realm,
+                co.promise,
+                Err(PromiseError { msg: e.msg, cancelled: e.cancelled, span: e.span }),
+            );
+            realm.pinned.remove(&co.promise);
+        }
+        Ok(FrameResult::Await { awaited, dst, resume_pc }) => {
+            let n = co.regs.len();
+            co.regs.copy_from_slice(&realm.stack[base..base + n]);
+            realm.stack.truncate(base);
+            co.resume_pc = resume_pc;
+            co.dst = dst;
+            let promise = co.promise;
+            let new_ref = realm.heap.alloc_foreign(Foreign::Coroutine(co));
+            realm.heap.promise_mut(awaited).reactions.push(new_ref);
+            realm.pinned.remove(&promise);
+            return;
+        }
+    }
+}
+
+/// Settle a promise; fulfilled waiters get the value written into their
+/// resume register and join the microtask queue, rejected waiters cascade.
+pub fn settle(
+    realm: &mut Realm,
+    promise: tsr_memory::Ref,
+    result: Result<Value, PromiseError>,
+) {
+    let reactions = {
+        let p = realm.heap.promise_mut(promise);
+        debug_assert!(matches!(p.state, PromiseState::Pending));
+        p.state = match &result {
+            Ok(v) => PromiseState::Fulfilled(*v),
+            Err(e) => PromiseState::Rejected(e.clone()),
+        };
+        std::mem::take(&mut p.reactions)
+    };
+    for co_ref in reactions {
+        match &result {
+            Ok(v) => {
+                if let Foreign::Coroutine(co) = realm.heap.foreign_mut(co_ref) {
+                    let dst = co.dst as usize;
+                    co.regs[dst] = *v;
+                }
+                realm.microtasks.push_back(co_ref);
+            }
+            Err(e) => {
+                // cascade the rejection without executing the waiter
+                let waiter_promise = match std::mem::replace(
+                    realm.heap.foreign_mut(co_ref),
+                    Foreign::Free,
+                ) {
+                    Foreign::Coroutine(co) => {
+                        realm.heap.free_foreigns.push(co_ref);
+                        co.promise
+                    }
+                    other => {
+                        *realm.heap.foreign_mut(co_ref) = other;
+                        continue;
+                    }
+                };
+                settle(realm, waiter_promise, Err(e.clone()));
+            }
+        }
+    }
 }
 
 // Register access: indices are emitter-guaranteed < base + n_regs and the
@@ -156,14 +362,27 @@ fn const_str_arc(proto: &FunctionProto, idx: usize) -> Arc<str> {
 /// worker/actor threads (which get 16MB stacks).
 const MAX_CALL_DEPTH: u32 = 10_000;
 
+/// Outcome of one frame execution: normal return, or suspension at an
+/// `await` on a pending promise (async frames only).
+pub enum FrameResult {
+    Return(Value),
+    Await {
+        /// The pending promise (foreign ref) being awaited.
+        awaited: tsr_memory::Ref,
+        dst: u8,
+        resume_pc: usize,
+    },
+}
+
 fn run_frame(
     realm: &mut Realm,
     closure: Option<tsr_memory::Ref>,
     proto: &FunctionProto,
     base: usize,
     depth: u32,
-) -> Result<Value, RtError> {
-    let mut pc: usize = 0;
+    start_pc: usize,
+) -> Result<FrameResult, RtError> {
+    let mut pc: usize = start_pc;
     loop {
         debug_assert!(pc < proto.code.len());
         let ins = unsafe { *proto.code.get_unchecked(pc) };
@@ -306,7 +525,16 @@ fn run_frame(
                     for r in argc..callee.arity as usize {
                         set_reg!(realm, new_base + r, Value::UNDEFINED);
                     }
-                    let result = run_frame(realm, Some(c), &callee, new_base, depth + 1)?;
+                    let result = if callee.is_async {
+                        Value::foreign(start_async(realm, Some(c), callee, new_base))
+                    } else {
+                        match run_frame(realm, Some(c), &callee, new_base, depth + 1, 0)? {
+                            FrameResult::Return(v) => v,
+                            FrameResult::Await { .. } => {
+                                unreachable!("await in sync frame")
+                            }
+                        }
+                    };
                     set_reg!(realm, a, result);
                 } else if let Kind::Native(i) = f.kind() {
                     let native = realm.natives[i as usize].clone();
@@ -326,8 +554,38 @@ fn run_frame(
                         "{} is not a function", f.type_of())));
                 }
             }
-            Op::Return => return Ok(reg!(realm, a)),
-            Op::Halt => return Ok(Value::UNDEFINED),
+            Op::Return => return Ok(FrameResult::Return(reg!(realm, a))),
+            Op::Halt => return Ok(FrameResult::Return(Value::UNDEFINED)),
+
+            Op::Await => {
+                let v = reg!(realm, a);
+                if let Some(r) = v.as_foreign() {
+                    if let Foreign::Promise(p) = realm.heap.foreign(r) {
+                        match &p.state {
+                            PromiseState::Fulfilled(val) => {
+                                let val = *val;
+                                set_reg!(realm, a, val);
+                            }
+                            PromiseState::Rejected(e) => {
+                                return Err(RtError {
+                                    msg: e.msg.clone(),
+                                    span: e.span.or_else(|| proto.spans.get(pc).copied()),
+                                    cancelled: e.cancelled,
+                                })
+                            }
+                            PromiseState::Pending => {
+                                return Ok(FrameResult::Await {
+                                    awaited: r,
+                                    dst: ins.a,
+                                    resume_pc: pc + 1,
+                                })
+                            }
+                        }
+                    }
+                }
+                // await of a non-promise is identity (documented divergence:
+                // no microtask tick for settled/plain values)
+            }
 
             Op::Closure => {
                 let child = proto.protos[ins.bx() as usize].clone();

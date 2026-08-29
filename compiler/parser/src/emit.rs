@@ -41,6 +41,7 @@ struct LoopCtx {
 struct FuncState {
     name: String,
     arity: u8,
+    is_async: bool,
     code: Vec<Instr>,
     spans: Vec<u32>,
     consts: Vec<Const>,
@@ -71,6 +72,7 @@ impl Emitter {
         em.fs.push(FuncState {
             name: "<main>".into(),
             scopes: vec![HashMap::new()],
+            is_async: true, // top-level await
             ..Default::default()
         });
         em.hoist_functions(&program.body)?;
@@ -414,8 +416,12 @@ impl Emitter {
                 };
                 let mark = self.mark();
                 let tmp = self.alloc_reg(f.span.start)?;
-                let proto_idx =
-                    self.compile_function(&id.name, &f.params, &body.statements)?;
+                let proto_idx = self.compile_function(
+                    &id.name,
+                    &f.params,
+                    &body.statements,
+                    f.r#async,
+                )?;
                 self.emit_abx(Op::Closure, tmp, proto_idx);
                 let place = self.resolve(&id.name);
                 self.store_place(place, &id.name, tmp, id.span.start)?;
@@ -662,8 +668,9 @@ impl Emitter {
         name: &str,
         params: &FormalParameters,
         body: &[Statement],
+        is_async: bool,
     ) -> R<u16> {
-        self.compile_function_inner(name, params, body, None)
+        self.compile_function_inner(name, params, body, None, is_async)
     }
 
     fn compile_function_inner(
@@ -672,10 +679,12 @@ impl Emitter {
         params: &FormalParameters,
         body: &[Statement],
         expr_body: Option<&Expression>,
+        is_async: bool,
     ) -> R<u16> {
         let mut fs = FuncState {
             name: name.to_string(),
             scopes: vec![HashMap::new()],
+            is_async,
             ..Default::default()
         };
         fs.arity = params.items.len() as u8;
@@ -759,6 +768,18 @@ impl Emitter {
             }
             Expression::TemplateLiteral(t) => self.template(t, dst),
             Expression::ParenthesizedExpression(p) => self.expr(&p.expression, dst),
+            Expression::AwaitExpression(aw) => {
+                if !self.fs.last().unwrap().is_async {
+                    return self.unsupported(
+                        "await outside an async function",
+                        aw.span.start,
+                    );
+                }
+                self.expr(&aw.argument, dst)?;
+                self.cur_span = aw.span.start;
+                self.emit(Op::Await, dst, 0, 0);
+                Ok(())
+            }
             Expression::TSAsExpression(t) => self.expr(&t.expression, dst),
             Expression::TSNonNullExpression(t) => self.expr(&t.expression, dst),
 
@@ -983,6 +1004,7 @@ impl Emitter {
                     &a.params,
                     &a.body.statements,
                     expr_body,
+                    a.r#async,
                 )?;
                 self.emit_abx(Op::Closure, dst, idx);
                 Ok(())
@@ -996,6 +1018,7 @@ impl Emitter {
                     name.as_deref().unwrap_or("<anon>"),
                     &f.params,
                     &body.statements,
+                    f.r#async,
                 )?;
                 self.emit_abx(Op::Closure, dst, idx);
                 Ok(())
@@ -1193,6 +1216,7 @@ fn finish(fs: FuncState) -> FunctionProto {
     FunctionProto {
         name: Arc::from(fs.name.as_str()),
         arity: fs.arity,
+        is_async: fs.is_async,
         n_regs: fs.max_reg.max(1),
         code: fs.code,
         consts: fs.consts,

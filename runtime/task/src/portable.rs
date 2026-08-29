@@ -3,10 +3,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tsc_ir::FunctionProto;
-use tsr_memory::{Closure, Heap, Kind, Obj, Value};
+use tsr_memory::{Closure, Foreign, Heap, Kind, Obj, Value};
 
 /// Realm-independent value tree. `Send + Sync`: safe to hand to any worker.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum PortableValue {
     Number(f64),
     Bool(bool),
@@ -19,6 +19,27 @@ pub enum PortableValue {
         proto: Arc<FunctionProto>,
         upvals: Vec<PortableValue>,
     },
+    /// Shared runtime handle (channel, actor ref): kind name + opaque core.
+    /// Rehydrates to an object with a hidden `__<kind>` foreign field.
+    Handle(&'static str, Arc<dyn std::any::Any + Send + Sync>),
+}
+
+impl std::fmt::Debug for PortableValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PortableValue::Number(n) => write!(f, "Number({n})"),
+            PortableValue::Bool(b) => write!(f, "Bool({b})"),
+            PortableValue::Null => write!(f, "Null"),
+            PortableValue::Undefined => write!(f, "Undefined"),
+            PortableValue::Str(s) => write!(f, "Str({s:?})"),
+            PortableValue::Array(a) => f.debug_tuple("Array").field(a).finish(),
+            PortableValue::Object(o) => f.debug_tuple("Object").field(o).finish(),
+            PortableValue::Closure { proto, .. } => {
+                write!(f, "Closure({})", proto.name)
+            }
+            PortableValue::Handle(kind, _) => write!(f, "Handle({kind})"),
+        }
+    }
 }
 
 /// Deep-copy a realm value into a portable tree.
@@ -52,6 +73,17 @@ fn clone_rec(
             PortableValue::Array(items)
         }
         Kind::Object(r) => {
+            // hidden-handle objects (channels, actor refs) travel as their
+            // shared core, not as field-by-field clones
+            for (k, v) in &heap.obj(r).fields {
+                if k.starts_with("__") {
+                    if let Some(f) = v.as_foreign() {
+                        if let Foreign::Handle(kind, any) = heap.foreign(f) {
+                            return Ok(PortableValue::Handle(kind, any.clone()));
+                        }
+                    }
+                }
+            }
             if !visiting.insert((1, r)) {
                 return Err("cannot capture cyclic data across realms".into());
             }
@@ -79,6 +111,15 @@ fn clone_rec(
             pv
         }
         Kind::Cell(_) => return Err("internal: cell escaped registers".into()),
+        Kind::Foreign(r) => {
+            let what = match heap.foreign(r) {
+                Foreign::Promise(_) => "a promise",
+                Foreign::Coroutine(_) => "a coroutine",
+                Foreign::Handle(kind, _) => kind,
+                Foreign::Free => "a freed value",
+            };
+            return Err(format!("cannot capture {what} across realms"));
+        }
         Kind::Native(_) => {
             return Err(
                 "cannot capture a native function across realms (reference it \
@@ -107,6 +148,12 @@ pub fn rehydrate(pv: &PortableValue, heap: &mut Heap) -> Value {
                 let v = rehydrate(x, heap);
                 obj.set(k.clone(), v);
             }
+            Value::object(heap.alloc_obj(obj))
+        }
+        PortableValue::Handle(kind, any) => {
+            let f = heap.alloc_foreign(Foreign::Handle(kind, any.clone()));
+            let mut obj = Obj::default();
+            obj.set(Arc::from(format!("__{kind}").as_str()), Value::foreign(f));
             Value::object(heap.alloc_obj(obj))
         }
         PortableValue::Closure { proto, upvals } => {

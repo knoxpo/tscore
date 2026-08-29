@@ -12,3 +12,4 @@ tsr-task.workspace = true
 tsr-scheduler.workspace = true
 tsr-io.workspace = true
 tss-parallel.workspace = true
+tsr-channel.workspace = true

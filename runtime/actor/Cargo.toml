@@ -11,3 +11,6 @@ tsr-memory.workspace = true
 tsr-task.workspace = true
 tsr-io.workspace = true
 crossbeam-channel.workspace = true
+tss-parallel.workspace = true
+tss-async.workspace = true
+tsr-channel.workspace = true

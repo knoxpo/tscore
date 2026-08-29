@@ -13,7 +13,7 @@ function countPrimes(range: { from: number, to: number }): number {
 const ranges: { from: number, to: number }[] = [];
 for (let i = 0; i < 400; i++) ranges.push({ from: i * 2000, to: (i + 1) * 2000 });
 const t0 = performance.now();
-const counts = parallel.map(ranges, countPrimes);
+const counts = await parallel.map(ranges, countPrimes);
 let total = 0;
 for (const c of counts) total += c;
 const t1 = performance.now();

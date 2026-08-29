@@ -6,10 +6,10 @@
 //! realm per chunk; results are cloned back. Deterministic: identical output
 //! at any worker count.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tsr_memory::Value;
-use tsr_realm::interp::call_value;
+use tsr_memory::{PromiseError, Value};
+use tsr_realm::interp::{call_value, drive};
 use tsr_realm::{Realm, RtError};
 use tsr_scheduler::Pool;
 use tsr_task::portable::{clone_out, rehydrate};
@@ -34,10 +34,15 @@ pub fn shared_pool() -> &'static Pool {
     POOL.get_or_init(|| Pool::new(configure(None)))
 }
 
+fn pool_help(done: &dyn Fn() -> bool) {
+    shared_pool().help_until(done);
+}
+
 /// Install `parallel` and `runtime.cpu` globals. First call fixes the
 /// worker count for the process.
 pub fn install(realm: &mut Realm, workers: Option<usize>) {
     let n_workers = configure(workers);
+    realm.idle_helper = Some(pool_help);
 
     let map = realm.add_native(|realm, args| run_parallel(realm, args, true));
     let for_ = realm.add_native(|realm, args| run_parallel(realm, args, false));
@@ -80,6 +85,9 @@ fn run_parallel(
             Value::UNDEFINED
         });
     }
+    // chunks inherit the calling task's cancel flag: cancelling a scope
+    // child cancels its inner parallel work at the next safepoint
+    let parent_cancel = realm.cancel.clone();
 
     // clone captures + input out of the caller realm
     let pv_fn = Arc::new(clone_out(&realm.heap, f).map_err(RtError::new)?);
@@ -99,54 +107,80 @@ fn run_parallel(
 
     let results: Arc<Mutex<Vec<Option<PortableValue>>>> =
         Arc::new(Mutex::new(if collect { vec![None; n_items] } else { Vec::new() }));
-    let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let error: Arc<Mutex<Option<PromiseError>>> = Arc::new(Mutex::new(None));
     let failed = Arc::new(AtomicBool::new(false));
+
+    // async: returns a promise settled by the last-finishing chunk
+    let (promise, completer) = realm.promise_pair();
+    let completer = Arc::new(Mutex::new(Some(completer)));
 
     let mut jobs: Vec<Box<dyn FnOnce(&tsr_scheduler::Ctx) + Send>> = Vec::new();
     let mut items = items.into_iter().enumerate().peekable();
+    let mut chunks: Vec<Vec<(usize, PortableValue)>> = Vec::new();
     while items.peek().is_some() {
-        let chunk: Vec<(usize, PortableValue)> = items.by_ref().take(chunk_size).collect();
+        chunks.push(items.by_ref().take(chunk_size).collect());
+    }
+    let remaining = Arc::new(AtomicUsize::new(chunks.len()));
+    for chunk in chunks {
         let pv_fn = pv_fn.clone();
         let results = results.clone();
         let error = error.clone();
         let failed = failed.clone();
+        let remaining = remaining.clone();
+        let completer = completer.clone();
+        let parent_cancel = parent_cancel.clone();
         jobs.push(Box::new(move |_ctx| {
-            if failed.load(Ordering::Relaxed) {
-                return;
-            }
-            match run_chunk(&pv_fn, &chunk, collect) {
-                Ok(out) => {
-                    if collect {
-                        let mut slots = results.lock().unwrap();
-                        for (i, v) in out {
-                            slots[i] = Some(v);
+            let cancelled_early = failed.load(Ordering::Relaxed)
+                || parent_cancel
+                    .as_ref()
+                    .is_some_and(|c| c.load(Ordering::Relaxed));
+            if !cancelled_early {
+                match run_chunk(&pv_fn, &chunk, collect, parent_cancel.clone()) {
+                    Ok(out) => {
+                        if collect {
+                            let mut slots = results.lock().unwrap();
+                            for (i, v) in out {
+                                slots[i] = Some(v);
+                            }
                         }
                     }
+                    Err(e) => {
+                        failed.store(true, Ordering::Relaxed);
+                        error.lock().unwrap().get_or_insert(e);
+                    }
                 }
-                Err(e) => {
-                    failed.store(true, Ordering::Relaxed);
-                    error.lock().unwrap().get_or_insert(e);
+            } else if let Some(c) = &parent_cancel {
+                if c.load(Ordering::Relaxed) {
+                    error.lock().unwrap().get_or_insert(PromiseError {
+                        msg: "task cancelled".into(),
+                        cancelled: true,
+                        span: None,
+                    });
+                }
+            }
+            if remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+                // last chunk assembles and settles
+                let completer = completer.lock().unwrap().take().unwrap();
+                if let Some(e) = error.lock().unwrap().take() {
+                    completer.settle(Err(e));
+                } else if collect {
+                    let slots = std::mem::take(&mut *results.lock().unwrap());
+                    let vals: Vec<PortableValue> = slots
+                        .into_iter()
+                        .map(|s| s.expect("chunk skipped without error"))
+                        .collect();
+                    completer.settle(Ok(PortableValue::Array(vals)));
+                } else {
+                    completer.settle(Ok(PortableValue::Undefined));
                 }
             }
         }));
     }
-    pool.run_batch(jobs);
-
-    if let Some(e) = error.lock().unwrap().take() {
-        return Err(RtError::new(e));
+    let batch = tsr_scheduler::Batch::new();
+    for job in jobs {
+        pool.submit(&batch, job);
     }
-    if !collect {
-        return Ok(Value::UNDEFINED);
-    }
-    let slots = Arc::try_unwrap(results)
-        .map_err(|_| RtError::new("internal: result refs leaked"))?
-        .into_inner()
-        .unwrap();
-    let vals: Vec<Value> = slots
-        .into_iter()
-        .map(|s| rehydrate(&s.expect("chunk skipped without error"), &mut realm.heap))
-        .collect();
-    Ok(Value::array(realm.heap.alloc_arr(vals)))
+    Ok(promise)
 }
 
 /// Execute one chunk in a fresh scratch realm. The realm (arena) drops at
@@ -155,22 +189,43 @@ fn run_chunk(
     pv_fn: &PortableValue,
     chunk: &[(usize, PortableValue)],
     collect: bool,
-) -> Result<Vec<(usize, PortableValue)>, String> {
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Vec<(usize, PortableValue)>, PromiseError> {
     let mut realm = Realm::new();
     // scratch realm: never collects (the rehydrated callback lives in a
     // Rust local, unrooted); the whole arena drops when the chunk ends
     realm.gc_enabled = false;
+    realm.cancel = cancel;
     tsr_io::install(&mut realm);
+    tsr_channel::install(&mut realm);
     install(&mut realm, None); // nested parallel.* shares the pool
     let f = rehydrate(pv_fn, &mut realm.heap);
     let mut out = Vec::with_capacity(if collect { chunk.len() } else { 0 });
     for (i, item) in chunk {
         let v = rehydrate(item, &mut realm.heap);
         let r = call_value(&mut realm, f, &[v, Value::number(*i as f64)])
-            .map_err(|e| e.msg)?;
+            .and_then(|r| settle_if_promise(&mut realm, r))
+            .map_err(|e| PromiseError {
+                msg: e.msg,
+                cancelled: e.cancelled,
+                span: e.span,
+            })?;
         if collect {
-            out.push((*i, clone_out(&realm.heap, r)?));
+            out.push((*i, clone_out(&realm.heap, r).map_err(|msg| PromiseError {
+                msg,
+                cancelled: false,
+                span: None,
+            })?));
         }
     }
     Ok(out)
+}
+
+/// Async callbacks return a promise: drive this realm's event loop until
+/// it settles (worker thread blocks meanwhile — it owns this realm).
+pub fn settle_if_promise(realm: &mut Realm, v: Value) -> Result<Value, RtError> {
+    match v.as_foreign() {
+        Some(r) => drive(realm, r),
+        None => Ok(v),
+    }
 }

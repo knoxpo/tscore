@@ -79,6 +79,7 @@ fn main() -> ExitCode {
             tss_parallel::install(&mut realm, workers);
             tsr_actor::install(&mut realm);
             tss_async::install(&mut realm);
+            tsr_channel::install(&mut realm);
             tsr_realm::interp::run_main(&mut realm, &chunk.main)
         })
         .expect("spawn main realm thread")

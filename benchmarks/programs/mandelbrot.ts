@@ -19,7 +19,7 @@ function mandelRow(y: number): number {
 const rows: number[] = [];
 for (let y = 0; y < 240; y++) rows.push(y);
 const t0 = performance.now();
-const counts = parallel.map(rows, mandelRow);
+const counts = await parallel.map(rows, mandelRow);
 let total = 0;
 for (const c of counts) total += c;
 const t1 = performance.now();

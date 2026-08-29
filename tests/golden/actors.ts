@@ -19,8 +19,8 @@ for (let i = 0; i < 50; i++) {
 }
 flaky.post({ type: "boom" });        // fails, logged, actor survives
 flaky.post({ type: "work" });
-console.log("counter:", counter.send({ type: "get" }));
-console.log("flaky survived:", flaky.send({ type: "count" }));
-console.log("counter unaffected:", counter.send({ type: "get" }));
+console.log("counter:", await counter.send({ type: "get" }));
+console.log("flaky survived:", await flaky.send({ type: "count" }));
+console.log("counter unaffected:", await counter.send({ type: "get" }));
 counter.stop();
 flaky.stop();

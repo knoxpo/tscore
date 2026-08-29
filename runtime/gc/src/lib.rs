@@ -5,7 +5,7 @@
 //! realms (parallel chunks) never collect — they drop wholesale.
 //! Per-realm heaps mean this never synchronizes across threads.
 
-use tsr_memory::{Heap, Kind, Ref, Value};
+use tsr_memory::{Foreign, Heap, Kind, PromiseState, Ref, Value};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GcStats {
@@ -20,6 +20,7 @@ struct Marks {
     arrs: Vec<bool>,
     closures: Vec<bool>,
     cells: Vec<bool>,
+    foreigns: Vec<bool>,
 }
 
 /// Collect the heap given its roots: the register stack and the globals.
@@ -35,6 +36,7 @@ pub fn collect<'a>(
         arrs: vec![false; heap.arrs.len()],
         closures: vec![false; heap.closures.len()],
         cells: vec![false; heap.cells.len()],
+        foreigns: vec![false; heap.foreigns.len()],
     };
     let mut work: Vec<Value> = Vec::with_capacity(stack.len() + 16);
     work.extend_from_slice(stack);
@@ -67,6 +69,26 @@ pub fn collect<'a>(
                     work.push(heap.cells[r as usize]);
                 }
             }
+            Kind::Foreign(r) => {
+                if !mark(&mut m.foreigns, r) {
+                    match &heap.foreigns[r as usize] {
+                        Foreign::Promise(p) => {
+                            if let PromiseState::Fulfilled(v) = p.state {
+                                work.push(v);
+                            }
+                            work.extend(p.reactions.iter().map(|&c| Value::foreign(c)));
+                        }
+                        Foreign::Coroutine(co) => {
+                            work.extend_from_slice(&co.regs);
+                            if let Some(c) = co.closure {
+                                work.push(Value::closure(c));
+                            }
+                            work.push(Value::foreign(co.promise));
+                        }
+                        Foreign::Handle(..) | Foreign::Free => {}
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -87,12 +109,24 @@ pub fn collect<'a>(
     freed += sweep(&m.cells, &mut heap.free_cells, |r| {
         heap.cells[r as usize] = Value::UNDEFINED;
     });
+    freed += sweep(&m.foreigns, &mut heap.free_foreigns, |r| {
+        // unobserved rejection dies here: surface it before dropping
+        if let Foreign::Promise(p) = &heap.foreigns[r as usize] {
+            if let PromiseState::Rejected(e) = &p.state {
+                if p.reactions.is_empty() && !e.cancelled {
+                    eprintln!("warning: unhandled promise rejection: {}", e.msg);
+                }
+            }
+        }
+        heap.foreigns[r as usize] = Foreign::Free;
+    });
 
     let total = heap.strs.len()
         + heap.objs.len()
         + heap.arrs.len()
         + heap.closures.len()
-        + heap.cells.len();
+        + heap.cells.len()
+        + heap.foreigns.len();
     stats.collections += 1;
     stats.last_freed = freed;
     stats.last_live = total - freed;
@@ -157,6 +191,7 @@ mod tests {
         let proto = Arc::new(tsc_ir::FunctionProto {
             name: Arc::from("f"),
             arity: 0,
+            is_async: false,
             n_regs: 1,
             code: vec![],
             consts: vec![],
