@@ -6,3 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tsr-realm.workspace = true
+tsr-memory.workspace = true
+tsr-task.workspace = true
+tsr-scheduler.workspace = true
+tsr-io.workspace = true
+tss-parallel.workspace = true

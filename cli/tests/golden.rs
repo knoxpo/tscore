@@ -78,3 +78,45 @@ fn runtime_error_has_span() {
         "{err}"
     );
 }
+
+// ---- M3 structured concurrency: failure paths ----
+
+fn run_expect_fail(source: &str) -> String {
+    let dir = std::env::temp_dir().join("tscore-golden");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join(format!("m3-{:x}.ts", source.len() * 31 + source.as_bytes()[0] as usize));
+    std::fs::write(&f, source).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tscore"))
+        .args(["run", f.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "expected failure");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn child_error_cancels_siblings_and_propagates() {
+    let start = std::time::Instant::now();
+    let err = run_expect_fail(
+        "task.scope((scope) => {\n\
+             scope.spawn(() => { let n = 0; while (true) { n++; } });\n\
+             scope.spawn(() => missingGlobal);\n\
+         });\n",
+    );
+    assert!(err.contains("task scope failed: missingGlobal is not defined"), "{err}");
+    // the spinning sibling was cancelled, not run to (never) completion
+    assert!(start.elapsed().as_secs() < 10, "sibling was not cancelled");
+}
+
+#[test]
+fn scope_timeout_cancels_children() {
+    let start = std::time::Instant::now();
+    let err = run_expect_fail(
+        "task.scope((scope) => {\n\
+             scope.spawn(() => { let n = 0; while (true) { n++; } });\n\
+         }, { timeout: 300 });\n",
+    );
+    assert!(err.contains("scope timed out after 300ms"), "{err}");
+    let secs = start.elapsed().as_secs_f64();
+    assert!(secs < 8.0, "timeout did not fire promptly: {secs}s");
+}

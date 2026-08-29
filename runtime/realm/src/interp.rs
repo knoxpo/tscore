@@ -36,13 +36,33 @@ pub fn run_main(realm: &mut Realm, main: &Arc<FunctionProto>) -> Result<Value, R
     result
 }
 
+// Register access: indices are emitter-guaranteed < base + n_regs and the
+// stack is sized to base + n_regs at frame entry (and only grows). Checked
+// in debug builds, unchecked in release — bounds checks are the biggest
+// per-instruction cost otherwise.
+macro_rules! reg {
+    ($realm:expr, $i:expr) => {{
+        let i = $i;
+        debug_assert!(i < $realm.stack.len());
+        unsafe { *$realm.stack.get_unchecked(i) }
+    }};
+}
+macro_rules! set_reg {
+    ($realm:expr, $i:expr, $v:expr) => {{
+        let i = $i;
+        let v = $v;
+        debug_assert!(i < $realm.stack.len());
+        unsafe { *$realm.stack.get_unchecked_mut(i) = v }
+    }};
+}
+
 macro_rules! num_bin {
     ($realm:ident, $proto:ident, $pc:ident, $ins:ident, $base:ident, $f:expr) => {{
-        let b = $realm.stack[$base + $ins.b as usize];
-        let c = $realm.stack[$base + $ins.c as usize];
+        let b = reg!($realm, $base + $ins.b as usize);
+        let c = reg!($realm, $base + $ins.c as usize);
         match (b, c) {
             (Value::Number(x), Value::Number(y)) => {
-                $realm.stack[$base + $ins.a as usize] = Value::Number($f(x, y));
+                set_reg!($realm, $base + $ins.a as usize, Value::Number($f(x, y)));
             }
             _ => return Err(err($proto, $pc, format!(
                 "cannot apply arithmetic to {} and {}", b.type_of(), c.type_of()))),
@@ -52,16 +72,16 @@ macro_rules! num_bin {
 
 macro_rules! int_bin {
     ($realm:ident, $ins:ident, $base:ident, $f:expr) => {{
-        let x = to_num($realm.stack[$base + $ins.b as usize]);
-        let y = to_num($realm.stack[$base + $ins.c as usize]);
-        $realm.stack[$base + $ins.a as usize] = Value::Number($f(x, y));
+        let x = to_num(reg!($realm, $base + $ins.b as usize));
+        let y = to_num(reg!($realm, $base + $ins.c as usize));
+        set_reg!($realm, $base + $ins.a as usize, Value::Number($f(x, y)));
     }};
 }
 
 macro_rules! cmp_bin {
     ($realm:ident, $proto:ident, $pc:ident, $ins:ident, $base:ident, $nf:expr, $sf:expr) => {{
-        let b = $realm.stack[$base + $ins.b as usize];
-        let c = $realm.stack[$base + $ins.c as usize];
+        let b = reg!($realm, $base + $ins.b as usize);
+        let c = reg!($realm, $base + $ins.c as usize);
         let r = match (b, c) {
             (Value::Number(x), Value::Number(y)) => $nf(&x, &y),
             (Value::Str(x), Value::Str(y)) => {
@@ -70,7 +90,25 @@ macro_rules! cmp_bin {
             _ => return Err(err($proto, $pc, format!(
                 "cannot compare {} and {}", b.type_of(), c.type_of()))),
         };
-        $realm.stack[$base + $ins.a as usize] = Value::Bool(r);
+        set_reg!($realm, $base + $ins.a as usize, Value::Bool(r));
+    }};
+}
+
+macro_rules! cmp_skip {
+    ($realm:ident, $proto:ident, $pc:ident, $ins:ident, $base:ident, $nf:expr, $sf:expr) => {{
+        let b = reg!($realm, $base + $ins.b as usize);
+        let c = reg!($realm, $base + $ins.c as usize);
+        let r = match (b, c) {
+            (Value::Number(x), Value::Number(y)) => $nf(&x, &y),
+            (Value::Str(x), Value::Str(y)) => {
+                $sf(&*$realm.heap.str_at(x).clone(), &*$realm.heap.str_at(y).clone())
+            }
+            _ => return Err(err($proto, $pc, format!(
+                "cannot compare {} and {}", b.type_of(), c.type_of()))),
+        };
+        if r {
+            $pc += 1;
+        }
     }};
 }
 
@@ -82,7 +120,15 @@ fn to_num(v: Value) -> f64 {
 }
 
 fn err(proto: &FunctionProto, pc: usize, msg: String) -> RtError {
-    RtError { msg, span: proto.spans.get(pc).copied() }
+    RtError { msg, span: proto.spans.get(pc).copied(), cancelled: false }
+}
+
+/// Attach a source span to an existing error, keeping its cancelled flag.
+fn at(mut e: RtError, proto: &FunctionProto, pc: usize) -> RtError {
+    if e.span.is_none() {
+        e.span = proto.spans.get(pc).copied();
+    }
+    e
 }
 
 /// Borrow a name constant — no Arc clone on the hot path (shared-refcount
@@ -104,12 +150,13 @@ fn const_str_arc(proto: &FunctionProto, idx: usize) -> Arc<str> {
 fn run_frame(
     realm: &mut Realm,
     closure: Option<tsr_memory::Ref>,
-    proto: &Arc<FunctionProto>,
+    proto: &FunctionProto,
     base: usize,
 ) -> Result<Value, RtError> {
     let mut pc: usize = 0;
     loop {
-        let ins = proto.code[pc];
+        debug_assert!(pc < proto.code.len());
+        let ins = unsafe { *proto.code.get_unchecked(pc) };
         let a = base + ins.a as usize;
         match ins.op {
             Op::LoadConst => {
@@ -125,11 +172,11 @@ fn run_frame(
             Op::LoadBool => realm.stack[a] = Value::Bool(ins.b != 0),
             Op::LoadNull => realm.stack[a] = Value::Null,
             Op::LoadUndef => realm.stack[a] = Value::Undefined,
-            Op::Move => realm.stack[a] = realm.stack[base + ins.b as usize],
+            Op::Move => realm.stack[a] = reg!(realm, base + ins.b as usize),
 
             Op::Add => {
-                let b = realm.stack[base + ins.b as usize];
-                let c = realm.stack[base + ins.c as usize];
+                let b = reg!(realm, base + ins.b as usize);
+                let c = reg!(realm, base + ins.c as usize);
                 realm.stack[a] = match (b, c) {
                     (Value::Number(x), Value::Number(y)) => Value::Number(x + y),
                     (Value::Str(_), _) | (_, Value::Str(_)) => {
@@ -148,7 +195,7 @@ fn run_frame(
             Op::Mod => num_bin!(realm, proto, pc, ins, base, |x: f64, y: f64| x % y),
             Op::Pow => num_bin!(realm, proto, pc, ins, base, |x: f64, y: f64| x.powf(y)),
             Op::Neg => {
-                let b = realm.stack[base + ins.b as usize];
+                let b = reg!(realm, base + ins.b as usize);
                 match b {
                     Value::Number(n) => realm.stack[a] = Value::Number(-n),
                     _ => return Err(err(proto, pc, format!("cannot negate {}", b.type_of()))),
@@ -168,33 +215,51 @@ fn run_frame(
                 (to_uint32(x) >> (to_uint32(y) & 31)) as f64
             }),
             Op::BitNot => {
-                let x = to_num(realm.stack[base + ins.b as usize]);
-                realm.stack[a] = Value::Number(!to_int32(x) as f64);
+                let x = to_num(reg!(realm, base + ins.b as usize));
+                set_reg!(realm, a, Value::Number(!to_int32(x) as f64));
             }
 
             Op::Eq => {
-                let b = realm.stack[base + ins.b as usize];
-                let c = realm.stack[base + ins.c as usize];
-                realm.stack[a] = Value::Bool(b.strict_eq(c, &realm.heap));
+                let b = reg!(realm, base + ins.b as usize);
+                let c = reg!(realm, base + ins.c as usize);
+                set_reg!(realm, a, Value::Bool(b.strict_eq(c, &realm.heap)));
             }
             Op::Ne => {
-                let b = realm.stack[base + ins.b as usize];
-                let c = realm.stack[base + ins.c as usize];
-                realm.stack[a] = Value::Bool(!b.strict_eq(c, &realm.heap));
+                let b = reg!(realm, base + ins.b as usize);
+                let c = reg!(realm, base + ins.c as usize);
+                set_reg!(realm, a, Value::Bool(!b.strict_eq(c, &realm.heap)));
             }
+            Op::EqSkip => {
+                let b = reg!(realm, base + ins.b as usize);
+                let c = reg!(realm, base + ins.c as usize);
+                if b.strict_eq(c, &realm.heap) {
+                    pc += 1;
+                }
+            }
+            Op::NeSkip => {
+                let b = reg!(realm, base + ins.b as usize);
+                let c = reg!(realm, base + ins.c as usize);
+                if !b.strict_eq(c, &realm.heap) {
+                    pc += 1;
+                }
+            }
+            Op::LtSkip => cmp_skip!(realm, proto, pc, ins, base, |x, y| f64::lt(x, y), str::lt),
+            Op::LeSkip => cmp_skip!(realm, proto, pc, ins, base, |x, y| f64::le(x, y), str::le),
+            Op::GtSkip => cmp_skip!(realm, proto, pc, ins, base, |x, y| f64::gt(x, y), str::gt),
+            Op::GeSkip => cmp_skip!(realm, proto, pc, ins, base, |x, y| f64::ge(x, y), str::ge),
             Op::Lt => cmp_bin!(realm, proto, pc, ins, base, |x, y| f64::lt(x, y), str::lt),
             Op::Le => cmp_bin!(realm, proto, pc, ins, base, |x, y| f64::le(x, y), str::le),
             Op::Gt => cmp_bin!(realm, proto, pc, ins, base, |x, y| f64::gt(x, y), str::gt),
             Op::Ge => cmp_bin!(realm, proto, pc, ins, base, |x, y| f64::ge(x, y), str::ge),
             Op::Not => {
-                let b = realm.stack[base + ins.b as usize];
-                realm.stack[a] = Value::Bool(!b.truthy(&realm.heap));
+                let b = reg!(realm, base + ins.b as usize);
+                set_reg!(realm, a, Value::Bool(!b.truthy(&realm.heap)));
             }
 
             Op::Jump => {
                 if ins.sbx() < 0 {
-                    // loop back-edge: GC safepoint (roots = stack + globals)
-                    realm.maybe_gc();
+                    // loop back-edge: cancellation + GC safepoint
+                    realm.safepoint().map_err(|e| at(e, proto, pc))?;
                 }
                 pc = (pc as i64 + ins.sbx() as i64) as usize;
             }
@@ -214,18 +279,21 @@ fn run_frame(
                 let argc = ins.b as usize;
                 match f {
                     Value::Closure(c) => {
-                        realm.maybe_gc(); // call safepoint
+                        realm.safepoint().map_err(|e| at(e, proto, pc))?;
                         let callee = realm.heap.closure(c).proto.clone();
                         let new_base = a + 1;
                         let need = new_base + callee.n_regs as usize;
                         if realm.stack.len() < need {
                             realm.stack.resize(need, Value::Undefined);
                         }
-                        for r in argc..callee.n_regs as usize {
+                        // missing args become undefined; other registers are
+                        // def-before-use by the emitter (stale values only
+                        // over-retain during GC, never misread)
+                        for r in argc..callee.arity as usize {
                             realm.stack[new_base + r] = Value::Undefined;
                         }
                         let result = run_frame(realm, Some(c), &callee, new_base)?;
-                        realm.stack[a] = result;
+                        set_reg!(realm, a, result);
                     }
                     Value::Native(i) => {
                         let native = realm.natives[i as usize].clone();
@@ -241,7 +309,7 @@ fn run_frame(
                             native(realm, &args)
                         }
                         .map_err(|e| err(proto, pc, e.msg))?;
-                        realm.stack[a] = result;
+                        set_reg!(realm, a, result);
                     }
                     _ => {
                         return Err(err(proto, pc, format!(
@@ -258,7 +326,7 @@ fn run_frame(
                 for u in &child.upvals {
                     let cell = match *u {
                         UpvalSrc::ParentLocal(reg) => {
-                            match realm.stack[base + reg as usize] {
+                            match reg!(realm, base + reg as usize) {
                                 Value::Cell(r) => r,
                                 v => {
                                     return Err(err(proto, pc, format!(
@@ -274,21 +342,21 @@ fn run_frame(
                     upvals.push(cell);
                 }
                 let r = realm.heap.alloc_closure(Closure { proto: child, upvals });
-                realm.stack[a] = Value::Closure(r);
+                set_reg!(realm, a, Value::Closure(r));
             }
             Op::NewCell => {
                 let init = realm.stack[a];
                 let r = realm.heap.alloc_cell(init);
-                realm.stack[a] = Value::Cell(r);
+                set_reg!(realm, a, Value::Cell(r));
             }
-            Op::LoadCell => match realm.stack[base + ins.b as usize] {
+            Op::LoadCell => match reg!(realm, base + ins.b as usize) {
                 Value::Cell(r) => realm.stack[a] = *realm.heap.cell(r),
                 v => return Err(err(proto, pc, format!(
                     "internal: LoadCell on {}", v.type_of()))),
             },
             Op::StoreCell => match realm.stack[a] {
                 Value::Cell(r) => {
-                    *realm.heap.cell_mut(r) = realm.stack[base + ins.b as usize]
+                    *realm.heap.cell_mut(r) = reg!(realm, base + ins.b as usize)
                 }
                 v => return Err(err(proto, pc, format!(
                     "internal: StoreCell on {}", v.type_of()))),
@@ -296,31 +364,31 @@ fn run_frame(
             Op::GetUpval => {
                 let c = closure.expect("GetUpval outside closure");
                 let cell = realm.heap.closure(c).upvals[ins.b as usize];
-                realm.stack[a] = *realm.heap.cell(cell);
+                set_reg!(realm, a, *realm.heap.cell(cell));
             }
             Op::SetUpval => {
                 let c = closure.expect("SetUpval outside closure");
                 let cell = realm.heap.closure(c).upvals[ins.a as usize];
-                *realm.heap.cell_mut(cell) = realm.stack[base + ins.b as usize];
+                *realm.heap.cell_mut(cell) = reg!(realm, base + ins.b as usize);
             }
 
             Op::NewObject => {
                 let r = realm.heap.alloc_obj(Default::default());
-                realm.stack[a] = Value::Object(r);
+                set_reg!(realm, a, Value::Object(r));
             }
             Op::NewArray => {
                 let r = realm.heap.alloc_arr(Vec::with_capacity(ins.b as usize));
-                realm.stack[a] = Value::Array(r);
+                set_reg!(realm, a, Value::Array(r));
             }
             Op::GetField => {
-                let obj = realm.stack[base + ins.b as usize];
+                let obj = reg!(realm, base + ins.b as usize);
                 let name = const_str(proto, ins.c as usize);
                 realm.stack[a] = get_field(realm, obj, name)
                     .map_err(|e| err(proto, pc, e.msg))?;
             }
             Op::SetField => {
                 let name = const_str_arc(proto, ins.b as usize);
-                let v = realm.stack[base + ins.c as usize];
+                let v = reg!(realm, base + ins.c as usize);
                 match realm.stack[a] {
                     Value::Object(r) => realm.heap.obj_mut(r).set(name, v),
                     t => return Err(err(proto, pc, format!(
@@ -328,8 +396,8 @@ fn run_frame(
                 }
             }
             Op::GetIndex => {
-                let obj = realm.stack[base + ins.b as usize];
-                let idx = realm.stack[base + ins.c as usize];
+                let obj = reg!(realm, base + ins.b as usize);
+                let idx = reg!(realm, base + ins.c as usize);
                 realm.stack[a] = match (obj, idx) {
                     (Value::Array(r), Value::Number(n)) => {
                         realm.heap.arr(r).get(n as usize).copied()
@@ -345,8 +413,8 @@ fn run_frame(
                 };
             }
             Op::SetIndex => {
-                let idx = realm.stack[base + ins.b as usize];
-                let v = realm.stack[base + ins.c as usize];
+                let idx = reg!(realm, base + ins.b as usize);
+                let v = reg!(realm, base + ins.c as usize);
                 match (realm.stack[a], idx) {
                     (Value::Array(r), Value::Number(n)) => {
                         let arr = realm.heap.arr_mut(r);
@@ -369,7 +437,7 @@ fn run_frame(
                 }
             }
             Op::Len => {
-                let b = realm.stack[base + ins.b as usize];
+                let b = reg!(realm, base + ins.b as usize);
                 realm.stack[a] = match b {
                     Value::Array(r) => Value::Number(realm.heap.arr(r).len() as f64),
                     Value::Str(r) => {
@@ -382,7 +450,7 @@ fn run_frame(
                 };
             }
             Op::ArrayPush => {
-                let v = realm.stack[base + ins.b as usize];
+                let v = reg!(realm, base + ins.b as usize);
                 match realm.stack[a] {
                     Value::Array(r) => realm.heap.arr_mut(r).push(v),
                     t => return Err(err(proto, pc, format!(
@@ -398,14 +466,14 @@ fn run_frame(
             }
 
             Op::Concat => {
-                let b = realm.stack[base + ins.b as usize];
-                let c = realm.stack[base + ins.c as usize];
+                let b = reg!(realm, base + ins.b as usize);
+                let c = reg!(realm, base + ins.c as usize);
                 let s = format!("{}{}", b.display(&realm.heap), c.display(&realm.heap));
-                realm.stack[a] = realm.alloc_string(&s);
+                set_reg!(realm, a, realm.alloc_string(&s));
             }
             Op::TypeOf => {
-                let b = realm.stack[base + ins.b as usize];
-                realm.stack[a] = realm.alloc_string(b.type_of());
+                let b = reg!(realm, base + ins.b as usize);
+                set_reg!(realm, a, realm.alloc_string(b.type_of()));
             }
         }
         pc += 1;

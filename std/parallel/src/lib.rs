@@ -16,20 +16,28 @@ use tsr_task::portable::{clone_out, rehydrate};
 use tsr_task::PortableValue;
 
 static POOL: OnceLock<Pool> = OnceLock::new();
+static CONFIGURED_WORKERS: OnceLock<usize> = OnceLock::new();
 
-fn pool(workers: Option<usize>) -> &'static Pool {
-    POOL.get_or_init(|| {
-        let n = workers.unwrap_or_else(|| {
+/// Record the desired worker count without spawning anything (startup cost:
+/// zero). Returns the effective count. First call wins.
+pub fn configure(workers: Option<usize>) -> usize {
+    *CONFIGURED_WORKERS.get_or_init(|| {
+        workers.unwrap_or_else(|| {
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-        });
-        Pool::new(n)
+        })
     })
+}
+
+/// The process-wide scheduler pool. Built lazily on first parallel /
+/// task.scope use — programs that never go parallel never spawn threads.
+pub fn shared_pool() -> &'static Pool {
+    POOL.get_or_init(|| Pool::new(configure(None)))
 }
 
 /// Install `parallel` and `runtime.cpu` globals. First call fixes the
 /// worker count for the process.
 pub fn install(realm: &mut Realm, workers: Option<usize>) {
-    let n_workers = pool(workers).workers();
+    let n_workers = configure(workers);
 
     let map = realm.add_native(|realm, args| run_parallel(realm, args, true));
     let for_ = realm.add_native(|realm, args| run_parallel(realm, args, false));
@@ -61,7 +69,7 @@ fn run_parallel(
             ))
         }
     };
-    let pool = pool(None);
+    let pool = shared_pool();
     let n_items = realm.heap.arr(arr).len();
     if n_items == 0 {
         return Ok(if collect {
@@ -81,11 +89,11 @@ fn run_parallel(
             .map_err(RtError::new)?
     };
 
-    // ponytail: static 4×workers chunks + work stealing; lazy binary
+    // ponytail: static 8×workers chunks + work stealing; lazy binary
     // splitting if benchmarks show skew starving workers. No minimum chunk
     // size: per-chunk overhead (realm setup + clone) is ~µs, so
     // over-chunking small heavy inputs costs less than under-chunking them.
-    let chunk_size = n_items.div_ceil(4 * pool.workers()).max(1);
+    let chunk_size = n_items.div_ceil(8 * pool.workers()).max(1);
 
     let results: Arc<Mutex<Vec<Option<PortableValue>>>> =
         Arc::new(Mutex::new(if collect { vec![None; n_items] } else { Vec::new() }));

@@ -10,8 +10,8 @@ const results = await parallel.map(records, processRecord);
 // runtime handles: partitioning, work stealing, core placement, isolation
 ```
 
-**Status:** M2 "Actors + Heap Isolation" complete (M1 "Multicore Proof"
-before it) — custom bytecode interpreter (register machine, per-realm
+**Status:** M3 "Structured Concurrency" complete (M1 Multicore Proof, M2
+Actors before it) — custom bytecode interpreter (register machine, per-realm
 isolated heaps, mark-sweep GC), work-stealing scheduler, actor runtime.
 ARM64 macOS/Linux.
 
@@ -19,9 +19,9 @@ ARM64 macOS/Linux.
 
 | workload | 2 cores | 4 cores | 8 cores | target (2/4/8) |
 |---|---|---|---|---|
-| primes | 1.86× | 3.58× | 5.95× | ≥1.7 / 3.0 / 5.5 |
-| fnv | 1.97× | 3.93× | 6.37× | ✓ |
-| mandelbrot | 1.98× | 3.72× | 5.99× | ✓ |
+| primes | 1.88× | 3.73× | 6.79× | ≥1.7 / 3.0 / 5.5 |
+| fnv | 1.84× | 3.65× | 5.69× | ✓ |
+| mandelbrot | 1.97× | 3.71× | 6.43× | ✓ |
 
 Output is bit-identical at every worker count (clone-at-spawn semantics).
 Single-core absolute speed vs V8 is an explicit non-goal at M1 — the claim
@@ -46,6 +46,21 @@ Each actor owns an isolated realm (heap + GC) on a dedicated thread with a
 bounded mailbox; messages cross realms as structured clones, handler
 failures stay inside the actor. See
 [actors spec](docs/specifications/actors-m2.md).
+
+## Structured concurrency (M3)
+
+```typescript
+const total = task.scope((scope) => {
+    const a = scope.spawn(() => heavyA());
+    const b = scope.spawn(() => heavyB());
+    return a.join() + b.join();      // scope exits only when ALL children did
+}, { timeout: 5000 });
+```
+
+Child errors cancel siblings and propagate to the parent; cancellation is
+cooperative at interpreter safepoints (`handle.cancel()`, scope timeouts,
+`Runtime.checkCancellation()`), and cascades through nested scopes. See
+[structured concurrency spec](docs/specifications/structured-concurrency-m3.md).
 
 ## Try it
 

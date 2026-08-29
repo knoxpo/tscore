@@ -70,6 +70,15 @@ pub enum Op {
     Gt,
     Ge,
     Not, // A = !B
+    // fused compare+branch: if (B op C) skip the next instruction (which
+    // the emitter guarantees is a Jump). One dispatch instead of two on
+    // the hot (true) path of loop conditions.
+    EqSkip,
+    NeSkip,
+    LtSkip,
+    LeSkip,
+    GtSkip,
+    GeSkip,
     // control
     Jump,        // pc += sBx
     JumpIfFalse, // if !truthy(A) pc += sBx

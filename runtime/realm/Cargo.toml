@@ -9,3 +9,4 @@ license.workspace = true
 tsc-ir.workspace = true
 tsr-memory.workspace = true
 tsr-gc.workspace = true
+rustc-hash = "2.1.3"

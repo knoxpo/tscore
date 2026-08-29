@@ -8,3 +8,9 @@ license.workspace = true
 [dependencies]
 crossbeam-deque.workspace = true
 parking_lot.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tsp-macos.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tsp-linux.workspace = true

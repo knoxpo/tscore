@@ -35,3 +35,9 @@ Each ported 1:1 to every comparison runtime, same algorithm, no SIMD tricks.
 - Clone/rehydrate time measured and reported **separately** from compute.
 - `benchmarks/run.sh` emits the table and asserts the targets.
 - Machine topology (`sysctl`/`/proc`) recorded in every report.
+
+## Machine-state caveat
+
+Absolute times on laptops swing ±40% with power/thermal state (observed:
+same binary, same day, 8.7s vs 12.4s on fnv serial). Benchmark plugged in,
+compare only numbers from one session, and trust ratios over absolutes.

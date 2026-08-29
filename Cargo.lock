@@ -660,6 +660,7 @@ dependencies = [
  "tsr-actor",
  "tsr-io",
  "tsr-realm",
+ "tss-async",
  "tss-parallel",
 ]
 
@@ -674,6 +675,9 @@ version = "0.1.0"
 [[package]]
 name = "tsp-macos"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "tsp-riscv64"
@@ -721,6 +725,7 @@ dependencies = [
 name = "tsr-realm"
 version = "0.1.0"
 dependencies = [
+ "rustc-hash",
  "tsc-ir",
  "tsr-gc",
  "tsr-memory",
@@ -732,6 +737,8 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-deque",
  "parking_lot",
+ "tsp-linux",
+ "tsp-macos",
 ]
 
 [[package]]
@@ -745,6 +752,14 @@ dependencies = [
 [[package]]
 name = "tss-async"
 version = "0.1.0"
+dependencies = [
+ "tsr-io",
+ "tsr-memory",
+ "tsr-realm",
+ "tsr-scheduler",
+ "tsr-task",
+ "tss-parallel",
+]
 
 [[package]]
 name = "tss-collections"

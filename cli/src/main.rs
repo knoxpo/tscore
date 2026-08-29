@@ -72,6 +72,7 @@ fn main() -> ExitCode {
     tsr_io::install(&mut realm);
     tss_parallel::install(&mut realm, workers);
     tsr_actor::install(&mut realm);
+    tss_async::install(&mut realm);
 
     match tsr_realm::interp::run_main(&mut realm, &chunk.main) {
         Ok(_) => ExitCode::SUCCESS,

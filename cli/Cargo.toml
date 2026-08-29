@@ -16,3 +16,4 @@ tsr-realm.workspace = true
 tsr-io.workspace = true
 tss-parallel.workspace = true
 tsr-actor.workspace = true
+tss-async.workspace = true

@@ -12,17 +12,27 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-type JobFn = Box<dyn FnOnce(&Ctx) + Send>;
+pub type JobFn = Box<dyn FnOnce(&Ctx) + Send>;
 
 struct JobUnit {
-    batch: Arc<BatchState>,
+    batch: Arc<Batch>,
     f: JobFn,
 }
 
-struct BatchState {
+/// A group of jobs with a shared completion counter. `Pool::wait` blocks
+/// (and helps) until every job — including nested spawns — finished.
+pub struct Batch {
     remaining: AtomicUsize,
-    m: Mutex<()>,
-    cv: Condvar,
+}
+
+impl Batch {
+    pub fn new() -> Arc<Batch> {
+        Arc::new(Batch { remaining: AtomicUsize::new(0) })
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.remaining.load(Ordering::SeqCst) == 0
+    }
 }
 
 struct Shared {
@@ -30,14 +40,35 @@ struct Shared {
     stealers: Vec<Stealer<JobUnit>>,
     sleep_m: Mutex<()>,
     sleep_cv: Condvar,
+    /// Threads currently parked (or about to park) — completion only
+    /// notifies when someone is listening.
+    sleepers: AtomicUsize,
     shutdown: AtomicBool,
+}
+
+impl Shared {
+    fn notify(&self) {
+        if self.sleepers.load(Ordering::SeqCst) > 0 {
+            self.sleep_cv.notify_all();
+        }
+    }
+
+    fn park(&self, timeout: Duration, recheck: impl Fn() -> bool) {
+        self.sleepers.fetch_add(1, Ordering::SeqCst);
+        let mut g = self.sleep_m.lock();
+        if !recheck() {
+            self.sleep_cv.wait_for(&mut g, timeout);
+        }
+        drop(g);
+        self.sleepers.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Execution context handed to every job; lets a job spawn subtasks into
 /// the same batch (pushed to the running worker's own deque when on a
 /// worker thread, the injector otherwise).
 pub struct Ctx<'a> {
-    batch: &'a Arc<BatchState>,
+    batch: &'a Arc<Batch>,
     local: Option<&'a Worker<JobUnit>>,
     shared: &'a Shared,
 }
@@ -50,7 +81,7 @@ impl Ctx<'_> {
             Some(w) => w.push(unit),
             None => self.shared.injector.push(unit),
         }
-        self.shared.sleep_cv.notify_all();
+        self.shared.notify();
     }
 }
 
@@ -74,6 +105,7 @@ impl Pool {
             stealers,
             sleep_m: Mutex::new(()),
             sleep_cv: Condvar::new(),
+            sleepers: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
         });
         let handles = workers
@@ -83,7 +115,13 @@ impl Pool {
                 let shared = shared.clone();
                 std::thread::Builder::new()
                     .name(format!("tscore-worker-{i}"))
-                    .spawn(move || worker_loop(w, i, &shared))
+                    .spawn(move || {
+                        #[cfg(target_os = "macos")]
+                        tsp_macos::prefer_performance_cores();
+                        #[cfg(target_os = "linux")]
+                        tsp_linux::prefer_performance_cores();
+                        worker_loop(w, i, &shared)
+                    })
                     .expect("spawn worker")
             })
             .collect();
@@ -94,47 +132,48 @@ impl Pool {
         self.n_workers
     }
 
-    /// Run a batch of jobs to completion. The calling thread helps execute
-    /// (steals) until every job — including nested spawns — has finished.
+    /// Submit one job into a batch; it starts as soon as a worker is free.
+    pub fn submit(&self, batch: &Arc<Batch>, f: JobFn) {
+        batch.remaining.fetch_add(1, Ordering::SeqCst);
+        self.shared.injector.push(JobUnit { batch: batch.clone(), f });
+        self.shared.notify();
+    }
+
+    /// Help execute pool work until `done()` — used by batch waits and by
+    /// join-style blocking. Parks briefly when no work is visible.
+    pub fn help_until(&self, done: impl Fn() -> bool) {
+        while !done() {
+            if let Some(unit) = find_job(&self.shared, None, usize::MAX) {
+                run_unit(unit, None, &self.shared);
+            } else {
+                // timeout: work may sit in a worker deque between steals
+                self.shared.park(Duration::from_micros(200), &done);
+            }
+        }
+    }
+
+    /// Block (helping) until the batch — including nested spawns — drains.
+    pub fn wait(&self, batch: &Arc<Batch>) {
+        self.help_until(|| batch.is_done());
+    }
+
+    /// Convenience: submit all jobs, wait for completion.
     pub fn run_batch<I>(&self, jobs: I)
     where
         I: IntoIterator<Item = JobFn>,
     {
-        let batch = Arc::new(BatchState {
-            remaining: AtomicUsize::new(0),
-            m: Mutex::new(()),
-            cv: Condvar::new(),
-        });
-        let mut n = 0usize;
+        let batch = Batch::new();
         for f in jobs {
-            batch.remaining.fetch_add(1, Ordering::SeqCst);
-            self.shared.injector.push(JobUnit { batch: batch.clone(), f });
-            n += 1;
+            self.submit(&batch, f);
         }
-        if n == 0 {
-            return;
-        }
-        self.shared.sleep_cv.notify_all();
-        // caller helps: pull from injector / steal from workers
-        while batch.remaining.load(Ordering::SeqCst) != 0 {
-            if let Some(unit) = find_job(&self.shared, None, usize::MAX) {
-                run_unit(unit, None, &self.shared);
-            } else {
-                let mut g = batch.m.lock();
-                if batch.remaining.load(Ordering::SeqCst) != 0 {
-                    // timeout: work may sit in a worker deque we cannot see
-                    // between steal attempts
-                    batch.cv.wait_for(&mut g, Duration::from_micros(200));
-                }
-            }
-        }
+        self.wait(&batch);
     }
 }
 
 impl Drop for Pool {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
-        self.shared.sleep_cv.notify_all();
+        self.shared.sleep_cv.notify_all(); // wake parked workers for shutdown
         for h in self.handles.drain(..) {
             let _ = h.join();
         }
@@ -144,10 +183,8 @@ impl Drop for Pool {
 fn run_unit(unit: JobUnit, local: Option<&Worker<JobUnit>>, shared: &Shared) {
     let ctx = Ctx { batch: &unit.batch, local, shared };
     (unit.f)(&ctx);
-    if unit.batch.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
-        let _g = unit.batch.m.lock();
-        unit.batch.cv.notify_all();
-    }
+    unit.batch.remaining.fetch_sub(1, Ordering::SeqCst);
+    shared.notify();
 }
 
 fn find_job(
@@ -195,16 +232,15 @@ fn worker_loop(w: Worker<JobUnit>, idx: usize, shared: &Shared) {
         match find_job(shared, Some(&w), idx) {
             Some(unit) => run_unit(unit, Some(&w), shared),
             None => {
-                let mut g = shared.sleep_m.lock();
                 if shared.shutdown.load(Ordering::SeqCst) {
                     return;
                 }
                 // ponytail: timed park instead of Rayon's sleep/wake
                 // protocol; bounded 1ms staleness, upgrade if profiles show
                 // idle burn
-                shared
-                    .sleep_cv
-                    .wait_for(&mut g, Duration::from_millis(1));
+                shared.park(Duration::from_millis(1), || {
+                    shared.shutdown.load(Ordering::SeqCst)
+                });
             }
         }
     }

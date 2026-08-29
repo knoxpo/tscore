@@ -5,7 +5,7 @@
 
 pub mod interp;
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use tsr_memory::{Heap, Value};
 
@@ -14,11 +14,17 @@ pub struct RtError {
     pub msg: String,
     /// Source byte offset, when known.
     pub span: Option<u32>,
+    /// True when this "error" is cooperative cancellation, not a failure.
+    pub cancelled: bool,
 }
 
 impl RtError {
     pub fn new(msg: impl Into<String>) -> Self {
-        RtError { msg: msg.into(), span: None }
+        RtError { msg: msg.into(), span: None, cancelled: false }
+    }
+
+    pub fn cancelled() -> Self {
+        RtError { msg: "task cancelled".into(), span: None, cancelled: true }
     }
 }
 
@@ -33,25 +39,42 @@ pub type NativeFn =
 
 pub struct Realm {
     pub heap: Heap,
-    pub globals: HashMap<Arc<str>, Value>,
+    pub globals: FxHashMap<Arc<str>, Value>,
     pub natives: Vec<NativeFn>,
     /// Register stack shared by all frames in this realm.
     pub stack: Vec<Value>,
     /// Scratch realms (parallel chunks) set this false: they drop wholesale.
     pub gc_enabled: bool,
     pub gc_stats: tsr_gc::GcStats,
+    /// Cooperative cancellation flag, checked at interpreter safepoints.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Realm {
     pub fn new() -> Self {
         Realm {
             heap: Heap::new(),
-            globals: HashMap::new(),
+            globals: FxHashMap::default(),
             natives: Vec::new(),
-            stack: Vec::new(),
+            // page-sized reservation: keeps per-thread register stacks off
+            // shared cache lines / size-class neighborhoods
+            stack: Vec::with_capacity(4096),
             gc_enabled: true,
             gc_stats: tsr_gc::GcStats::default(),
+            cancel: None,
         }
+    }
+
+    /// Safepoint: cancellation check, then GC check. Called at loop
+    /// back-edges and closure calls.
+    pub fn safepoint(&mut self) -> Result<(), RtError> {
+        if let Some(c) = &self.cancel {
+            if c.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(RtError::cancelled());
+            }
+        }
+        self.maybe_gc();
+        Ok(())
     }
 
     pub fn maybe_gc(&mut self) {

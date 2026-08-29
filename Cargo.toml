@@ -72,3 +72,7 @@ parking_lot = "0.12"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.profiling]
+inherits = "release"
+debug = true

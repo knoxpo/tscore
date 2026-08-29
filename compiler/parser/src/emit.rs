@@ -265,6 +265,98 @@ impl Emitter {
         Ok(())
     }
 
+    /// Register holding a plain (non-captured) local — usable directly as
+    /// an operand, skipping a Move to a temp.
+    fn local_operand(&mut self, e: &Expression) -> Option<u8> {
+        if let Expression::Identifier(id) = e {
+            if !matches!(&*id.name, "undefined" | "NaN" | "Infinity") {
+                if let Place::Local(l) = self.resolve(&id.name) {
+                    if !l.captured {
+                        return Some(l.reg);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// True when evaluating `e` cannot write any local (safe to read the
+    /// left operand's register after evaluating `e`).
+    fn is_effect_free(e: &Expression) -> bool {
+        match e {
+            Expression::NumericLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::Identifier(_) => true,
+            Expression::ParenthesizedExpression(p) => Self::is_effect_free(&p.expression),
+            Expression::StaticMemberExpression(m) => Self::is_effect_free(&m.object),
+            Expression::ComputedMemberExpression(m) => {
+                Self::is_effect_free(&m.object) && Self::is_effect_free(&m.expression)
+            }
+            Expression::UnaryExpression(u) => Self::is_effect_free(&u.argument),
+            Expression::BinaryExpression(b) => {
+                Self::is_effect_free(&b.left) && Self::is_effect_free(&b.right)
+            }
+            _ => false,
+        }
+    }
+
+    /// Emit a loop/if condition and return the jump-to-patch for the false
+    /// path. A test that is syntactically a plain comparison fuses into a
+    /// compare-and-skip op (one dispatch on the hot path). Only whole-test
+    /// comparisons fuse — short-circuit tests keep the two-op form because
+    /// their internal jumps may land right after the compare.
+    fn emit_test_jump(&mut self, test: &Expression) -> R<usize> {
+        let mut t = test;
+        while let Expression::ParenthesizedExpression(p) = t {
+            t = &p.expression;
+        }
+        if let Expression::BinaryExpression(b) = t {
+            let skip_op = match b.operator {
+                BinaryOperator::Equality | BinaryOperator::StrictEquality => Some(Op::EqSkip),
+                BinaryOperator::Inequality | BinaryOperator::StrictInequality => {
+                    Some(Op::NeSkip)
+                }
+                BinaryOperator::LessThan => Some(Op::LtSkip),
+                BinaryOperator::LessEqualThan => Some(Op::LeSkip),
+                BinaryOperator::GreaterThan => Some(Op::GtSkip),
+                BinaryOperator::GreaterEqualThan => Some(Op::GeSkip),
+                _ => None,
+            };
+            if let Some(op) = skip_op {
+                let mark = self.mark();
+                let rb = match self.local_operand(&b.left) {
+                    Some(r) if Self::is_effect_free(&b.right) => r,
+                    _ => {
+                        let r = self.alloc_reg(b.span.start)?;
+                        self.expr(&b.left, r)?;
+                        r
+                    }
+                };
+                let rc = match self.local_operand(&b.right) {
+                    Some(r) => r,
+                    None => {
+                        let r = self.alloc_reg(b.span.start)?;
+                        self.expr(&b.right, r)?;
+                        r
+                    }
+                };
+                self.cur_span = b.span.start;
+                self.emit(op, 0, rb, rc);
+                let j = self.emit_jump(Op::Jump, 0);
+                self.free_to(mark);
+                return Ok(j);
+            }
+        }
+        let mark = self.mark();
+        let cond = self.alloc_reg(test.span().start)?;
+        self.expr(test, cond)?;
+        let j = self.emit_jump(Op::JumpIfFalse, cond);
+        self.free_to(mark);
+        Ok(j)
+    }
+
     fn hoist_functions(&mut self, stmts: &[Statement]) -> R {
         for s in stmts {
             if let Statement::FunctionDeclaration(f) = s {
@@ -338,6 +430,12 @@ impl Emitter {
                 Ok(())
             }
             Statement::ReturnStatement(r) => {
+                if let Some(arg) = &r.argument {
+                    if let Some(reg) = self.local_operand(arg) {
+                        self.emit(Op::Return, reg, 0, 0);
+                        return Ok(());
+                    }
+                }
                 let mark = self.mark();
                 let tmp = self.alloc_reg(r.span.start)?;
                 match &r.argument {
@@ -351,11 +449,7 @@ impl Emitter {
                 Ok(())
             }
             Statement::IfStatement(i) => {
-                let mark = self.mark();
-                let cond = self.alloc_reg(i.span.start)?;
-                self.expr(&i.test, cond)?;
-                let jf = self.emit_jump(Op::JumpIfFalse, cond);
-                self.free_to(mark);
+                let jf = self.emit_test_jump(&i.test)?;
                 self.stmt(&i.consequent)?;
                 match &i.alternate {
                     Some(alt) => {
@@ -370,11 +464,7 @@ impl Emitter {
             }
             Statement::WhileStatement(w) => {
                 let top = self.f().code.len();
-                let mark = self.mark();
-                let cond = self.alloc_reg(w.span.start)?;
-                self.expr(&w.test, cond)?;
-                let jf = self.emit_jump(Op::JumpIfFalse, cond);
-                self.free_to(mark);
+                let jf = self.emit_test_jump(&w.test)?;
                 self.f().loops.push(LoopCtx {
                     break_jumps: vec![],
                     continue_jumps: vec![],
@@ -433,14 +523,7 @@ impl Emitter {
                 }
                 let top = self.f().code.len();
                 let jf = match &f.test {
-                    Some(test) => {
-                        let mark = self.mark();
-                        let cond = self.alloc_reg(f.span.start)?;
-                        self.expr(test, cond)?;
-                        let jf = self.emit_jump(Op::JumpIfFalse, cond);
-                        self.free_to(mark);
-                        Some(jf)
-                    }
+                    Some(test) => Some(self.emit_test_jump(test)?),
                     None => None,
                 };
                 self.f().loops.push(LoopCtx {
@@ -485,13 +568,12 @@ impl Emitter {
                 self.expr(&f.right, arr)?;
                 let idx = self.alloc_reg(f.span.start)?;
                 let len = self.alloc_reg(f.span.start)?;
-                let cond = self.alloc_reg(f.span.start)?;
                 self.emit_abx(Op::LoadInt, idx, tsc_ir::SBX_BIAS as u16); // 0
                 let elem = self.declare_local(&b.name, b.span.start)?;
                 let top = self.f().code.len();
                 self.emit(Op::Len, len, arr, 0);
-                self.emit(Op::Lt, cond, idx, len);
-                let jf = self.emit_jump(Op::JumpIfFalse, cond);
+                self.emit(Op::LtSkip, 0, idx, len);
+                let jf = self.emit_jump(Op::Jump, 0);
                 self.emit(Op::GetIndex, elem.reg, arr, idx);
                 if elem.captured {
                     // fresh cell per iteration = correct `let` semantics
@@ -707,10 +789,23 @@ impl Emitter {
                     }
                 };
                 let mark = self.mark();
-                let rb = self.alloc_reg(b.span.start)?;
-                self.expr(&b.left, rb)?;
-                let rc = self.alloc_reg(b.span.start)?;
-                self.expr(&b.right, rc)?;
+                // operands read local registers directly when safe
+                let rb = match self.local_operand(&b.left) {
+                    Some(r) if Self::is_effect_free(&b.right) => r,
+                    _ => {
+                        let r = self.alloc_reg(b.span.start)?;
+                        self.expr(&b.left, r)?;
+                        r
+                    }
+                };
+                let rc = match self.local_operand(&b.right) {
+                    Some(r) => r,
+                    None => {
+                        let r = self.alloc_reg(b.span.start)?;
+                        self.expr(&b.right, r)?;
+                        r
+                    }
+                };
                 self.cur_span = b.span.start;
                 self.emit(op, dst, rb, rc);
                 self.free_to(mark);
