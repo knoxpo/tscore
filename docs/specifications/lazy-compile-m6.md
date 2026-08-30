@@ -1,5 +1,16 @@
 # M6: lazy function compilation
 
+> **Status: SHIPPED** (M6a–M6d). Parse row 21.7ms → ~12-13.5ms end-to-end
+> on 50k LOC — statistical tie with bun (13.5 ± 3.9 same session); emit
+> at startup 10ms → 0.2ms, resolve 4.4ms → 1.9ms. Remaining floor is oxc
+> parse (~6.4ms) + process startup (~1.5ms). Deviations from the plan
+> below: spans are preserved by left-padding the re-parsed snippet to its
+> original file offset (no `env`-relative remapping, no LazyFile capture
+> tables — the fill re-resolves the snippet with the stored upvalue names
+> pre-seeded); parameter-pattern errors stay eager via a header-time scan;
+> resolve fast-path used borrowed AST names + linear-scan scopes with a
+> side index past 32 entries rather than oxc Atom plumbing.
+
 Target: win the parse+compile row (~50k LOC: tscore 21.7ms vs bun 11.8ms)
 and cut startup further, with zero regression on steady-state rows.
 

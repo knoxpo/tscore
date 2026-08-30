@@ -63,9 +63,11 @@ pub fn install(realm: &mut Realm, workers: Option<usize>) {
     // Once-guarded: install() also runs per scratch realm.
     static WARM: std::sync::Once = std::sync::Once::new();
     WARM.call_once(|| {
-        std::thread::spawn(|| {
-            let _ = shared_pool();
-        });
+        if std::env::var_os("TSC_NO_POOL_WARM").is_none() {
+            std::thread::spawn(|| {
+                let _ = shared_pool();
+            });
+        }
     });
 
     let map = realm.add_native(|realm, args| run_parallel(realm, args, true));

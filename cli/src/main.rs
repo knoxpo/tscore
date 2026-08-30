@@ -67,6 +67,8 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
+    let t_start = std::time::Instant::now();
+    let phases = std::env::var_os("TSC_COMPILE_PHASES").is_some();
     let source = match std::fs::read_to_string(&file) {
         Ok(s) => s,
         Err(e) => {
@@ -75,6 +77,9 @@ fn main() -> ExitCode {
         }
     };
 
+    if phases {
+        eprintln!("[cli] read={:?}", t_start.elapsed());
+    }
     let chunk = match tsc_parser::compile(&source, &file) {
         Ok(c) => c,
         Err(e) => {
@@ -116,7 +121,12 @@ fn main() -> ExitCode {
             tsr_actor::install(&mut realm);
             tss_async::install(&mut realm);
             tsr_channel::install(&mut realm);
-            tsr_realm::interp::run_main(&mut realm, &chunk.main)
+            {
+                if std::env::var_os("TSC_COMPILE_PHASES").is_some() {
+                    eprintln!("[cli] to-exec={:?}", t_start.elapsed());
+                }
+                tsr_realm::interp::run_main(&mut realm, &chunk.main)
+            }
         })
         .expect("spawn main realm thread")
         .join()

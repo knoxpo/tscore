@@ -11,8 +11,41 @@ pub type BindingId = u32;
 /// Function identity = span start of its Function/Arrow node.
 pub type FnId = u32;
 
-struct Scope {
-    names: HashMap<String, (BindingId, usize)>,
+/// Small linear-scan scope: cheaper than a HashMap at typical sizes and
+/// allocation-free (names borrow from the AST). Scopes that grow past
+/// SCOPE_INDEX_AT (the 12k-function top level of a generated bundle)
+/// get a side index.
+const SCOPE_INDEX_AT: usize = 32;
+
+struct Scope<'a> {
+    names: Vec<(&'a str, (BindingId, usize))>,
+    /// name -> index into `names` of its latest declaration.
+    index: Option<HashMap<&'a str, usize>>,
+}
+
+impl<'a> Scope<'a> {
+    fn new() -> Self {
+        Scope { names: Vec::new(), index: None }
+    }
+
+    fn get(&self, name: &str) -> Option<(BindingId, usize)> {
+        if let Some(ix) = &self.index {
+            return ix.get(name).map(|&i| self.names[i].1);
+        }
+        self.names.iter().rev().find(|(n, _)| *n == name).map(|&(_, h)| h)
+    }
+
+    fn push(&mut self, name: &'a str, hit: (BindingId, usize)) {
+        self.names.push((name, hit));
+        if self.names.len() > SCOPE_INDEX_AT && self.index.is_none() {
+            self.index = Some(
+                self.names.iter().enumerate().map(|(i, &(n, _))| (n, i)).collect(),
+            );
+        }
+        if let Some(ix) = &mut self.index {
+            ix.insert(self.names.last().unwrap().0, self.names.len() - 1);
+        }
+    }
 }
 
 /// One active function during the walk: collects the ordered list of free
@@ -24,8 +57,8 @@ struct FnRec {
     caps: Vec<String>,
 }
 
-pub struct Resolver {
-    scopes: Vec<Scope>,
+pub struct Resolver<'a> {
+    scopes: Vec<Scope<'a>>,
     fn_depth: usize,
     fn_stack: Vec<FnRec>,
     pub captured: HashSet<BindingId>,
@@ -34,9 +67,9 @@ pub struct Resolver {
     pub fn_caps: HashMap<FnId, Vec<String>>,
 }
 
-impl Resolver {
+impl<'a> Resolver<'a> {
     pub fn run(
-        program: &Program,
+        program: &'a Program<'a>,
     ) -> (HashSet<BindingId>, HashSet<BindingId>, HashMap<FnId, Vec<String>>) {
         Self::run_seeded(program, &[])
     }
@@ -45,11 +78,11 @@ impl Resolver {
     /// — used when re-resolving a lazily-compiled function snippet whose
     /// free names are the stored upvalue environment (M6c).
     pub fn run_seeded(
-        program: &Program,
-        env: &[String],
+        program: &'a Program<'a>,
+        env: &'a [String],
     ) -> (HashSet<BindingId>, HashSet<BindingId>, HashMap<FnId, Vec<String>>) {
         let mut r = Resolver {
-            scopes: vec![Scope { names: HashMap::new() }],
+            scopes: vec![Scope::new()],
             fn_depth: 0,
             fn_stack: Vec::new(),
             captured: HashSet::new(),
@@ -67,45 +100,44 @@ impl Resolver {
         (r.captured, r.mutated, r.fn_caps)
     }
 
-    fn mark_mutated(&mut self, name: &str) {
+    fn lookup(&self, name: &str) -> Option<(BindingId, usize)> {
         for scope in self.scopes.iter().rev() {
-            if let Some(&(id, _)) = scope.names.get(name) {
-                self.mutated.insert(id);
-                return;
+            if let Some(hit) = scope.get(name) {
+                return Some(hit);
             }
+        }
+        None
+    }
+
+    fn mark_mutated(&mut self, name: &str) {
+        if let Some((id, _)) = self.lookup(name) {
+            self.mutated.insert(id);
         }
     }
 
-    fn declare(&mut self, name: &str, id: BindingId) {
+    fn declare(&mut self, name: &'a str, id: BindingId) {
         let depth = self.fn_depth;
-        self.scopes
-            .last_mut()
-            .unwrap()
-            .names
-            .insert(name.to_string(), (id, depth));
+        self.scopes.last_mut().unwrap().push(name, (id, depth));
     }
 
     fn reference(&mut self, name: &str) {
-        for scope in self.scopes.iter().rev() {
-            if let Some(&(id, depth)) = scope.names.get(name) {
-                if depth < self.fn_depth {
-                    self.captured.insert(id);
-                    // thread the capture through every enclosing function
-                    // between the owner and the referencing one — mirrors
-                    // the emitter's upvalue chain
-                    for level in depth..self.fn_depth {
-                        let rec = &mut self.fn_stack[level];
-                        if !rec.caps.iter().any(|n| n == name) {
-                            rec.caps.push(name.to_string());
-                        }
+        if let Some((id, depth)) = self.lookup(name) {
+            if depth < self.fn_depth {
+                self.captured.insert(id);
+                // thread the capture through every enclosing function
+                // between the owner and the referencing one — mirrors
+                // the emitter's upvalue chain
+                for level in depth..self.fn_depth {
+                    let rec = &mut self.fn_stack[level];
+                    if !rec.caps.iter().any(|n| n == name) {
+                        rec.caps.push(name.to_string());
                     }
                 }
-                return;
             }
         }
     }
 
-    fn hoist_functions(&mut self, stmts: &[Statement]) {
+    fn hoist_functions(&mut self, stmts: &'a [Statement<'a>]) {
         for s in stmts {
             if let Statement::FunctionDeclaration(f) = s {
                 if let Some(id) = &f.id {
@@ -117,10 +149,10 @@ impl Resolver {
         }
     }
 
-    fn function(&mut self, id: FnId, params: &FormalParameters, body: &FunctionBody) {
+    fn function(&mut self, id: FnId, params: &'a FormalParameters<'a>, body: &'a FunctionBody<'a>) {
         self.fn_depth += 1;
         self.fn_stack.push(FnRec { id, caps: Vec::new() });
-        self.scopes.push(Scope { names: HashMap::new() });
+        self.scopes.push(Scope::new());
         for p in &params.items {
             if let BindingPattern::BindingIdentifier(b) = &p.pattern {
                 self.declare(&b.name, b.span.start);
@@ -132,11 +164,13 @@ impl Resolver {
         }
         self.scopes.pop();
         let rec = self.fn_stack.pop().unwrap();
-        self.fn_caps.insert(rec.id, rec.caps);
+        if !rec.caps.is_empty() {
+            self.fn_caps.insert(rec.id, rec.caps);
+        }
         self.fn_depth -= 1;
     }
 
-    fn stmt(&mut self, s: &Statement) {
+    fn stmt(&mut self, s: &'a Statement<'a>) {
         match s {
             Statement::VariableDeclaration(d) => {
                 for decl in &d.declarations {
@@ -172,7 +206,7 @@ impl Resolver {
                 self.stmt(&w.body);
             }
             Statement::ForStatement(f) => {
-                self.scopes.push(Scope { names: HashMap::new() });
+                self.scopes.push(Scope::new());
                 match &f.init {
                     Some(ForStatementInit::VariableDeclaration(d)) => {
                         for decl in &d.declarations {
@@ -202,7 +236,7 @@ impl Resolver {
             }
             Statement::ForOfStatement(f) => {
                 self.expr(&f.right);
-                self.scopes.push(Scope { names: HashMap::new() });
+                self.scopes.push(Scope::new());
                 if let ForStatementLeft::VariableDeclaration(d) = &f.left {
                     for decl in &d.declarations {
                         if let BindingPattern::BindingIdentifier(b) = &decl.id {
@@ -214,7 +248,7 @@ impl Resolver {
                 self.scopes.pop();
             }
             Statement::BlockStatement(b) => {
-                self.scopes.push(Scope { names: HashMap::new() });
+                self.scopes.push(Scope::new());
                 self.hoist_functions(&b.body);
                 for s in &b.body {
                     self.stmt(s);
@@ -225,7 +259,7 @@ impl Resolver {
         }
     }
 
-    fn expr(&mut self, e: &Expression) {
+    fn expr(&mut self, e: &'a Expression<'a>) {
         match e {
             Expression::Identifier(id) => self.reference(&id.name),
             Expression::BinaryExpression(b) => {

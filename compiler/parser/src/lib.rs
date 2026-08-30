@@ -29,7 +29,9 @@ impl CompileError {
 pub fn compile(source: &str, source_name: &str) -> Result<Chunk, CompileError> {
     let phases = std::env::var_os("TSC_COMPILE_PHASES").is_some();
     let t0 = std::time::Instant::now();
-    let allocator = Allocator::default();
+    // pre-size the AST arena: ~8x source is oxc's typical footprint, and
+    // growth chunks mid-parse cost mmap + zeroing syscalls
+    let allocator = Allocator::with_capacity(source.len() * 8);
     let program = tsc_ast::parse(&allocator, source).map_err(|errs| {
         let e = &errs[0];
         CompileError { msg: format!("parse error: {}", e.msg), span_start: e.span_start }
