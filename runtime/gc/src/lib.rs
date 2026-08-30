@@ -450,19 +450,7 @@ mod tests {
         let mut heap = Heap::new();
         // cell -> closure -> cell (cycle), unreachable from roots
         let cell = heap.alloc_cell(Value::UNDEFINED);
-        let proto = Arc::new(tsc_ir::FunctionProto {
-            name: Arc::from("f"),
-            arity: 0,
-            is_async: false,
-            n_regs: 1,
-            code: vec![],
-            consts: vec![],
-            upvals: vec![],
-            protos: vec![],
-            spans: vec![],
-            arg_types: vec![],
-            jit: Default::default(),
-        });
+        let proto = Arc::new(tsc_ir::FunctionProto::default());
         let clo = heap.alloc_closure(tsr_memory::Closure { proto, upvals: vec![Value::cell(cell)] });
         *heap.cell_mut(cell) = Value::closure(clo);
 

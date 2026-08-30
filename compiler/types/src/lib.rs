@@ -66,8 +66,9 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         *g = annotated || seen == 1;
     }
 
-    let n = proto.code.len();
-    let nregs = proto.n_regs as usize;
+    let body = proto.body();
+    let n = body.code.len();
+    let nregs = body.n_regs as usize;
     let mut states: Vec<Option<Vec<T>>> = vec![None; n + 1];
     let mut entry = vec![T::Top; nregs];
     for (i, &g) in arg_guard.iter().enumerate() {
@@ -107,7 +108,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
             continue;
         }
         let mut s = states[pc].clone().unwrap();
-        let ins = proto.code[pc];
+        let ins = body.code[pc];
         let a = ins.a as usize;
         // b/c bytes overlap the sBx payload on Bx-format ops — out-of-range
         // "registers" just read as not-Num
@@ -123,7 +124,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         match ins.op {
             Op::LoadInt => s[a] = T::Num,
             Op::LoadConst => {
-                s[a] = match proto.consts.get(ins.bx() as usize) {
+                s[a] = match body.consts.get(ins.bx() as usize) {
                     Some(Const::Number(_)) => T::Num,
                     _ => T::Top,
                 }
@@ -200,19 +201,20 @@ mod tests {
     use tsc_ir::{Instr, Op};
 
     fn proto(arity: u8, arg_types: Vec<TypeHint>, code: Vec<Instr>) -> FunctionProto {
-        FunctionProto {
-            name: Arc::from("t"),
+        FunctionProto::new(
+            Arc::from("t"),
             arity,
-            is_async: false,
-            n_regs: 8,
-            spans: vec![0; code.len()],
-            code,
-            consts: vec![],
-            upvals: vec![],
-            protos: vec![],
+            false,
+            vec![],
             arg_types,
-            jit: Default::default(),
-        }
+            tsc_ir::ProtoBody {
+                n_regs: 8,
+                spans: vec![0; code.len()],
+                code,
+                consts: vec![],
+                protos: vec![],
+            },
+        )
     }
 
     #[test]

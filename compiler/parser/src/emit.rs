@@ -1307,19 +1307,20 @@ fn finish(mut fs: FuncState) -> FunctionProto {
         fs.max_reg.max(1),
         fs.arity,
     );
-    FunctionProto {
-        name: Arc::from(fs.name.as_str()),
-        arity: fs.arity,
-        is_async: fs.is_async,
-        n_regs: fs.max_reg.max(1),
-        code: fs.code,
-        consts: fs.consts,
-        upvals: fs.upvals.into_iter().map(|(_, s)| s).collect(),
-        protos: fs.protos,
-        spans: fs.spans,
-        arg_types: fs.arg_types,
-        jit: Default::default(),
-    }
+    FunctionProto::new(
+        Arc::from(fs.name.as_str()),
+        fs.arity,
+        fs.is_async,
+        fs.upvals.into_iter().map(|(_, s)| s).collect(),
+        fs.arg_types,
+        tsc_ir::ProtoBody {
+            n_regs: fs.max_reg.max(1),
+            code: fs.code,
+            consts: fs.consts,
+            protos: fs.protos,
+            spans: fs.spans,
+        },
+    )
 }
 
 fn stmt_kind(s: &Statement) -> &'static str {

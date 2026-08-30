@@ -56,7 +56,7 @@ mod tests {
     #[test]
     fn compiles_hello() {
         let chunk = compile(r#"console.log("hi");"#, "test.ts").unwrap_or_else(|e| panic!("{}", e.msg));
-        assert!(!chunk.main.code.is_empty());
+        assert!(!chunk.main.body().code.is_empty());
     }
 
     #[test]

@@ -29,7 +29,7 @@ fn fail(realm: &mut Realm, e: RtError) -> JitRet {
 }
 
 fn err_at(proto: &FunctionProto, pc: usize, msg: String) -> RtError {
-    RtError { msg, span: proto.spans.get(pc).copied(), cancelled: false }
+    RtError { msg, span: proto.body().spans.get(pc).copied(), cancelled: false }
 }
 
 /// Per-pc shape-transition cache entry (leaked once per monomorphic
@@ -48,18 +48,18 @@ pub(crate) fn lit_shape(
     pc: usize,
     cidx: usize,
 ) -> &'static tsr_memory::ShapeData {
-    let tic = pr.jit.tic_load(pr.code.len(), pc);
+    let tic = pr.jit.tic_load(pr.body().code.len(), pc);
     if !tic.is_null() {
         return unsafe { &*(tic as *const tsr_memory::ShapeData) };
     }
-    let Const::Keys(keys) = &pr.consts[cidx] else {
+    let Const::Keys(keys) = &pr.body().consts[cidx] else {
         unreachable!("NewObjectLit const is Keys")
     };
     let mut s = tsr_memory::empty_shape();
     for k in keys.iter() {
         s = s.with_field(k.clone());
     }
-    let _ = pr.jit.tic_store(pr.code.len(), pc, s as *const _ as *mut u8);
+    let _ = pr.jit.tic_store(pr.body().code.len(), pc, s as *const _ as *mut u8);
     s
 }
 
@@ -74,7 +74,7 @@ pub(crate) fn set_field_add(
     name: impl FnOnce() -> std::sync::Arc<str>,
     v: Value,
 ) {
-    let tic = pr.jit.tic_load(pr.code.len(), pc);
+    let tic = pr.jit.tic_load(pr.body().code.len(), pc);
     if !tic.is_null() {
         let e = unsafe { &*(tic as *const TransIc) };
         if e.old_sid == sid {
@@ -86,7 +86,7 @@ pub(crate) fn set_field_add(
     let ns = obj.shape.with_field(name());
     if tic.is_null() {
         let b = Box::into_raw(Box::new(TransIc { old_sid: sid, shape: ns })) as *mut u8;
-        if !pr.jit.tic_store(pr.code.len(), pc, b) {
+        if !pr.jit.tic_store(pr.body().code.len(), pc, b) {
             drop(unsafe { Box::from_raw(b as *mut TransIc) });
         }
     }
@@ -182,7 +182,7 @@ extern "C" fn h_call(
             let callee: &FunctionProto =
                 unsafe { &*Arc::as_ptr(&r.heap.closure(c).proto) };
             let new_base = abs_a + 1;
-            let need = new_base + callee.n_regs as usize;
+            let need = new_base + callee.body().n_regs as usize;
             if r.stack.len() < need {
                 r.stack.resize(need, Value::UNDEFINED);
             }
@@ -199,7 +199,7 @@ extern "C" fn h_call(
             let code_ptr = callee.jit.code.load(Acquire);
             if !code_ptr.is_null()
                 && callee.arity as usize == argc
-                && pr.jit.tic_load(pr.code.len(), pc).is_null()
+                && pr.jit.tic_load(pr.body().code.len(), pc).is_null()
             {
                 let proto_word = unsafe {
                     *(&r.heap.closure(c).proto as *const Arc<FunctionProto> as *const u64)
@@ -209,9 +209,9 @@ extern "C" fn h_call(
                     proto_data: callee as *const FunctionProto as u64,
                     code: code_ptr as u64,
                     arity: callee.arity as u32,
-                    n_regs: callee.n_regs as u32,
+                    n_regs: callee.body().n_regs as u32,
                 })) as *mut u8;
-                if !pr.jit.tic_store(pr.code.len(), pc, ic) {
+                if !pr.jit.tic_store(pr.body().code.len(), pc, ic) {
                     drop(unsafe { Box::from_raw(ic as *mut CallIc) });
                 }
             }
@@ -231,7 +231,7 @@ extern "C" fn h_call(
             };
             native(r, args).map_err(|mut e| {
                 if e.span.is_none() {
-                    e.span = pr.spans.get(pc).copied();
+                    e.span = pr.body().spans.get(pc).copied();
                 }
                 e
             })
@@ -275,7 +275,8 @@ fn step(
     base: usize,
     closure: Option<u32>,
 ) -> Result<u64, RtError> {
-    let ins = proto.code[pc];
+    let pbody = proto.body();
+    let ins = pbody.code[pc];
     let a = base + ins.a as usize;
     let rb = |realm: &Realm| realm.stack[base + ins.b as usize];
     let rc = |realm: &Realm| realm.stack[base + ins.c as usize];
@@ -326,7 +327,7 @@ fn step(
 
     match ins.op {
         Op::LoadConst => {
-            let v = match &proto.consts[ins.bx() as usize] {
+            let v = match &pbody.consts[ins.bx() as usize] {
                 Const::Number(n) => Value::number(*n),
                 Const::Str(s) => {
                     let s = s.clone();
@@ -442,7 +443,7 @@ fn step(
         }
 
         Op::Closure => {
-            let child = proto.protos[ins.bx() as usize].clone();
+            let child = pbody.protos[ins.bx() as usize].clone();
             let mut upvals_buf = [Value::UNDEFINED; 8];
             let mut upvals_vec;
             let n_up = child.upvals.len();
@@ -540,7 +541,7 @@ fn step(
         }
         Op::GetField => {
             let obj = rb(realm);
-            let name = match &proto.consts[ins.c as usize] {
+            let name = match &pbody.consts[ins.c as usize] {
                 Const::Str(s) => s.clone(),
                 Const::Number(n) => Arc::from(tsr_memory::fmt_number(*n)),
                 Const::Keys(_) => Arc::from(""),
@@ -550,7 +551,7 @@ fn step(
             Ok(0)
         }
         Op::SetField => {
-            let name = match &proto.consts[ins.b as usize] {
+            let name = match &pbody.consts[ins.b as usize] {
                 Const::Str(s) => s.clone(),
                 Const::Number(n) => Arc::from(tsr_memory::fmt_number(*n)),
                 Const::Keys(_) => Arc::from(""),
@@ -663,7 +664,7 @@ fn step(
             }
         }
         Op::GetGlobal => {
-            let name = match &proto.consts[ins.bx() as usize] {
+            let name = match &pbody.consts[ins.bx() as usize] {
                 Const::Str(s) => s.clone(),
                 Const::Number(n) => Arc::from(tsr_memory::fmt_number(*n)),
                 Const::Keys(_) => Arc::from(""),
@@ -707,7 +708,7 @@ fn step(
 }
 
 fn name_const<'a>(pr: &'a FunctionProto, idx: usize) -> &'a str {
-    match &pr.consts[idx] {
+    match &pr.body().consts[idx] {
         Const::Str(s) => s,
         _ => "",
     }
@@ -727,14 +728,14 @@ extern "C" fn h_get_field(
     if let Some(o) = obj.as_object() {
         let objref = &r.heap.objs[o as usize];
         let sid = objref.shape.id;
-        let ic = pr.jit.ic_load(pr.code.len(), pc as usize);
+        let ic = pr.jit.ic_load(pr.body().code.len(), pc as usize);
         let v = if ic != 0 && (ic >> 32) as u32 == sid {
             objref.val((ic & 0xFFFF_FFFF) as usize - 1)
         } else {
             let name = name_const(pr, cidx as usize);
             match objref.shape.slot_of(name) {
                 Some(i) => {
-                    pr.jit.ic_store(pr.code.len(), pc as usize, sid, i);
+                    pr.jit.ic_store(pr.body().code.len(), pc as usize, sid, i);
                     objref.val(i)
                 }
                 None => Value::UNDEFINED,
@@ -746,7 +747,7 @@ extern "C" fn h_get_field(
     match get_field(r, obj, &name) {
         Ok(v) => JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 },
         Err(mut e) => {
-            e.span = pr.spans.get(pc as usize).copied();
+            e.span = pr.body().spans.get(pc as usize).copied();
             fail(r, e)
         }
     }
@@ -769,18 +770,18 @@ extern "C" fn h_set_field(
             r.heap.barrier_obj(o);
             let obj = &mut r.heap.objs[o as usize];
             let sid = obj.shape.id;
-            let ic = pr.jit.ic_load(pr.code.len(), pc as usize);
+            let ic = pr.jit.ic_load(pr.body().code.len(), pc as usize);
             if ic != 0 && (ic >> 32) as u32 == sid {
                 obj.set_val((ic & 0xFFFF_FFFF) as usize - 1, v);
             } else {
                 let name = name_const(pr, cidx as usize);
                 match obj.shape.slot_of(name) {
                     Some(i) => {
-                        pr.jit.ic_store(pr.code.len(), pc as usize, sid, i);
+                        pr.jit.ic_store(pr.body().code.len(), pc as usize, sid, i);
                         obj.set_val(i, v);
                     }
                     None => set_field_add(pr, pc as usize, obj, sid, || {
-                        match &pr.consts[cidx as usize] {
+                        match &pr.body().consts[cidx as usize] {
                             Const::Str(s) => s.clone(),
                             Const::Number(n) => {
                                 std::sync::Arc::from(tsr_memory::fmt_number(*n))
@@ -827,7 +828,7 @@ extern "C" fn h_get_index(
         return match get_field(r, obj, &name) {
             Ok(v) => JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 },
             Err(mut e) => {
-                e.span = pr.spans.get(pc as usize).copied();
+                e.span = pr.body().spans.get(pc as usize).copied();
                 fail(r, e)
             }
         };
@@ -1087,8 +1088,8 @@ extern "C" fn h_new_closure(
     let pr = proto(pp);
     let pc = pc as usize;
     let base = (base_bytes / 8) as usize;
-    let ins = pr.code[pc];
-    let child = pr.protos[ins.bx() as usize].clone();
+    let ins = pr.body().code[pc];
+    let child = pr.body().protos[ins.bx() as usize].clone();
     let mut upvals_buf = [Value::UNDEFINED; 8];
     let mut upvals_vec;
     let n_up = child.upvals.len();
@@ -1147,7 +1148,7 @@ extern "C" fn h_load_const(
 ) -> JitRet {
     let r = realm(p);
     let pr = proto(pp);
-    let v = match &pr.consts[bx as usize] {
+    let v = match &pr.body().consts[bx as usize] {
         Const::Number(n) => Value::number(*n),
         Const::Str(s) => Value::str_ref(r.heap.alloc_str(s.clone())),
         Const::Keys(_) => Value::UNDEFINED,
@@ -1347,7 +1348,7 @@ pub fn osr_slow(proto: &FunctionProto) -> Option<CompiledFn> {
         jit.backedges.store(u32::MAX, Relaxed);
         return None;
     }
-    let ics = proto.jit.ics_base(proto.code.len()) as u64;
+    let ics = proto.jit.ics_base(proto.body().code.len()) as u64;
     let code = compile_unified(proto, true)
         .or_else(|| tsr_jit::tier1::compile(proto, helpers(), true, heap_offsets(), ics));
     match code {
@@ -1430,11 +1431,12 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
         jumpif: &jumpif,
         arg_guard: &typed.arg_guard,
     };
-    let ics = proto.jit.ics_base(proto.code.len()) as u64;
-    let tics = proto.jit.tics_base(proto.code.len()) as u64;
+    let ics = proto.jit.ics_base(proto.body().code.len()) as u64;
+    let tics = proto.jit.tics_base(proto.body().code.len()) as u64;
     // bake NewObjectLit shapes at compile time: the shape is process-global
     // and fully determined by the site's key list
     let lit_shapes: Vec<(u64, u32)> = proto
+        .body()
         .code
         .iter()
         .enumerate()
@@ -1472,7 +1474,7 @@ pub fn compile_now(proto: &FunctionProto) {
 }
 
 fn compile_tier1(proto: &FunctionProto) {
-    let ics = proto.jit.ics_base(proto.code.len()) as u64;
+    let ics = proto.jit.ics_base(proto.body().code.len()) as u64;
     match tsr_jit::tier1::compile(proto, helpers(), false, heap_offsets(), ics) {
         Some(code) => {
             let ptr = tsr_jit::heap::publish(&code) as *mut u8;

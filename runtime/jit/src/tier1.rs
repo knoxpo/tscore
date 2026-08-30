@@ -219,7 +219,8 @@ pub fn compile(
     offsets: Option<HeapOffsets>,
     ics_base: u64,
 ) -> Option<Vec<u32>> {
-    if proto.is_async || proto.code.len() > MAX_CODE {
+    let pbody = proto.body();
+    if proto.is_async || pbody.code.len() > MAX_CODE {
         return None;
     }
     // Calls inside loops lose to the interpreter's inline native-call arm
@@ -245,11 +246,11 @@ pub fn compile(
     // function-level: OSR may compile call-containing loops when the
     // function allocates/mutates anywhere (object/closure churn shapes);
     // pure arithmetic-and-call functions (fnv shape) stay interpreted
-    let fn_mutates = proto.code.iter().any(|i| heap_op(i.op));
-    for (pc, ins) in proto.code.iter().enumerate() {
+    let fn_mutates = pbody.code.iter().any(|i| heap_op(i.op));
+    for (pc, ins) in pbody.code.iter().enumerate() {
         if ins.op == Op::Jump && ins.sbx() < 0 {
             let target = (pc as i64 + ins.sbx() as i64 + 1) as usize;
-            let body = &proto.code[target..pc];
+            let body = &pbody.code[target..pc];
             if body.iter().any(|i| i.op == Op::Call) {
                 let allowed = for_osr && fn_mutates;
                 if !allowed {
@@ -262,7 +263,7 @@ pub fn compile(
         let mut a = Asm::new();
         let bail = a.new_label();
         let ret = a.new_label();
-        let pc_labels: Vec<Label> = (0..proto.code.len() + 2).map(|_| a.new_label()).collect();
+        let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
         C { a, pc_labels, bail, ret, helpers, offsets, ics_base }
     };
 
@@ -291,7 +292,7 @@ pub fn compile(
     // (register state is the stack slots — always current in Tier-1)
     let normal = c.a.new_label();
     c.a.cbz(15, normal);
-    let mut headers: Vec<usize> = proto
+    let mut headers: Vec<usize> = pbody
         .code
         .iter()
         .enumerate()
@@ -308,15 +309,15 @@ pub fn compile(
     }
     c.a.bind(normal);
 
-    for (pc, ins) in proto.code.iter().enumerate() {
+    for (pc, ins) in pbody.code.iter().enumerate() {
         let l = c.pc_labels[pc];
         c.a.bind(l);
         emit_op(&mut c, pc, *ins);
     }
     // trailing label (jump targets can be code.len())
-    let end = c.pc_labels[proto.code.len()];
+    let end = c.pc_labels[pbody.code.len()];
     c.a.bind(end);
-    let end2 = c.pc_labels[proto.code.len() + 1];
+    let end2 = c.pc_labels[pbody.code.len() + 1];
     c.a.bind(end2);
     // falling off the end: return undefined (emitter guarantees terminators,
     // this is belt-and-braces)

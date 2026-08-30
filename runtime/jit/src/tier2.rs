@@ -211,7 +211,8 @@ pub fn compile(
     tics_base: u64,
     lit_shapes: &[(u64, u32)],
 ) -> Option<Vec<u32>> {
-    if proto.code.len() > crate::tier1::MAX_CODE {
+    let pbody = proto.body();
+    if pbody.code.len() > crate::tier1::MAX_CODE {
         return None;
     }
     let heap_op = |op: Op| {
@@ -228,24 +229,24 @@ pub fn compile(
                 | Op::Concat
         )
     };
-    let fn_mutates = proto.code.iter().any(|i| heap_op(i.op));
-    for (pc, ins) in proto.code.iter().enumerate() {
+    let fn_mutates = pbody.code.iter().any(|i| heap_op(i.op));
+    for (pc, ins) in pbody.code.iter().enumerate() {
         if ins.op == Op::Jump && ins.sbx() < 0 {
             let target = (pc as i64 + ins.sbx() as i64 + 1) as usize;
-            let body = &proto.code[target..pc];
+            let body = &pbody.code[target..pc];
             if body.iter().any(|i| i.op == Op::Call) && !(for_osr && fn_mutates) {
                 return None;
             }
         }
     }
 
-    let n_low = proto.n_regs.min(LOW);
+    let n_low = pbody.n_regs.min(LOW);
     let mut c = {
         let mut a = Asm::new();
         let bail = a.new_label();
         let await_exit = a.new_label();
         let ret = a.new_label();
-        let pc_labels: Vec<Label> = (0..proto.code.len() + 2).map(|_| a.new_label()).collect();
+        let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
         C { a, pc_labels, bail, await_exit, ret, helpers, offsets, ics_base, tics_base, n_low }
     };
     let out = c.a.new_label();
@@ -253,7 +254,7 @@ pub fn compile(
     // prologue: tier1 frame + only the d-pairs this fn actually uses as
     // vreg homes (small leaf functions push/pop far less)
     let d_pairs = c.n_low.div_ceil(2) as u32;
-    let has_field_ops = proto
+    let has_field_ops = pbody
         .code
         .iter()
         .any(|i| matches!(i.op, Op::GetField | Op::SetField));
@@ -314,7 +315,7 @@ pub fn compile(
     if for_osr {
         let normal = c.a.new_label();
         c.a.cbz(R_STARTPC, normal);
-        let mut headers: Vec<usize> = proto
+        let mut headers: Vec<usize> = pbody
             .code
             .iter()
             .enumerate()
@@ -332,14 +333,14 @@ pub fn compile(
         c.a.bind(normal);
     }
 
-    for (pc, ins) in proto.code.iter().enumerate() {
+    for (pc, ins) in pbody.code.iter().enumerate() {
         let l = c.pc_labels[pc];
         c.a.bind(l);
         emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes);
     }
-    let e1 = c.pc_labels[proto.code.len()];
+    let e1 = c.pc_labels[pbody.code.len()];
     c.a.bind(e1);
-    let e2 = c.pc_labels[proto.code.len() + 1];
+    let e2 = c.pc_labels[pbody.code.len() + 1];
     c.a.bind(e2);
     c.a.mov_imm64(1, Value::UNDEFINED.bits());
     c.a.b(c.ret);
@@ -432,6 +433,7 @@ fn emit_op(
     pow_addr: usize,
     lit_shapes: &[(u64, u32)],
 ) {
+    let pbody = proto.body();
     let num_bc = facts.num[pc][1] && facts.num[pc][2];
     let num_b = facts.num[pc][1];
     match ins.op {
@@ -442,7 +444,7 @@ fn emit_op(
         ),
         Op::LoadNull => c.put_bits(ins.a, Value::NULL.bits()),
         Op::LoadUndef => c.put_bits(ins.a, Value::UNDEFINED.bits()),
-        Op::LoadConst => match proto.consts.get(ins.bx() as usize) {
+        Op::LoadConst => match pbody.consts.get(ins.bx() as usize) {
             Some(Const::Number(n)) => c.put_bits(ins.a, Value::number(*n).bits()),
             // string consts allocate — thin helper (no spill/reload)
             _ => {
@@ -1125,7 +1127,7 @@ fn emit_op(
             let n = if ins.op == Op::NewArrayLit {
                 ins.c as usize
             } else {
-                match &proto.consts[ins.c as usize] {
+                match &pbody.consts[ins.c as usize] {
                     Const::Keys(k) => k.len(),
                     _ => unreachable!("NewObjectLit const is Keys"),
                 }
@@ -1166,7 +1168,7 @@ fn emit_op(
         Op::Closure => {
             // flush the d-reg homes the child's upval sources read from
             // slots (helper never GCs — no reload needed)
-            let child = &proto.protos[ins.bx() as usize];
+            let child = &pbody.protos[ins.bx() as usize];
             for u in &child.upvals {
                 let src = match *u {
                     tsc_ir::UpvalSrc::ParentLocal(reg)

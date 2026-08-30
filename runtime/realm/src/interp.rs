@@ -19,7 +19,7 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
         }
         Kind::Closure(c) => {
             let proto = realm.heap.closure(c).proto.clone();
-            realm.stack.resize(base + proto.n_regs as usize, Value::UNDEFINED);
+            realm.stack.resize(base + proto.body().n_regs as usize, Value::UNDEFINED);
             let n = (proto.arity as usize).min(args.len());
             realm.stack[base..base + n].copy_from_slice(&args[..n]);
             if proto.is_async {
@@ -41,7 +41,7 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
 /// its promise settles.
 pub fn run_main(realm: &mut Realm, main: &Arc<FunctionProto>) -> Result<Value, RtError> {
     let base = realm.stack.len();
-    realm.stack.resize(base + main.n_regs as usize, Value::UNDEFINED);
+    realm.stack.resize(base + main.body().n_regs as usize, Value::UNDEFINED);
     let main_promise = start_async(realm, None, main.clone(), base);
     realm.stack.truncate(base);
     realm.pinned.insert(main_promise);
@@ -139,7 +139,7 @@ pub fn start_async(
         })),
         Ok(FrameResult::Await { awaited, dst, resume_pc }) => {
             let promise = realm.heap.alloc_promise();
-            let regs = realm.stack[base..base + proto.n_regs as usize].to_vec();
+            let regs = realm.stack[base..base + proto.body().n_regs as usize].to_vec();
             let co = realm.heap.alloc_foreign(Foreign::Coroutine(Coroutine {
                 closure,
                 proto,
@@ -177,7 +177,7 @@ fn start_async_fused(
             // no safepoint between these allocs and the reactions push, so
             // the fresh promise/coroutine can't be collected out from under us
             let promise = realm.heap.alloc_promise();
-            let regs = realm.stack[base..base + proto.n_regs as usize].to_vec();
+            let regs = realm.stack[base..base + proto.body().n_regs as usize].to_vec();
             let co = realm.heap.alloc_foreign(Foreign::Coroutine(Coroutine {
                 closure,
                 proto,
@@ -402,13 +402,13 @@ fn to_num(v: Value) -> f64 {
 }
 
 fn err(proto: &FunctionProto, pc: usize, msg: String) -> RtError {
-    RtError { msg, span: proto.spans.get(pc).copied(), cancelled: false }
+    RtError { msg, span: proto.body().spans.get(pc).copied(), cancelled: false }
 }
 
 /// Attach a source span to an existing error, keeping its cancelled flag.
 fn at(mut e: RtError, proto: &FunctionProto, pc: usize) -> RtError {
     if e.span.is_none() {
-        e.span = proto.spans.get(pc).copied();
+        e.span = proto.body().spans.get(pc).copied();
     }
     e
 }
@@ -416,14 +416,14 @@ fn at(mut e: RtError, proto: &FunctionProto, pc: usize) -> RtError {
 /// Borrow a name constant — no Arc clone on the hot path (shared-refcount
 /// traffic across worker threads kills scaling).
 fn const_str(proto: &FunctionProto, idx: usize) -> &str {
-    match &proto.consts[idx] {
+    match &proto.body().consts[idx] {
         Const::Str(s) => s,
         _ => "",
     }
 }
 
 fn const_str_arc(proto: &FunctionProto, idx: usize) -> Arc<str> {
-    match &proto.consts[idx] {
+    match &proto.body().consts[idx] {
         Const::Str(s) => s.clone(),
         Const::Number(n) => Arc::from(tsr_memory::fmt_number(*n)),
         Const::Keys(_) => Arc::from(""),
@@ -493,14 +493,15 @@ fn run_frame(
     depth: u32,
     start_pc: usize,
 ) -> Result<FrameResult, RtError> {
+    let pbody = proto.body();
     let mut pc: usize = start_pc;
     loop {
-        debug_assert!(pc < proto.code.len());
-        let ins = unsafe { *proto.code.get_unchecked(pc) };
+        debug_assert!(pc < pbody.code.len());
+        let ins = unsafe { *pbody.code.get_unchecked(pc) };
         let a = base + ins.a as usize;
         match ins.op {
             Op::LoadConst => {
-                let v = match &proto.consts[ins.bx() as usize] {
+                let v = match &pbody.consts[ins.bx() as usize] {
                     Const::Number(n) => Value::number(*n),
                     Const::Str(s) => {
                         let s = s.clone();
@@ -651,7 +652,7 @@ fn run_frame(
                     let callee: &FunctionProto =
                         unsafe { &*Arc::as_ptr(&realm.heap.closure(c).proto) };
                     let new_base = a + 1;
-                    let need = new_base + callee.n_regs as usize;
+                    let need = new_base + callee.body().n_regs as usize;
                     if realm.stack.len() < need {
                         realm.stack.resize(need, Value::UNDEFINED);
                     }
@@ -670,7 +671,7 @@ fn run_frame(
                         // actually suspends (await of a plain value is
                         // identity, so the Await op passes it through)
                         let fused = await_fuse_enabled()
-                            && matches!(proto.code.get(pc + 1),
+                            && matches!(pbody.code.get(pc + 1),
                                 Some(n) if n.op == Op::Await && n.a == ins.a);
                         if fused {
                             start_async_fused(realm, Some(c), callee, new_base)
@@ -716,7 +717,7 @@ fn run_frame(
                             PromiseState::Rejected(e) => {
                                 return Err(RtError {
                                     msg: e.msg.clone(),
-                                    span: e.span.or_else(|| proto.spans.get(pc).copied()),
+                                    span: e.span.or_else(|| pbody.spans.get(pc).copied()),
                                     cancelled: e.cancelled,
                                 })
                             }
@@ -735,7 +736,7 @@ fn run_frame(
             }
 
             Op::Closure => {
-                let child = proto.protos[ins.bx() as usize].clone();
+                let child = pbody.protos[ins.bx() as usize].clone();
                 let mut upvals_buf = [Value::UNDEFINED; 8];
                 let mut upvals_vec;
                 let n_up = child.upvals.len();
@@ -837,14 +838,14 @@ fn run_frame(
                 if let Some(o) = obj.as_object() {
                     let objref = &realm.heap.objs[o as usize];
                     let sid = objref.shape.id;
-                    let ic = proto.jit.ic_load(proto.code.len(), pc);
+                    let ic = proto.jit.ic_load(pbody.code.len(), pc);
                     let v = if ic != 0 && (ic >> 32) as u32 == sid {
                         objref.val((ic & 0xFFFF_FFFF) as usize - 1)
                     } else {
                         let name = const_str(proto, ins.c as usize);
                         match objref.shape.slot_of(name) {
                             Some(i) => {
-                                proto.jit.ic_store(proto.code.len(), pc, sid, i);
+                                proto.jit.ic_store(pbody.code.len(), pc, sid, i);
                                 objref.val(i)
                             }
                             None => Value::UNDEFINED,
@@ -864,14 +865,14 @@ fn run_frame(
                         realm.heap.barrier_obj(r);
                         let objref = &mut realm.heap.objs[r as usize];
                         let sid = objref.shape.id;
-                        let ic = proto.jit.ic_load(proto.code.len(), pc);
+                        let ic = proto.jit.ic_load(pbody.code.len(), pc);
                         if ic != 0 && (ic >> 32) as u32 == sid {
                             objref.set_val((ic & 0xFFFF_FFFF) as usize - 1, v);
                         } else {
                             let name = const_str(proto, ins.b as usize);
                             match objref.shape.slot_of(name) {
                                 Some(i) => {
-                                    proto.jit.ic_store(proto.code.len(), pc, sid, i);
+                                    proto.jit.ic_store(pbody.code.len(), pc, sid, i);
                                     objref.set_val(i, v);
                                 }
                                 None => crate::jit::set_field_add(

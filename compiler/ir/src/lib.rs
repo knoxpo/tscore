@@ -256,40 +256,74 @@ pub enum UpvalSrc {
     ParentUpval(u8),
 }
 
+/// The compiled body of a function — everything execution needs beyond
+/// the header. Split out (M6a) so it can be filled lazily on first call
+/// (M6c); until then it is always populated at construction.
+#[derive(Debug, Default)]
+pub struct ProtoBody {
+    pub n_regs: u8,
+    pub code: Vec<Instr>,
+    pub consts: Vec<Const>,
+    /// Child function protos referenced by `Closure` Bx.
+    pub protos: Vec<Arc<FunctionProto>>,
+    /// Source byte offset per instruction, for error spans.
+    pub spans: Vec<u32>,
+}
+
 #[derive(Debug)]
 pub struct FunctionProto {
     pub name: Arc<str>,
     pub arity: u8,
     /// Async functions run as coroutines; calls return a promise.
     pub is_async: bool,
-    pub n_regs: u8,
-    pub code: Vec<Instr>,
-    pub consts: Vec<Const>,
     pub upvals: Vec<UpvalSrc>,
-    /// Child function protos referenced by `Closure` Bx.
-    pub protos: Vec<Arc<FunctionProto>>,
-    /// Source byte offset per instruction, for error spans.
-    pub spans: Vec<u32>,
     /// TS parameter annotations (Top when unannotated).
     pub arg_types: Vec<TypeHint>,
     pub jit: JitState,
+    body: std::sync::OnceLock<ProtoBody>,
+}
+
+impl FunctionProto {
+    pub fn new(
+        name: Arc<str>,
+        arity: u8,
+        is_async: bool,
+        upvals: Vec<UpvalSrc>,
+        arg_types: Vec<TypeHint>,
+        body: ProtoBody,
+    ) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(body);
+        FunctionProto {
+            name,
+            arity,
+            is_async,
+            upvals,
+            arg_types,
+            jit: JitState::default(),
+            body: cell,
+        }
+    }
+
+    /// The function's compiled body. One atomic load; resolve once per
+    /// frame and reuse the reference on hot paths. (M6c makes this fill
+    /// lazily on first use.)
+    #[inline(always)]
+    pub fn body(&self) -> &ProtoBody {
+        self.body.get().expect("proto body not filled")
+    }
 }
 
 impl Default for FunctionProto {
     fn default() -> Self {
-        FunctionProto {
-            name: Arc::from(""),
-            arity: 0,
-            is_async: false,
-            n_regs: 0,
-            code: Vec::new(),
-            consts: Vec::new(),
-            upvals: Vec::new(),
-            protos: Vec::new(),
-            spans: Vec::new(),
-            arg_types: Vec::new(),
-            jit: JitState::default(),
-        }
+        FunctionProto::new(
+            Arc::from(""),
+            0,
+            false,
+            Vec::new(),
+            Vec::new(),
+            ProtoBody::default(),
+        )
     }
 }
 
@@ -315,21 +349,22 @@ impl fmt::Debug for Instr {
 
 pub fn disassemble(proto: &FunctionProto, out: &mut String) {
     use fmt::Write;
+    let b = proto.body();
     let _ = writeln!(
         out,
         "function {} (arity {}, regs {}, upvals {})",
         proto.name,
         proto.arity,
-        proto.n_regs,
+        b.n_regs,
         proto.upvals.len()
     );
-    for (i, c) in proto.consts.iter().enumerate() {
+    for (i, c) in b.consts.iter().enumerate() {
         let _ = writeln!(out, "  const {i}: {c:?}");
     }
-    for (i, ins) in proto.code.iter().enumerate() {
+    for (i, ins) in b.code.iter().enumerate() {
         let _ = writeln!(out, "  {i:4}: {ins:?}");
     }
-    for p in &proto.protos {
+    for p in &b.protos {
         disassemble(p, out);
     }
 }
