@@ -16,20 +16,31 @@ pub struct Resolver {
     scopes: Vec<Scope>,
     fn_depth: usize,
     pub captured: HashSet<BindingId>,
+    pub mutated: HashSet<BindingId>,
 }
 
 impl Resolver {
-    pub fn run(program: &Program) -> HashSet<BindingId> {
+    pub fn run(program: &Program) -> (HashSet<BindingId>, HashSet<BindingId>) {
         let mut r = Resolver {
             scopes: vec![Scope { names: HashMap::new() }],
             fn_depth: 0,
             captured: HashSet::new(),
+            mutated: HashSet::new(),
         };
         r.hoist_functions(&program.body);
         for s in &program.body {
             r.stmt(s);
         }
-        r.captured
+        (r.captured, r.mutated)
+    }
+
+    fn mark_mutated(&mut self, name: &str) {
+        for scope in self.scopes.iter().rev() {
+            if let Some(&(id, _)) = scope.names.get(name) {
+                self.mutated.insert(id);
+                return;
+            }
+        }
     }
 
     fn declare(&mut self, name: &str, id: BindingId) {
@@ -57,6 +68,8 @@ impl Resolver {
             if let Statement::FunctionDeclaration(f) = s {
                 if let Some(id) = &f.id {
                     self.declare(&id.name, id.span.start);
+                    // the declaration itself stores the closure after hoist
+                    self.mutated.insert(id.span.start);
                 }
             }
         }
@@ -183,12 +196,14 @@ impl Resolver {
             Expression::UpdateExpression(u) => {
                 if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &u.argument {
                     self.reference(&id.name);
+                    self.mark_mutated(&id.name);
                 }
             }
             Expression::AssignmentExpression(a) => {
                 match &a.left {
                     AssignmentTarget::AssignmentTargetIdentifier(id) => {
-                        self.reference(&id.name)
+                        self.reference(&id.name);
+                        self.mark_mutated(&id.name);
                     }
                     AssignmentTarget::StaticMemberExpression(m) => self.expr(&m.object),
                     AssignmentTarget::ComputedMemberExpression(m) => {

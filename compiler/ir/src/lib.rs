@@ -137,6 +137,11 @@ pub struct JitState {
     pub counter: AtomicU32,
     pub tier: AtomicU8,
     pub code: AtomicPtr<u8>,
+    /// Tier-1 code entered via OSR (loop-header dispatch); may coexist
+    /// with a Tier-2 `code` pointer used for normal calls.
+    pub osr_code: AtomicPtr<u8>,
+    /// Interpreter back-edges observed (OSR trigger).
+    pub backedges: AtomicU32,
     /// Tier-2 deoptimization count (demote to Tier-1 at 10).
     pub deopts: AtomicU32,
     /// Arg-tag bitmasks observed during profiling: 1=number seen,
@@ -183,7 +188,10 @@ pub enum Const {
 pub enum UpvalSrc {
     /// A cell living in the enclosing frame's register `reg`.
     ParentLocal(u8),
-    /// The enclosing closure's upvalue `idx`.
+    /// Immutable capture: copy the VALUE from the enclosing frame's
+    /// register (the binding is never reassigned — no cell needed).
+    ParentLocalValue(u8),
+    /// The enclosing closure's upvalue `idx` (copied verbatim).
     ParentUpval(u8),
 }
 

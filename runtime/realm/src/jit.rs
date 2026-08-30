@@ -302,21 +302,21 @@ fn step(
             let child = proto.protos[ins.bx() as usize].clone();
             let mut upvals = Vec::with_capacity(child.upvals.len());
             for u in &child.upvals {
-                let cell = match *u {
+                let entry = match *u {
                     UpvalSrc::ParentLocal(reg) => {
-                        match realm.stack[base + reg as usize].as_cell() {
-                            Some(r) => r,
-                            None => {
-                                return Err(e("internal: captured slot is not a cell".into()))
-                            }
+                        let v = realm.stack[base + reg as usize];
+                        if v.as_cell().is_none() {
+                            return Err(e("internal: captured slot is not a cell".into()));
                         }
+                        v
                     }
+                    UpvalSrc::ParentLocalValue(reg) => realm.stack[base + reg as usize],
                     UpvalSrc::ParentUpval(idx) => {
                         let c = closure.expect("upval capture outside closure");
                         realm.heap.closure(c).upvals[idx as usize]
                     }
                 };
-                upvals.push(cell);
+                upvals.push(entry);
             }
             let r = realm.heap.alloc_closure(Closure { proto: child, upvals });
             realm.stack[a] = Value::closure(r);
@@ -345,24 +345,28 @@ fn step(
         },
         Op::GetUpval => {
             let c = closure.expect("GetUpval outside closure");
-            let cell = realm.heap.closure(c).upvals[ins.b as usize];
-            realm.stack[a] = *realm.heap.cell(cell);
+            let entry = realm.heap.closure(c).upvals[ins.b as usize];
+            realm.stack[a] = match entry.as_cell() {
+                Some(r) => *realm.heap.cell(r),
+                None => entry,
+            };
             Ok(0)
         }
         Op::SetUpval => {
             let c = closure.expect("SetUpval outside closure");
-            let cell = realm.heap.closure(c).upvals[ins.a as usize];
+            let entry = realm.heap.closure(c).upvals[ins.a as usize];
+            let cell = entry.as_cell().expect("SetUpval on value capture");
             realm.heap.barrier_cell(cell);
             *realm.heap.cell_mut(cell) = rb(realm);
             Ok(0)
         }
         Op::NewObject => {
-            let r = realm.heap.alloc_obj(Default::default());
+            let r = realm.heap.alloc_obj_empty();
             realm.stack[a] = Value::object(r);
             Ok(0)
         }
         Op::NewArray => {
-            let r = realm.heap.alloc_arr(Vec::with_capacity(ins.b as usize));
+            let r = realm.heap.alloc_arr_empty(ins.b as usize);
             realm.stack[a] = Value::array(r);
             Ok(0)
         }
@@ -858,6 +862,75 @@ fn tier2_enabled() -> bool {
     *E.get_or_init(|| std::env::var_os("TSC_NO_TIER2").is_none())
 }
 
+/// OSR trigger threshold (interpreter back-edges in one function).
+fn osr_threshold() -> u32 {
+    static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("TSC_OSR_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000)
+    })
+}
+
+pub fn osr_threshold_pub() -> u32 {
+    osr_threshold()
+}
+
+/// OSR slow path: reached only after the back-edge counter crossed the
+/// threshold (interpreter keeps a one-load fast path). Compiles once,
+/// returns the code, or marks the proto permanently un-OSR-able
+/// (backedges = u32::MAX) so the fast path never returns here.
+pub fn osr_slow(proto: &Arc<FunctionProto>) -> Option<CompiledFn> {
+    let jit = &proto.jit;
+    let code = jit.osr_code.load(Acquire);
+    if !code.is_null() {
+        return Some(unsafe { std::mem::transmute::<*mut u8, CompiledFn>(code) });
+    }
+    if !jit_enabled() {
+        jit.backedges.store(u32::MAX, Relaxed);
+        return None;
+    }
+    match tsr_jit::tier1::compile(proto, helpers(), true) {
+        Some(code) => {
+            let ptr = tsr_jit::heap::publish(&code) as *mut u8;
+            jit.osr_code.store(ptr, Release);
+            Some(unsafe { std::mem::transmute::<*mut u8, CompiledFn>(ptr) })
+        }
+        None => {
+            jit.backedges.store(u32::MAX, Relaxed);
+            None
+        }
+    }
+}
+
+/// Enter Tier-1 code mid-function at a loop header (state = the slots).
+pub fn enter_osr(
+    realm: &mut Realm,
+    f: CompiledFn,
+    proto: &Arc<FunctionProto>,
+    base: usize,
+    closure: Option<u32>,
+    depth: u32,
+    target_pc: usize,
+) -> Result<Value, RtError> {
+    let ret = f(
+        realm as *mut Realm as *mut core::ffi::c_void,
+        proto.as_ref() as *const FunctionProto,
+        (base * 8) as u64,
+        closure.unwrap_or(u32::MAX),
+        depth,
+        target_pc as u64,
+    );
+    match ret.val {
+        0 => Ok(Value::from_bits(ret.stack)),
+        _ => Err(realm
+            .jit_error
+            .take()
+            .unwrap_or_else(|| RtError::new("internal: jit error missing"))),
+    }
+}
+
 pub fn compile_now(proto: &Arc<FunctionProto>) {
     if tier2_enabled() {
         let typed = tsc_types::analyze(proto);
@@ -879,7 +952,7 @@ pub fn compile_now(proto: &Arc<FunctionProto>) {
 }
 
 fn compile_tier1(proto: &Arc<FunctionProto>) {
-    match tsr_jit::tier1::compile(proto, helpers()) {
+    match tsr_jit::tier1::compile(proto, helpers(), false) {
         Some(code) => {
             let ptr = tsr_jit::heap::publish(&code) as *mut u8;
             proto.jit.code.store(ptr, Release);
@@ -906,6 +979,7 @@ pub fn enter_jit(
         (base * 8) as u64,
         closure.unwrap_or(u32::MAX),
         depth,
+        0,
     );
     match ret.val {
         0 => Ok(Value::from_bits(ret.stack)),

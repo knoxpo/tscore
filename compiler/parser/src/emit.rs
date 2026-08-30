@@ -16,6 +16,10 @@ use tsc_ir::{Const, FunctionProto, Instr, Op, UpvalSrc};
 #[derive(Clone, Copy)]
 struct Local {
     reg: u8,
+    /// Captured AND mutated: lives in a heap cell. Captured-immutable
+    /// bindings stay plain registers (closures copy the value).
+    cell: bool,
+    /// Captured at all (cell or by-value).
     captured: bool,
 }
 
@@ -58,6 +62,7 @@ struct FuncState {
 pub struct Emitter {
     fs: Vec<FuncState>,
     captured: HashSet<BindingId>,
+    mutated: HashSet<BindingId>,
     cur_span: u32,
 }
 
@@ -67,9 +72,10 @@ impl Emitter {
     pub fn compile(
         program: &Program,
         captured: HashSet<BindingId>,
+        mutated: HashSet<BindingId>,
         source_name: &str,
     ) -> R<tsc_ir::Chunk> {
-        let mut em = Emitter { fs: Vec::new(), captured, cur_span: 0 };
+        let mut em = Emitter { fs: Vec::new(), captured, mutated, cur_span: 0 };
         em.fs.push(FuncState {
             name: "<main>".into(),
             scopes: vec![HashMap::new()],
@@ -179,8 +185,9 @@ impl Emitter {
 
     fn declare_local(&mut self, name: &str, binding_span: u32) -> R<Local> {
         let captured = self.captured.contains(&binding_span);
+        let cell = captured && self.mutated.contains(&binding_span);
         let reg = self.alloc_reg(binding_span)?;
-        let local = Local { reg, captured };
+        let local = Local { reg, cell, captured };
         self.f().scopes.last_mut().unwrap().insert(name.to_string(), local);
         Ok(local)
     }
@@ -217,7 +224,11 @@ impl Emitter {
             }
             let src = if let Some(l) = find_local(&self.fs[level - 1], name) {
                 debug_assert!(l.captured, "resolver missed a capture");
-                UpvalSrc::ParentLocal(l.reg)
+                if l.cell {
+                    UpvalSrc::ParentLocal(l.reg)
+                } else {
+                    UpvalSrc::ParentLocalValue(l.reg)
+                }
             } else {
                 let i = find_upval(&self.fs[level - 1], name)
                     .expect("upvalue chain broken");
@@ -230,7 +241,7 @@ impl Emitter {
 
     fn load_place(&mut self, place: Place, name: &str, dst: u8) {
         match place {
-            Place::Local(l) if l.captured => {
+            Place::Local(l) if l.cell => {
                 self.emit(Op::LoadCell, dst, l.reg, 0);
             }
             Place::Local(l) => {
@@ -250,7 +261,7 @@ impl Emitter {
 
     fn store_place(&mut self, place: Place, name: &str, src: u8, span: u32) -> R {
         match place {
-            Place::Local(l) if l.captured => {
+            Place::Local(l) if l.cell => {
                 self.emit(Op::StoreCell, l.reg, src, 0);
             }
             Place::Local(l) => {
@@ -274,7 +285,7 @@ impl Emitter {
         if let Expression::Identifier(id) = e {
             if !matches!(&*id.name, "undefined" | "NaN" | "Infinity") {
                 if let Place::Local(l) = self.resolve(&id.name) {
-                    if !l.captured {
+                    if !l.cell {
                         return Some(l.reg);
                     }
                 }
@@ -366,7 +377,7 @@ impl Emitter {
                 if let Some(id) = &f.id {
                     let local = self.declare_local(&id.name, id.span.start)?;
                     self.emit(Op::LoadUndef, local.reg, 0, 0);
-                    if local.captured {
+                    if local.cell {
                         self.emit(Op::NewCell, local.reg, 0, 0);
                     }
                 }
@@ -402,7 +413,7 @@ impl Emitter {
                     if local.reg != tmp {
                         self.emit(Op::Move, local.reg, tmp, 0);
                     }
-                    if local.captured {
+                    if local.cell {
                         self.emit(Op::NewCell, local.reg, 0, 0);
                     }
                 }
@@ -513,7 +524,7 @@ impl Emitter {
                             if local.reg != tmp {
                                 self.emit(Op::Move, local.reg, tmp, 0);
                             }
-                            if local.captured {
+                            if local.cell {
                                 self.emit(Op::NewCell, local.reg, 0, 0);
                             }
                         }
@@ -582,7 +593,7 @@ impl Emitter {
                 self.emit(Op::LtSkip, 0, idx, len);
                 let jf = self.emit_jump(Op::Jump, 0);
                 self.emit(Op::GetIndex, elem.reg, arr, idx);
-                if elem.captured {
+                if elem.cell {
                     // fresh cell per iteration = correct `let` semantics
                     self.emit(Op::NewCell, elem.reg, 0, 0);
                 }
@@ -705,7 +716,7 @@ impl Emitter {
             };
             self.f().arg_types.push(hint);
             let local = self.declare_local(&b.name, b.span.start)?;
-            if local.captured {
+            if local.cell {
                 self.emit(Op::NewCell, local.reg, 0, 0);
             }
         }

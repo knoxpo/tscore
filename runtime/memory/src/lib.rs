@@ -251,8 +251,9 @@ pub enum Foreign {
 #[derive(Debug)]
 pub struct Closure {
     pub proto: Arc<FunctionProto>,
-    /// Cell refs captured per proto.upvals.
-    pub upvals: Vec<Ref>,
+    /// Captured environment per proto.upvals: `Value::cell(r)` for
+    /// mutable captures, the captured value itself for immutable ones.
+    pub upvals: Vec<Value>,
 }
 
 /// Hidden class: objects with the same field history share one shape.
@@ -549,6 +550,41 @@ impl Heap {
 
     pub fn needs_gc(&self) -> bool {
         self.allocs_since_gc >= self.gc_threshold
+    }
+
+    /// Allocate an empty array, reusing a freed slot's buffer when
+    /// possible (churn workloads would otherwise malloc per array).
+    pub fn alloc_arr_empty(&mut self, cap: usize) -> Ref {
+        self.allocs_since_gc += 1;
+        if let Some(r) = self.free_arrs.pop() {
+            let v = &mut self.arrs[r as usize];
+            v.clear();
+            if v.capacity() > 1024 {
+                v.shrink_to(64); // don't hoard giant buffers in the free list
+            }
+            self.gen_arrs.on_alloc(r);
+            return r;
+        }
+        self.arrs.push(Vec::with_capacity(cap));
+        let r = (self.arrs.len() - 1) as Ref;
+        self.gen_arrs.on_alloc(r);
+        r
+    }
+
+    /// Allocate an empty object, reusing a freed slot's values buffer.
+    pub fn alloc_obj_empty(&mut self) -> Ref {
+        self.allocs_since_gc += 1;
+        if let Some(r) = self.free_objs.pop() {
+            let o = &mut self.objs[r as usize];
+            o.shape = empty_shape();
+            o.values.clear();
+            self.gen_objs.on_alloc(r);
+            return r;
+        }
+        self.objs.push(Obj::default());
+        let r = (self.objs.len() - 1) as Ref;
+        self.gen_objs.on_alloc(r);
+        r
     }
 }
 

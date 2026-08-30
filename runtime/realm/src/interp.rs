@@ -417,7 +417,7 @@ pub enum FrameResult {
 fn run_frame(
     realm: &mut Realm,
     closure: Option<tsr_memory::Ref>,
-    proto: &FunctionProto,
+    proto: &Arc<FunctionProto>,
     base: usize,
     depth: u32,
     start_pc: usize,
@@ -530,6 +530,27 @@ fn run_frame(
                 if ins.sbx() < 0 {
                     // loop back-edge: cancellation + GC safepoint
                     realm.safepoint().map_err(|e| at(e, proto, pc))?;
+                    // OSR: hand a hot interpreted loop to Tier-1 native code
+                    // (slot-resident registers make any header enterable).
+                    // Fast path is one load + one store; u32::MAX marks
+                    // permanently rejected protos.
+                    if realm.jit_enabled && !proto.is_async {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let be = proto.jit.backedges.load(Relaxed);
+                        if be != u32::MAX {
+                            proto.jit.backedges.store(be.wrapping_add(1), Relaxed);
+                            if be >= crate::jit::osr_threshold_pub() {
+                                if let Some(f) = crate::jit::osr_slow(proto) {
+                                    let target =
+                                        (pc as i64 + ins.sbx() as i64 + 1) as usize;
+                                    let v = crate::jit::enter_osr(
+                                        realm, f, proto, base, closure, depth, target,
+                                    )?;
+                                    return Ok(FrameResult::Return(v));
+                                }
+                            }
+                        }
+                    }
                 }
                 pc = (pc as i64 + ins.sbx() as i64) as usize;
             }
@@ -627,22 +648,25 @@ fn run_frame(
                 let child = proto.protos[ins.bx() as usize].clone();
                 let mut upvals = Vec::with_capacity(child.upvals.len());
                 for u in &child.upvals {
-                    let cell = match *u {
+                    let entry = match *u {
                         UpvalSrc::ParentLocal(reg) => {
-                            match reg!(realm, base + reg as usize).as_cell() {
-                                Some(r) => r,
-                                None => {
-                                    return Err(err(proto, pc,
-                                        "internal: captured slot is not a cell".into()))
-                                }
+                            let v = reg!(realm, base + reg as usize);
+                            if v.as_cell().is_none() {
+                                return Err(err(proto, pc,
+                                    "internal: captured slot is not a cell".into()));
                             }
+                            v
+                        }
+                        UpvalSrc::ParentLocalValue(reg) => {
+                            // immutable capture: copy the value, no cell
+                            reg!(realm, base + reg as usize)
                         }
                         UpvalSrc::ParentUpval(idx) => {
                             let c = closure.expect("upval capture outside closure");
                             realm.heap.closure(c).upvals[idx as usize]
                         }
                     };
-                    upvals.push(cell);
+                    upvals.push(entry);
                 }
                 let r = realm.heap.alloc_closure(Closure { proto: child, upvals });
                 set_reg!(realm, a, Value::closure(r));
@@ -665,22 +689,27 @@ fn run_frame(
             },
             Op::GetUpval => {
                 let c = closure.expect("GetUpval outside closure");
-                let cell = realm.heap.closure(c).upvals[ins.b as usize];
-                set_reg!(realm, a, *realm.heap.cell(cell));
+                let entry = realm.heap.closure(c).upvals[ins.b as usize];
+                let v = match entry.as_cell() {
+                    Some(r) => *realm.heap.cell(r),
+                    None => entry, // immutable value capture
+                };
+                set_reg!(realm, a, v);
             }
             Op::SetUpval => {
                 let c = closure.expect("SetUpval outside closure");
-                let cell = realm.heap.closure(c).upvals[ins.a as usize];
+                let entry = realm.heap.closure(c).upvals[ins.a as usize];
+                let cell = entry.as_cell().expect("SetUpval on value capture");
                 realm.heap.barrier_cell(cell);
                 *realm.heap.cell_mut(cell) = reg!(realm, base + ins.b as usize);
             }
 
             Op::NewObject => {
-                let r = realm.heap.alloc_obj(Default::default());
+                let r = realm.heap.alloc_obj_empty();
                 set_reg!(realm, a, Value::object(r));
             }
             Op::NewArray => {
-                let r = realm.heap.alloc_arr(Vec::with_capacity(ins.b as usize));
+                let r = realm.heap.alloc_arr_empty(ins.b as usize);
                 set_reg!(realm, a, Value::array(r));
             }
             Op::GetField => {

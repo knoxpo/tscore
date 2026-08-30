@@ -32,8 +32,8 @@ pub fn compile(source: &str, source_name: &str) -> Result<Chunk, CompileError> {
         let e = &errs[0];
         CompileError { msg: format!("parse error: {}", e.msg), span_start: e.span_start }
     })?;
-    let captured = resolve::Resolver::run(&program);
-    emit::Emitter::compile(&program, captured, source_name)
+    let (captured, mutated) = resolve::Resolver::run(&program);
+    emit::Emitter::compile(&program, captured, mutated, source_name)
 }
 
 #[cfg(test)]

@@ -50,11 +50,18 @@ pub struct JitRet {
 }
 
 /// Compiled function ABI:
-/// extern "C" fn(realm, proto, base_bytes, closure_u32, depth) -> JitRet
-/// where JitRet.val = 0 ok / 1 error (RtError in realm.jit_error),
-/// JitRet.stack = return Value bits when ok.
-pub type CompiledFn =
-    extern "C" fn(*mut core::ffi::c_void, *const FunctionProto, u64, u32, u32) -> JitRet;
+/// extern "C" fn(realm, proto, base_bytes, closure_u32, depth, start_pc)
+/// -> JitRet where JitRet.val = 0 ok / 1 error / 2 deopt(resume_pc in
+/// stack), JitRet.stack = return Value bits when ok. `start_pc` != 0
+/// enters at that loop header (OSR; Tier-1 only — slots are the frame).
+pub type CompiledFn = extern "C" fn(
+    *mut core::ffi::c_void,
+    *const FunctionProto,
+    u64,
+    u32,
+    u32,
+    u64,
+) -> JitRet;
 
 const SAFEPOINT_INTERVAL: u16 = 1024;
 pub const MAX_CODE: usize = 16 * 1024;
@@ -126,18 +133,43 @@ impl C {
 }
 
 /// Compile a proto to Tier-1 native code. Returns None when ineligible.
-pub fn compile(proto: &FunctionProto, helpers: Helpers) -> Option<Vec<u32>> {
+/// `for_osr`: compiled as an OSR target — calls-in-loops allowed (the
+/// alternative there is staying interpreted, not a faster tier).
+pub fn compile(proto: &FunctionProto, helpers: Helpers, for_osr: bool) -> Option<Vec<u32>> {
     if proto.is_async || proto.code.len() > MAX_CODE {
         return None;
     }
     // Calls inside loops lose to the interpreter's inline native-call arm
-    // (helper hop per iteration) — leave those functions interpreted.
-    // ponytail: revisit with an inline native fast path in the template.
+    // (measured on fnv). Exception: OSR entry into loops that also touch
+    // the heap (objects/arrays/closures) — those shapes win in native
+    // even paying the call-helper hop.
+    // allocation/mutation ops — method-lookup GetFields (Math.imul) must
+    // NOT qualify, or tight native-call loops (fnv) regress
+    let heap_op = |op: Op| {
+        matches!(
+            op,
+            Op::SetField
+                | Op::SetIndex
+                | Op::ArrayPush
+                | Op::NewObject
+                | Op::NewArray
+                | Op::Closure
+                | Op::Concat
+        )
+    };
+    // function-level: OSR may compile call-containing loops when the
+    // function allocates/mutates anywhere (object/closure churn shapes);
+    // pure arithmetic-and-call functions (fnv shape) stay interpreted
+    let fn_mutates = proto.code.iter().any(|i| heap_op(i.op));
     for (pc, ins) in proto.code.iter().enumerate() {
         if ins.op == Op::Jump && ins.sbx() < 0 {
             let target = (pc as i64 + ins.sbx() as i64 + 1) as usize;
-            if proto.code[target..pc].iter().any(|i| i.op == Op::Call) {
-                return None;
+            let body = &proto.code[target..pc];
+            if body.iter().any(|i| i.op == Op::Call) {
+                let allowed = for_osr && fn_mutates;
+                if !allowed {
+                    return None;
+                }
             }
         }
     }
@@ -164,9 +196,32 @@ pub fn compile(proto: &FunctionProto, helpers: Helpers) -> Option<Vec<u32>> {
     c.a.mov_imm64(R_SENTINEL, JIT_ERR_SENTINEL);
     c.a.movz(R_TAGLIM, 0xFFF9, 0);
     c.a.movz(R_POLL, SAFEPOINT_INTERVAL, 0);
+    // stash start_pc (x5) across the stack_ptr helper call
+    c.a.mov(15, 5);
     c.a.mov_imm64(8, helpers.stack_ptr as u64);
     c.a.blr(8);
     c.a.add_reg(R_SLOTS, 1, R_BASE);
+
+    // OSR dispatch: start_pc != 0 jumps to the matching loop header
+    // (register state is the stack slots — always current in Tier-1)
+    let normal = c.a.new_label();
+    c.a.cbz(15, normal);
+    let mut headers: Vec<usize> = proto
+        .code
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.op == Op::Jump && i.sbx() < 0)
+        .map(|(pc, i)| (pc as i64 + i.sbx() as i64 + 1) as usize)
+        .collect();
+    headers.sort_unstable();
+    headers.dedup();
+    for h in headers {
+        c.a.mov_imm64(8, h as u64);
+        c.a.cmp_reg(15, 8);
+        let l = c.pc_labels[h];
+        c.a.b_cond(Cond::Eq, l);
+    }
+    c.a.bind(normal);
 
     for (pc, ins) in proto.code.iter().enumerate() {
         let l = c.pc_labels[pc];

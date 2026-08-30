@@ -103,7 +103,10 @@ fn clone_rec(
             let upvals = c
                 .upvals
                 .iter()
-                .map(|&cell| clone_rec(heap, *heap.cell(cell), visiting))
+                .map(|&entry| match entry.as_cell() {
+                    Some(cell) => clone_rec(heap, *heap.cell(cell), visiting),
+                    None => clone_rec(heap, entry, visiting),
+                })
                 .collect::<Result<_, _>>()?;
             let pv = PortableValue::Closure { proto: c.proto.clone(), upvals };
             visiting.remove(&(2, r));
@@ -156,11 +159,11 @@ pub fn rehydrate(pv: &PortableValue, heap: &mut Heap) -> Value {
             Value::object(heap.alloc_obj(obj))
         }
         PortableValue::Closure { proto, upvals } => {
-            let cells: Vec<u32> = upvals
+            let cells: Vec<Value> = upvals
                 .iter()
                 .map(|x| {
                     let v = rehydrate(x, heap);
-                    heap.alloc_cell(v)
+                    Value::cell(heap.alloc_cell(v))
                 })
                 .collect();
             Value::closure(heap.alloc_closure(Closure {

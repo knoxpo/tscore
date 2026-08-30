@@ -77,9 +77,7 @@ pub fn collect<'a>(
             }
             Kind::Closure(r) => {
                 if !mark(&mut m.closures, r) {
-                    work.extend(
-                        heap.closures[r as usize].upvals.iter().map(|&c| Value::cell(c)),
-                    );
+                    work.extend_from_slice(&heap.closures[r as usize].upvals);
                 }
             }
             Kind::Cell(r) => {
@@ -116,13 +114,15 @@ pub fn collect<'a>(
         heap.strs[r as usize] = std::sync::Arc::from("");
     });
     freed += sweep(&m.objs, &mut heap.free_objs, |r| {
-        heap.objs[r as usize] = Default::default();
+        let o = &mut heap.objs[r as usize];
+        o.shape = tsr_memory::empty_shape();
+        o.values.clear(); // keep capacity
     });
     freed += sweep(&m.arrs, &mut heap.free_arrs, |r| {
-        heap.arrs[r as usize] = Vec::new();
+        heap.arrs[r as usize].clear(); // keep capacity: reuse avoids malloc
     });
     freed += sweep(&m.closures, &mut heap.free_closures, |r| {
-        heap.closures[r as usize].upvals = Vec::new();
+        heap.closures[r as usize].upvals.clear();
     });
     freed += sweep(&m.cells, &mut heap.free_cells, |r| {
         heap.cells[r as usize] = Value::UNDEFINED;
@@ -171,7 +171,7 @@ fn push_children(heap: &Heap, v: Value, work: &mut Vec<Value>) {
         Kind::Object(r) => work.extend_from_slice(&heap.objs[r as usize].values),
         Kind::Array(r) => work.extend_from_slice(&heap.arrs[r as usize]),
         Kind::Closure(r) => {
-            work.extend(heap.closures[r as usize].upvals.iter().map(|&c| Value::cell(c)))
+            work.extend_from_slice(&heap.closures[r as usize].upvals)
         }
         Kind::Cell(r) => work.push(heap.cells[r as usize]),
         Kind::Foreign(r) => match &heap.foreigns[r as usize] {
@@ -275,13 +275,15 @@ pub fn collect_minor<'a>(
         h.strs[r as usize] = std::sync::Arc::from("");
     });
     sweep_young!(gen_objs, m.objs, free_objs, |h: &mut Heap, r| {
-        h.objs[r as usize] = Default::default();
+        let o = &mut h.objs[r as usize];
+        o.shape = tsr_memory::empty_shape();
+        o.values.clear();
     });
     sweep_young!(gen_arrs, m.arrs, free_arrs, |h: &mut Heap, r| {
-        h.arrs[r as usize] = Vec::new();
+        h.arrs[r as usize].clear();
     });
     sweep_young!(gen_closures, m.closures, free_closures, |h: &mut Heap, r| {
-        h.closures[r as usize].upvals = Vec::new();
+        h.closures[r as usize].upvals.clear();
     });
     sweep_young!(gen_cells, m.cells, free_cells, |h: &mut Heap, r| {
         h.cells[r as usize] = Value::UNDEFINED;
@@ -321,8 +323,8 @@ fn slot_bytes(heap: &Heap, arena: &str, r: tsr_memory::Ref) -> usize {
     match arena {
         "gen_strs" => 24 + heap.strs[i].len(),
         "gen_objs" => 32 + heap.objs[i].values.len() * 8,
-        "gen_arrs" => 32 + heap.arrs[i].capacity() * 8,
-        "gen_closures" => 32 + heap.closures[i].upvals.len() * 4,
+        "gen_arrs" => 32 + heap.arrs[i].len() * 8,
+        "gen_closures" => 32 + heap.closures[i].upvals.len() * 8,
         "gen_cells" => 8,
         _ => 96,
     }
@@ -359,12 +361,12 @@ fn approx_live_bytes(heap: &Heap, m: &Marks) -> usize {
     }
     for (i, alive) in m.arrs.iter().enumerate() {
         if *alive {
-            bytes += 32 + heap.arrs[i].capacity() * 8;
+            bytes += 32 + heap.arrs[i].len() * 8;
         }
     }
     for (i, alive) in m.closures.iter().enumerate() {
         if *alive {
-            bytes += 32 + heap.closures[i].upvals.len() * 4;
+            bytes += 32 + heap.closures[i].upvals.len() * 8;
         }
     }
     bytes += m.cells.iter().filter(|a| **a).count() * 8;
@@ -441,7 +443,7 @@ mod tests {
             arg_types: vec![],
             jit: Default::default(),
         });
-        let clo = heap.alloc_closure(tsr_memory::Closure { proto, upvals: vec![cell] });
+        let clo = heap.alloc_closure(tsr_memory::Closure { proto, upvals: vec![Value::cell(cell)] });
         *heap.cell_mut(cell) = Value::closure(clo);
 
         let mut stats = GcStats::default();
