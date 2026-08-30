@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::Arc;
 use tsc_ir::{Const, FunctionProto, Op, UpvalSrc, TIER_BASELINE, TIER_COLD, TIER_COMPILING, TIER_OPT, TIER_REJECTED};
 use tsr_jit::tier1::{CompiledFn, Helpers, JitRet};
-use tsr_memory::{to_int32, to_uint32, Closure, Kind, Value, JIT_ERR_SENTINEL};
+use tsr_memory::{to_int32, to_uint32, Kind, Value, JIT_ERR_SENTINEL};
 
 fn realm<'a>(p: *mut core::ffi::c_void) -> &'a mut Realm {
     unsafe { &mut *(p as *mut Realm) }
@@ -208,7 +208,14 @@ fn step(
                 realm.stack[a] = Value::number(b.as_number() + c.as_number());
                 Ok(0)
             } else if b.as_str_ref().is_some() || c.as_str_ref().is_some() {
-                let s = format!("{}{}", b.display(&realm.heap), c.display(&realm.heap));
+                let mut s = String::with_capacity(16);
+                if !tsr_memory::display_into(&mut s, b, &realm.heap)
+                    || !tsr_memory::display_into(&mut s, c, &realm.heap)
+                {
+                    s.clear();
+                    s.push_str(&b.display(&realm.heap));
+                    s.push_str(&c.display(&realm.heap));
+                }
                 let v = realm.alloc_string(&s);
                 realm.stack[a] = v;
                 Ok(0)
@@ -300,7 +307,16 @@ fn step(
 
         Op::Closure => {
             let child = proto.protos[ins.bx() as usize].clone();
-            let mut upvals = Vec::with_capacity(child.upvals.len());
+            let mut upvals_buf = [Value::UNDEFINED; 8];
+            let mut upvals_vec;
+            let n_up = child.upvals.len();
+            let upvals: &mut [Value] = if n_up <= 8 {
+                &mut upvals_buf[..n_up]
+            } else {
+                upvals_vec = vec![Value::UNDEFINED; n_up];
+                &mut upvals_vec
+            };
+            let mut up_i = 0;
             for u in &child.upvals {
                 let entry = match *u {
                     UpvalSrc::ParentLocal(reg) => {
@@ -316,9 +332,10 @@ fn step(
                         realm.heap.closure(c).upvals[idx as usize]
                     }
                 };
-                upvals.push(entry);
+                upvals[up_i] = entry;
+                up_i += 1;
             }
-            let r = realm.heap.alloc_closure(Closure { proto: child, upvals });
+            let r = realm.heap.alloc_closure_reuse(child, upvals);
             realm.stack[a] = Value::closure(r);
             Ok(0)
         }
@@ -414,7 +431,7 @@ fn step(
                     }
                 }
             } else if let (Some(_), Some(s)) = (obj.as_object(), idx.as_str_ref()) {
-                let name = realm.heap.str_at(s).clone();
+                let name = realm.heap.str_arc(s);
                 get_field(realm, obj, &name).map_err(|er| e(er.msg))?
             } else {
                 return Err(e(format!(
@@ -456,7 +473,7 @@ fn step(
                     ))),
                 }
             } else if let (Some(r), Some(s)) = (target.as_object(), idx.as_str_ref()) {
-                let name = realm.heap.str_at(s).clone();
+                let name = realm.heap.str_arc(s);
                 realm.heap.barrier_obj(r);
                 realm.heap.obj_mut(r).set(name, v);
                 Ok(0)
@@ -644,7 +661,7 @@ extern "C" fn h_get_index(
         );
     }
     if let (Some(_), Some(sref)) = (obj.as_object(), idx.as_str_ref()) {
-        let name = r.heap.str_at(sref).clone();
+        let name = r.heap.str_arc(sref);
         return match get_field(r, obj, &name) {
             Ok(v) => JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 },
             Err(mut e) => {
@@ -708,7 +725,7 @@ extern "C" fn h_set_index(
         );
     }
     if let (Some(o), Some(sref)) = (target.as_object(), idx.as_str_ref()) {
-        let name = r.heap.str_at(sref).clone();
+        let name = r.heap.str_arc(sref);
         r.heap.barrier_obj(o);
         r.heap.obj_mut(o).set(name, v);
         return ok(r, 0);

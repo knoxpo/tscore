@@ -59,7 +59,7 @@ fn clone_rec(
         Kind::Bool(b) => PortableValue::Bool(b),
         Kind::Null => PortableValue::Null,
         Kind::Undefined => PortableValue::Undefined,
-        Kind::Str(r) => PortableValue::Str(heap.str_at(r).clone()),
+        Kind::Str(r) => PortableValue::Str(heap.str_arc(r)),
         Kind::Array(r) => {
             if !visiting.insert((0, r)) {
                 return Err("cannot capture cyclic data across realms".into());

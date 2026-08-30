@@ -266,7 +266,7 @@ pub struct ShapeData {
     pub id: u32,
     /// Field names in slot order.
     pub fields: Vec<Arc<str>>,
-    transitions: std::sync::Mutex<Vec<(Arc<str>, Arc<ShapeData>)>>,
+    transitions: std::sync::RwLock<Vec<(Arc<str>, Arc<ShapeData>)>>,
 }
 
 static SHAPE_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
@@ -278,7 +278,7 @@ pub fn empty_shape() -> Arc<ShapeData> {
             Arc::new(ShapeData {
                 id: 0,
                 fields: Vec::new(),
-                transitions: std::sync::Mutex::new(Vec::new()),
+                transitions: std::sync::RwLock::new(Vec::new()),
             })
         })
         .clone()
@@ -289,9 +289,17 @@ impl ShapeData {
         self.fields.iter().position(|f| &**f == name)
     }
 
-    /// Shape after adding `name` (cached transition).
+    /// Shape after adding `name` — read-mostly: cached transitions hit a
+    /// shared read lock (object-literal creation is this path, hot).
     pub fn with_field(self: &Arc<Self>, name: Arc<str>) -> Arc<ShapeData> {
-        let mut tr = self.transitions.lock().unwrap();
+        {
+            let tr = self.transitions.read().unwrap();
+            if let Some((_, next)) = tr.iter().find(|(k, _)| **k == *name) {
+                return next.clone();
+            }
+        }
+        let mut tr = self.transitions.write().unwrap();
+        // re-check under the write lock (racing creator)
         if let Some((_, next)) = tr.iter().find(|(k, _)| **k == *name) {
             return next.clone();
         }
@@ -300,7 +308,7 @@ impl ShapeData {
         let next = Arc::new(ShapeData {
             id: SHAPE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             fields,
-            transitions: std::sync::Mutex::new(Vec::new()),
+            transitions: std::sync::RwLock::new(Vec::new()),
         });
         tr.push((name, next.clone()));
         next
@@ -387,8 +395,27 @@ impl GenState {
     }
 }
 
+/// Heap string: shared constants stay refcounted; runtime-built strings
+/// own a reusable buffer (freed slots keep capacity — steady-state
+/// string churn stops calling malloc).
+#[derive(Debug)]
+pub enum HStr {
+    Shared(Arc<str>),
+    Buf(String),
+}
+
+impl HStr {
+    #[inline(always)]
+    pub fn as_str(&self) -> &str {
+        match self {
+            HStr::Shared(a) => a,
+            HStr::Buf(b) => b,
+        }
+    }
+}
+
 pub struct Heap {
-    pub strs: Vec<Arc<str>>,
+    pub strs: Vec<HStr>,
     pub objs: Vec<Obj>,
     pub arrs: Vec<Vec<Value>>,
     pub closures: Vec<Closure>,
@@ -478,7 +505,70 @@ impl Heap {
     pub fn new() -> Self {
         Self::default()
     }
-    alloc!(alloc_str, str_at, str_at_mut, strs, free_strs, gen_strs, Arc<str>);
+    alloc!(alloc_str_slot, str_raw, str_at_mut, strs, free_strs, gen_strs, HStr);
+
+    /// Shared-constant string (refcount bump only).
+    pub fn alloc_str(&mut self, s: Arc<str>) -> Ref {
+        self.alloc_str_slot(HStr::Shared(s))
+    }
+
+    /// Closure allocation reusing a freed slot's upvals buffer.
+    pub fn alloc_closure_reuse(
+        &mut self,
+        proto: Arc<FunctionProto>,
+        upvals: &[Value],
+    ) -> Ref {
+        self.allocs_since_gc += 1;
+        if let Some(r) = self.free_closures.pop() {
+            let c = &mut self.closures[r as usize];
+            c.proto = proto;
+            c.upvals.clear();
+            c.upvals.extend_from_slice(upvals);
+            self.gen_closures.on_alloc(r);
+            return r;
+        }
+        self.closures.push(Closure { proto, upvals: upvals.to_vec() });
+        let r = (self.closures.len() - 1) as Ref;
+        self.gen_closures.on_alloc(r);
+        r
+    }
+
+    /// Runtime-built string: reuses a freed slot's buffer when possible.
+    pub fn alloc_str_copy(&mut self, s: &str) -> Ref {
+        self.allocs_since_gc += 1;
+        if let Some(r) = self.free_strs.pop() {
+            let slot = &mut self.strs[r as usize];
+            match slot {
+                HStr::Buf(b) => {
+                    b.clear();
+                    if b.capacity() > 1024 {
+                        b.shrink_to(64);
+                    }
+                    b.push_str(s);
+                }
+                HStr::Shared(_) => *slot = HStr::Buf(String::from(s)),
+            }
+            self.gen_strs.on_alloc(r);
+            return r;
+        }
+        self.strs.push(HStr::Buf(String::from(s)));
+        let r = (self.strs.len() - 1) as Ref;
+        self.gen_strs.on_alloc(r);
+        r
+    }
+
+    #[inline(always)]
+    pub fn str_at(&self, r: Ref) -> &str {
+        self.strs[r as usize].as_str()
+    }
+
+    /// Arc for cross-realm/portable use (copies Buf strings).
+    pub fn str_arc(&self, r: Ref) -> Arc<str> {
+        match &self.strs[r as usize] {
+            HStr::Shared(a) => a.clone(),
+            HStr::Buf(b) => Arc::from(b.as_str()),
+        }
+    }
     alloc!(alloc_obj, obj, obj_mut, objs, free_objs, gen_objs, Obj);
     alloc!(alloc_arr, arr, arr_mut, arrs, free_arrs, gen_arrs, Vec<Value>);
     alloc!(alloc_closure, closure, closure_mut, closures, free_closures, gen_closures, Closure);
@@ -581,7 +671,12 @@ impl Heap {
             self.gen_objs.on_alloc(r);
             return r;
         }
-        self.objs.push(Obj::default());
+        self.objs.push(Obj {
+            shape: empty_shape(),
+            // literals typically add 2-4 fields: skip the 1->2->4 realloc
+            // ladder on fresh slots
+            values: Vec::with_capacity(4),
+        });
         let r = (self.objs.len() - 1) as Ref;
         self.gen_objs.on_alloc(r);
         r
@@ -661,6 +756,37 @@ impl Value {
             },
         }
     }
+}
+
+/// Append JS-style number formatting without intermediate allocations.
+pub fn push_number(out: &mut String, n: f64) {
+    use std::fmt::Write;
+    if n.is_nan() {
+        out.push_str("NaN");
+    } else if n.is_infinite() {
+        out.push_str(if n > 0.0 { "Infinity" } else { "-Infinity" });
+    } else if n == n.trunc() && n.abs() < 1e21 {
+        let _ = write!(out, "{}", n as i64);
+    } else {
+        let _ = write!(out, "{n}");
+    }
+}
+
+/// Append a value's display form; returns false for aggregate values the
+/// caller must route through the slow path.
+pub fn display_into(out: &mut String, v: Value, heap: &Heap) -> bool {
+    if v.is_number() {
+        push_number(out, v.as_number());
+        return true;
+    }
+    match v.kind() {
+        Kind::Str(r) => out.push_str(heap.str_at(r)),
+        Kind::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+        Kind::Null => out.push_str("null"),
+        Kind::Undefined => out.push_str("undefined"),
+        _ => return false,
+    }
+    true
 }
 
 /// JS-style number formatting: integers print without a fraction.

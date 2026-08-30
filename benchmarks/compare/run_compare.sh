@@ -6,6 +6,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+# single-runner lock: concurrent runs interleave RESULTS.md and contend for
+# CPU, corrupting both reports and numbers
+LOCK=benchmarks/compare/.lock
+if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "another run_compare.sh is already running (rm -rf $LOCK if stale)" >&2
+    exit 1
+fi
+trap 'rmdir "$LOCK"' EXIT
+
 RUNS=${RUNS:-5}
 DIR=benchmarks/compare
 GEN=$DIR/generated

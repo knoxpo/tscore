@@ -4,7 +4,7 @@ use crate::{Realm, RtError};
 use std::sync::Arc;
 use tsc_ir::{Const, FunctionProto, Op, UpvalSrc};
 use tsr_memory::{
-    to_int32, to_uint32, Closure, Coroutine, Foreign, Kind, PromiseError, PromiseState,
+    to_int32, to_uint32, Coroutine, Foreign, Kind, PromiseError, PromiseState,
     Value,
 };
 
@@ -646,7 +646,16 @@ fn run_frame(
 
             Op::Closure => {
                 let child = proto.protos[ins.bx() as usize].clone();
-                let mut upvals = Vec::with_capacity(child.upvals.len());
+                let mut upvals_buf = [Value::UNDEFINED; 8];
+                let mut upvals_vec;
+                let n_up = child.upvals.len();
+                let upvals: &mut [Value] = if n_up <= 8 {
+                    &mut upvals_buf[..n_up]
+                } else {
+                    upvals_vec = vec![Value::UNDEFINED; n_up];
+                    &mut upvals_vec
+                };
+                let mut up_i = 0;
                 for u in &child.upvals {
                     let entry = match *u {
                         UpvalSrc::ParentLocal(reg) => {
@@ -666,9 +675,10 @@ fn run_frame(
                             realm.heap.closure(c).upvals[idx as usize]
                         }
                     };
-                    upvals.push(entry);
+                    upvals[up_i] = entry;
+                    up_i += 1;
                 }
-                let r = realm.heap.alloc_closure(Closure { proto: child, upvals });
+                let r = realm.heap.alloc_closure_reuse(child, upvals);
                 set_reg!(realm, a, Value::closure(r));
             }
             Op::NewCell => {
@@ -778,7 +788,7 @@ fn run_frame(
                             "cannot index {} with number", obj.type_of()))),
                     }
                 } else if let (Some(_), Some(s)) = (obj.as_object(), idx.as_str_ref()) {
-                    let name = realm.heap.str_at(s).clone();
+                    let name = realm.heap.str_arc(s);
                     get_field(realm, obj, &name).map_err(|e| err(proto, pc, e.msg))?
                 } else {
                     return Err(err(proto, pc, format!(
@@ -813,7 +823,7 @@ fn run_frame(
                             "cannot index-assign {} with number", target.type_of()))),
                     }
                 } else if let (Some(r), Some(s)) = (target.as_object(), idx.as_str_ref()) {
-                    let name = realm.heap.str_at(s).clone();
+                    let name = realm.heap.str_arc(s);
                     realm.heap.barrier_obj(r);
                     realm.heap.obj_mut(r).set(name, v);
                 } else {
@@ -858,7 +868,14 @@ fn run_frame(
             Op::Concat => {
                 let b = reg!(realm, base + ins.b as usize);
                 let c = reg!(realm, base + ins.c as usize);
-                let s = format!("{}{}", b.display(&realm.heap), c.display(&realm.heap));
+                let mut s = String::with_capacity(16);
+                if !tsr_memory::display_into(&mut s, b, &realm.heap)
+                    || !tsr_memory::display_into(&mut s, c, &realm.heap)
+                {
+                    s.clear();
+                    s.push_str(&b.display(&realm.heap));
+                    s.push_str(&c.display(&realm.heap));
+                }
                 let v = realm.alloc_string(&s);
                 set_reg!(realm, a, v);
             }

@@ -111,7 +111,12 @@ pub fn collect<'a>(
 
     let mut freed = 0usize;
     freed += sweep(&m.strs, &mut heap.free_strs, |r| {
-        heap.strs[r as usize] = std::sync::Arc::from("");
+        // Buf slots keep their buffer for reuse; drop shared refcounts
+        if let tsr_memory::HStr::Shared(_) = heap.strs[r as usize] {
+            heap.strs[r as usize] = tsr_memory::HStr::Buf(String::new());
+        } else if let tsr_memory::HStr::Buf(b) = &mut heap.strs[r as usize] {
+            b.clear();
+        }
     });
     freed += sweep(&m.objs, &mut heap.free_objs, |r| {
         let o = &mut heap.objs[r as usize];
@@ -272,7 +277,11 @@ pub fn collect_minor<'a>(
         }};
     }
     sweep_young!(gen_strs, m.strs, free_strs, |h: &mut Heap, r| {
-        h.strs[r as usize] = std::sync::Arc::from("");
+        if let tsr_memory::HStr::Shared(_) = h.strs[r as usize] {
+            h.strs[r as usize] = tsr_memory::HStr::Buf(String::new());
+        } else if let tsr_memory::HStr::Buf(b) = &mut h.strs[r as usize] {
+            b.clear();
+        }
     });
     sweep_young!(gen_objs, m.objs, free_objs, |h: &mut Heap, r| {
         let o = &mut h.objs[r as usize];
@@ -321,7 +330,7 @@ pub fn collect_minor<'a>(
 fn slot_bytes(heap: &Heap, arena: &str, r: tsr_memory::Ref) -> usize {
     let i = r as usize;
     match arena {
-        "gen_strs" => 24 + heap.strs[i].len(),
+        "gen_strs" => 24 + heap.strs[i].as_str().len(),
         "gen_objs" => 32 + heap.objs[i].values.len() * 8,
         "gen_arrs" => 32 + heap.arrs[i].len() * 8,
         "gen_closures" => 32 + heap.closures[i].upvals.len() * 8,
@@ -351,7 +360,7 @@ fn approx_live_bytes(heap: &Heap, m: &Marks) -> usize {
     let mut bytes = 0usize;
     for (i, alive) in m.strs.iter().enumerate() {
         if *alive {
-            bytes += 24 + heap.strs[i].len();
+            bytes += 24 + heap.strs[i].as_str().len();
         }
     }
     for (i, alive) in m.objs.iter().enumerate() {
@@ -416,7 +425,7 @@ mod tests {
 
         assert_eq!(stats.last_freed, 1000);
         assert_eq!(stats.major_collections, 1);
-        assert_eq!(&**heap.str_at(live_str), "keep");
+        assert_eq!(heap.str_at(live_str), "keep");
         // freed slots are reused, arena does not grow
         let len_before = heap.strs.len();
         for _ in 0..500 {

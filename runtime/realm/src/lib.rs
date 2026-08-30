@@ -282,7 +282,9 @@ impl Realm {
     }
 
     pub fn alloc_string(&mut self, s: &str) -> Value {
-        Value::str_ref(self.heap.alloc_str(Arc::from(s)))
+        // buffer-reusing arena slot: steady-state string churn stops
+        // touching malloc
+        Value::str_ref(self.heap.alloc_str_copy(s))
     }
 }
 
