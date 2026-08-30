@@ -579,6 +579,11 @@ pub struct Heap {
     /// Young allocation enabled (TSC_NURSERY=1; N3 flips the default once
     /// the JIT templates understand YOUNG_BIT).
     pub nursery_on: bool,
+    /// [old data ptr, nursery data ptr] — contiguous so the JIT selects
+    /// an arena base with one shifted load on the young bit. Refreshed by
+    /// `refresh_bases()` at every point a data pointer can move.
+    pub obj_bases: [usize; 2],
+    pub arr_bases: [usize; 2],
     /// Detached backing buffers harvested from dead nursery slots.
     pub pool_arr_bufs: Vec<Vec<Value>>,
     pub pool_str_bufs: Vec<String>,
@@ -618,6 +623,8 @@ impl Default for Heap {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(16 << 20), // 16MB: churn live-sets die in-nursery (measured)
             nursery_on: std::env::var_os("TSC_NO_NURSERY").is_none(),
+            obj_bases: [0; 2],
+            arr_bases: [0; 2],
             pool_arr_bufs: Vec::new(),
             pool_str_bufs: Vec::new(),
         }
@@ -634,6 +641,7 @@ macro_rules! alloc {
                 return r;
             }
             self.$field.push(v);
+            self.refresh_bases();
             let r = (self.$field.len() - 1) as Ref;
             self.$gen.on_alloc(r);
             r
@@ -662,6 +670,7 @@ macro_rules! alloc_moving {
                 return r;
             }
             self.$field.push(v);
+            self.refresh_bases();
             let r = (self.$field.len() - 1) as Ref;
             self.$gen.on_alloc(r);
             r
@@ -831,6 +840,21 @@ impl Heap {
         }
     }
 
+    /// Re-derive the JIT's arena base-pair tables. MUST be called after
+    /// any operation that can move an objs/arrs data pointer (Vec growth,
+    /// nursery take/restore) — compiled code reads these words directly.
+    #[inline(always)]
+    pub fn refresh_bases(&mut self) {
+        self.obj_bases = [
+            self.objs.as_ptr() as usize,
+            self.nursery.objs.as_ptr() as usize,
+        ];
+        self.arr_bases = [
+            self.arrs.as_ptr() as usize,
+            self.nursery.arrs.as_ptr() as usize,
+        ];
+    }
+
     pub fn needs_gc(&self) -> bool {
         self.allocs_since_gc >= self.gc_threshold
             || self.nursery.bytes >= self.nursery_limit
@@ -851,6 +875,7 @@ impl Heap {
             return r;
         }
         self.arrs.push(Vec::with_capacity(cap));
+        self.refresh_bases();
         let r = (self.arrs.len() - 1) as Ref;
         self.gen_arrs.on_alloc(r);
         r
@@ -875,6 +900,7 @@ impl Heap {
         let mut o = Obj { shape, ..Obj::default() };
         o.extend_vals(values);
         self.objs.push(o);
+        self.refresh_bases();
         let r = (self.objs.len() - 1) as Ref;
         self.gen_objs.on_alloc(r);
         r
@@ -896,6 +922,7 @@ impl Heap {
             return r;
         }
         self.arrs.push(values.to_vec());
+        self.refresh_bases();
         let r = (self.arrs.len() - 1) as Ref;
         self.gen_arrs.on_alloc(r);
         r
@@ -914,6 +941,7 @@ impl Heap {
             return r;
         }
         self.objs.push(Obj::default());
+        self.refresh_bases();
         let r = (self.objs.len() - 1) as Ref;
         self.gen_objs.on_alloc(r);
         r
@@ -928,6 +956,7 @@ impl Heap {
         assert!(i < YOUNG_BIT as usize, "nursery overflow");
         self.nursery.bytes += 72 + o.overflow.capacity() * 8;
         self.nursery.objs.push(o);
+        self.refresh_bases();
         i as Ref | YOUNG_BIT
     }
 
@@ -939,6 +968,7 @@ impl Heap {
         // allocs_since_gc backstops the trigger
         self.nursery.bytes += 32 + v.capacity() * 8;
         self.nursery.arrs.push(v);
+        self.refresh_bases();
         i as Ref | YOUNG_BIT
     }
 
@@ -982,6 +1012,8 @@ impl Heap {
             }
             None => {
                 self.objs.push(o);
+                self.refresh_bases();
+        self.refresh_bases();
                 (self.objs.len() - 1) as Ref
             }
         };
@@ -1004,6 +1036,7 @@ impl Heap {
             }
             None => {
                 self.arrs.push(v);
+                self.refresh_bases();
                 (self.arrs.len() - 1) as Ref
             }
         };

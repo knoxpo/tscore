@@ -145,14 +145,17 @@ impl C {
 
     /// x{base} = arena data pointer selected by payload bit 31 of
     /// w{refr} (old vs nursery); leaves the masked index in w{refr}.
-    /// Branchless: both bases loaded, csel on the bit (old refs have
-    /// bit 31 = 0, so the unconditional mask is a no-op for them).
-    fn arena_base(&mut self, base: u32, refr: u32, old_off: u32, young_off: u32) {
-        self.a.ldr_imm(base, R_REALM, old_off);
-        self.a.ldr_imm(11, R_REALM, young_off);
+    /// One shifted load from the realm's [old, young] base-pair table
+    /// (refreshed by Heap::refresh_bases on every pointer move).
+    fn arena_base(&mut self, base: u32, refr: u32, table_off: u32) {
         self.a.lsr_imm(13, refr, 31);
-        self.a.cmp_imm(13, 0);
-        self.a.csel(base, base, 11, Cond::Eq);
+        if table_off < 4096 {
+            self.a.add_imm(11, R_REALM, table_off);
+        } else {
+            self.a.mov_imm64(11, table_off as u64);
+            self.a.add_reg(11, R_REALM, 11);
+        }
+        self.a.ldr_reg_lsl3(base, 11, 13);
         self.a.ubfx32(refr, refr, 0, 31);
     }
     /// x{dst} = x{base} + w{idx} * size.
@@ -166,6 +169,13 @@ impl C {
         }
     }
 
+    /// The field-access CSE cache lives in x15 (validated obj address;
+    /// 0 = invalid) and x16 (its shape id). Both are caller-saved, so any
+    /// emitted blr must zero x15 — cached accesses guard with one cbz.
+    fn zero_cache(&mut self) {
+        self.a.movz(15, 0, 0);
+    }
+
     /// blr a thin helper whose args are staged in x0..; sentinel check +
     /// stack-ptr refresh. Thin helpers take args BY VALUE and never GC,
     /// so d-regs stay live across them.
@@ -175,6 +185,7 @@ impl C {
         self.a.cmp_reg(0, R_SENTINEL);
         self.a.b_cond(Cond::Eq, self.bail);
         self.a.add_reg(R_SLOTS, 1, R_BASE);
+        self.zero_cache();
     }
 
     /// Full interpreter semantics for instruction `pc` via h_step, with
@@ -193,6 +204,7 @@ impl C {
         self.a.b_cond(Cond::Eq, self.bail);
         self.a.add_reg(R_SLOTS, 1, R_BASE);
         self.reload_low();
+        self.zero_cache();
     }
 }
 
@@ -223,6 +235,7 @@ pub fn compile(
     ics_base: u64,
     tics_base: u64,
     lit_shapes: &[(u64, u32)],
+    inlines: &[Option<(u64, std::sync::Arc<FunctionProto>)>],
 ) -> Option<Vec<u32>> {
     let pbody = proto.body();
     if pbody.code.len() > crate::tier1::MAX_CODE {
@@ -346,10 +359,57 @@ pub fn compile(
         c.a.bind(normal);
     }
 
+    // field-access CSE: compile-time single-entry cache of which vreg's
+    // validated object address/shape sit in x15/x16. Merge points kill it.
+    let mut jump_targets = vec![false; pbody.code.len() + 2];
     for (pc, ins) in pbody.code.iter().enumerate() {
+        match ins.op {
+            Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue => {
+                let t = (pc as i64 + ins.sbx() as i64 + 1) as usize;
+                jump_targets[t] = true;
+            }
+            Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip
+            | Op::GeSkip => jump_targets[pc + 2] = true,
+            _ => {}
+        }
+    }
+    let mut fcache: Option<u8> = None;
+    for (pc, ins) in pbody.code.iter().enumerate() {
+        if jump_targets[pc] {
+            fcache = None;
+        }
         let l = c.pc_labels[pc];
         c.a.bind(l);
-        emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes);
+        emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache);
+        // ops with only cold-path blrs (which zero x15) preserve the cache;
+        // everything else — calls, allocation, heap ops that clobber
+        // x15/x16 outright — kills it at compile time
+        let preserves = match ins.op {
+            Op::LoadInt | Op::LoadBool | Op::LoadNull | Op::LoadUndef | Op::Move
+            | Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::Neg
+            | Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr
+            | Op::BitNot | Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge
+            | Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip
+            | Op::GeSkip | Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue => true,
+            Op::LoadConst => matches!(pbody.consts.get(ins.bx() as usize), Some(Const::Number(_))),
+            Op::GetField | Op::SetField => true, // arms manage the cache
+            _ => false,
+        };
+        if !preserves {
+            fcache = None;
+        } else if let Some(v) = fcache {
+            // an op that overwrites the cached vreg's register drops it
+            let writes_a = !matches!(
+                ins.op,
+                Op::SetField | Op::SetIndex | Op::ArrayPush | Op::StoreCell
+                    | Op::SetUpval | Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue
+                    | Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip
+                    | Op::GtSkip | Op::GeSkip
+            );
+            if writes_a && ins.a == v {
+                fcache = None;
+            }
+        }
     }
     let e1 = c.pc_labels[pbody.code.len()];
     c.a.bind(e1);
@@ -431,8 +491,243 @@ fn emit_mod_num(c: &mut C, a_reg: u8, db: u32, dc: u32, fmod_addr: usize) {
     }
     c.a.mov_imm64(8, fmod_addr as u64);
     c.a.blr(8);
+    c.zero_cache();
     c.put(a_reg, 0);
     c.a.bind(done);
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Callee shapes the direct-call inliner accepts: tiny, straight-line,
+/// pure-register bodies whose every op has a no-fallback inline template
+/// (no h_step — the pc would resolve against the caller's proto). Args
+/// must be read-only (a failed mid-body guard falls back to the generic
+/// call, which re-reads them).
+pub fn inlinable(callee: &FunctionProto) -> bool {
+    if callee.is_async || callee.arity > 4 {
+        return false;
+    }
+    let b = callee.body();
+    if b.code.len() > 12 || b.n_regs > 24 {
+        return false;
+    }
+    b.code.iter().all(|i| {
+        let dst_ok = i.a >= callee.arity || matches!(i.op, Op::Return);
+        dst_ok
+            && match i.op {
+                Op::LoadInt
+                | Op::LoadUndef
+                | Op::LoadNull
+                | Op::LoadBool
+                | Op::Move
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::Neg
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::Shl
+                | Op::Shr
+                | Op::UShr
+                | Op::BitNot
+                | Op::Return => true,
+                Op::LoadConst => {
+                    matches!(b.consts.get(i.bx() as usize), Some(Const::Number(_)))
+                }
+                Op::GetUpval => callee
+                    .upvals
+                    .get(i.b as usize)
+                    .is_some(),
+                _ => false,
+            }
+    })
+}
+
+/// Splice a tiny callee's body at a direct-call site. Callee reg r maps to
+/// caller vreg window+r (the call window — clobbering it is already the
+/// Call contract). Every arithmetic operand is number-guarded to `generic`
+/// (the ordinary call sequence); args are immutable so the fallback sees
+/// them intact.
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_call(
+    c: &mut C,
+    ins: Instr,
+    proto_word: u64,
+    callee: &FunctionProto,
+    o: &HeapOffsets,
+    fmod_addr: usize,
+    generic: Label,
+    done: Label,
+) {
+    let w = ins.a + 1; // window base vreg
+    let map = |r: u8| w + r;
+    // stack must already cover the callee temps (high-water usually does)
+    c.a.ldr_imm(9, R_REALM, o.realm_stack_len);
+    c.a.lsr_imm(10, R_BASE, 3);
+    c.a.add_imm(10, 10, w as u32 + callee.body().n_regs as u32);
+    c.a.cmp_reg(10, 9);
+    c.a.b_cond(Cond::Hi, generic);
+    // callee identity: closure tag + stored proto word
+    c.fetch_x(ins.a, 8);
+    c.a.lsr_imm(10, 8, 48);
+    c.a.movz(11, 0xFFFD, 0); // TAG_CLOSURE
+    c.a.cmp_reg(10, 11);
+    c.a.b_cond(Cond::Ne, generic);
+    c.a.orr_reg32(12, 31, 8);
+    c.a.ldr_imm(10, R_REALM, o.realm_closures_ptr);
+    c.index_addr(10, 10, 12, o.closure_size);
+    c.a.ldr_imm(11, 10, o.closure_proto_off);
+    c.a.mov_imm64(12, proto_word);
+    c.a.cmp_reg(11, 12);
+    c.a.b_cond(Cond::Ne, generic);
+    // x14 = closure arena address (kept for GetUpval; arith avoids x14
+    // except Mod, whose int path uses 10-14 — reload there if needed)
+    c.a.mov(14, 10);
+
+    let guard = |c: &mut C, v: u8, g: Label| {
+        c.fetch_x(v, 8);
+        c.a.lsr_imm(10, 8, 48);
+        c.a.cmp_reg(10, R_TAGLIM);
+        c.a.b_cond(Cond::Hs, g);
+    };
+    for cins in callee.body().code.iter() {
+        match cins.op {
+            Op::LoadInt => c.put_bits(map(cins.a), Value::number(cins.sbx() as f64).bits()),
+            Op::LoadUndef => c.put_bits(map(cins.a), Value::UNDEFINED.bits()),
+            Op::LoadNull => c.put_bits(map(cins.a), Value::NULL.bits()),
+            Op::LoadBool => c.put_bits(
+                map(cins.a),
+                if cins.b != 0 { Value::TRUE.bits() } else { Value::FALSE.bits() },
+            ),
+            Op::LoadConst => {
+                let bits = match &callee.body().consts[cins.bx() as usize] {
+                    Const::Number(n) => Value::number(*n).bits(),
+                    _ => unreachable!("inlinable checked"),
+                };
+                c.put_bits(map(cins.a), bits);
+            }
+            Op::Move => {
+                let src = c.fetch(map(cins.b), 0);
+                c.put(map(cins.a), src);
+            }
+            Op::Add | Op::Sub | Op::Mul | Op::Div => {
+                guard(c, map(cins.b), generic);
+                guard(c, map(cins.c), generic);
+                let db = c.fetch(map(cins.b), 0);
+                let dc = c.fetch(map(cins.c), 1);
+                let dst = if map(cins.a) < LOW { (8 + map(cins.a)) as u32 } else { 2 };
+                match cins.op {
+                    Op::Add => c.a.fadd(dst, db, dc),
+                    Op::Sub => c.a.fsub(dst, db, dc),
+                    Op::Mul => c.a.fmul(dst, db, dc),
+                    _ => c.a.fdiv(dst, db, dc),
+                }
+                if map(cins.a) >= LOW {
+                    c.a.str_d_imm(dst, R_SLOTS, C::slot(map(cins.a)));
+                }
+            }
+            Op::Mod => {
+                guard(c, map(cins.b), generic);
+                guard(c, map(cins.c), generic);
+                let db = c.fetch(map(cins.b), 0);
+                let dc = c.fetch(map(cins.c), 1);
+                emit_mod_num(c, map(cins.a), db, dc, fmod_addr);
+                c.zero_cache(); // fmod path is a blr
+                // x14 (closure addr) may be clobbered: recompute lazily in
+                // GetUpval below — mark by zeroing
+                c.a.movz(14, 0, 0);
+            }
+            Op::Neg => {
+                guard(c, map(cins.b), generic);
+                let db = c.fetch(map(cins.b), 0);
+                let dst = if map(cins.a) < LOW { (8 + map(cins.a)) as u32 } else { 0 };
+                c.a.fneg(dst, db);
+                if map(cins.a) >= LOW {
+                    c.a.str_d_imm(dst, R_SLOTS, C::slot(map(cins.a)));
+                }
+            }
+            Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr
+            | Op::BitNot => {
+                let unary = cins.op == Op::BitNot;
+                guard(c, map(cins.b), generic);
+                if !unary {
+                    guard(c, map(cins.c), generic);
+                }
+                let db = c.fetch(map(cins.b), 0);
+                c.a.fcvtzs(10, db);
+                if !unary {
+                    let dc = c.fetch(map(cins.c), 1);
+                    c.a.fcvtzs(11, dc);
+                }
+                let mut unsigned = false;
+                match cins.op {
+                    Op::BitAnd => c.a.and_reg32(10, 10, 11),
+                    Op::BitOr => c.a.orr_reg32(10, 10, 11),
+                    Op::BitXor => c.a.eor_reg32(10, 10, 11),
+                    Op::Shl => {
+                        c.a.movz(12, 31, 0);
+                        c.a.and_reg32(11, 11, 12);
+                        c.a.lslv32(10, 10, 11);
+                    }
+                    Op::Shr => {
+                        c.a.movz(12, 31, 0);
+                        c.a.and_reg32(11, 11, 12);
+                        c.a.asrv32(10, 10, 11);
+                    }
+                    Op::UShr => {
+                        c.a.movz(12, 31, 0);
+                        c.a.and_reg32(11, 11, 12);
+                        c.a.lsrv32(10, 10, 11);
+                        unsigned = true;
+                    }
+                    _ => c.a.mvn32(10, 10),
+                }
+                let dst = if map(cins.a) < LOW { (8 + map(cins.a)) as u32 } else { 2 };
+                if unsigned {
+                    c.a.ucvtf_w(dst, 10);
+                } else {
+                    c.a.scvtf_w(dst, 10);
+                }
+                if map(cins.a) >= LOW {
+                    c.a.str_d_imm(dst, R_SLOTS, C::slot(map(cins.a)));
+                }
+            }
+            Op::GetUpval => {
+                // x14 holds the closure arena address unless Mod zeroed it
+                let have = c.a.new_label();
+                c.a.cbnz(14, have);
+                c.fetch_x(ins.a, 8);
+                c.a.orr_reg32(12, 31, 8);
+                c.a.ldr_imm(14, R_REALM, o.realm_closures_ptr);
+                c.index_addr(14, 14, 12, o.closure_size);
+                c.a.bind(have);
+                c.a.ldr_imm(11, 14, o.closure_upvals_ptr);
+                c.a.ldr_imm(8, 11, cins.b as u32 * 8);
+                match callee.upvals[cins.b as usize] {
+                    tsc_ir::UpvalSrc::ParentLocalValue(_) => {}
+                    _ => {
+                        // cell deref (cells are old-only, non-moving)
+                        c.a.orr_reg32(9, 31, 8);
+                        c.a.ldr_imm(10, R_REALM, o.realm_cells_ptr);
+                        c.a.ldr_reg_lsl3(8, 10, 9);
+                    }
+                }
+                c.put_x(map(cins.a), 8);
+            }
+            Op::Return => {
+                c.fetch_x(map(cins.a), 8);
+                c.put_x(ins.a, 8);
+                c.a.b(done);
+                return;
+            }
+            _ => unreachable!("inlinable checked"),
+        }
+    }
+    // fell off the end (no Return): result undefined
+    c.put_bits(ins.a, Value::UNDEFINED.bits());
+    c.a.b(done);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -445,6 +740,8 @@ fn emit_op(
     fmod_addr: usize,
     pow_addr: usize,
     lit_shapes: &[(u64, u32)],
+    inlines: &[Option<(u64, std::sync::Arc<FunctionProto>)>],
+    fcache: &mut Option<u8>,
 ) {
     let pbody = proto.body();
     let num_bc = facts.num[pc][1] && facts.num[pc][2];
@@ -556,6 +853,7 @@ fn emit_op(
             }
             c.a.mov_imm64(8, pow_addr as u64);
             c.a.blr(8);
+            c.zero_cache();
             c.put(ins.a, 0);
             c.a.b(done);
             c.a.bind(slow);
@@ -721,6 +1019,7 @@ fn emit_op(
                 c.a.b_cond(Cond::Eq, c.bail);
                 c.a.add_reg(R_SLOTS, 1, R_BASE);
                 c.reload_low();
+                c.zero_cache(); // GC may have evacuated the cached object
                 c.a.movz(R_POLL, SAFEPOINT_INTERVAL, 0);
                 c.a.bind(no_poll);
             }
@@ -786,6 +1085,26 @@ fn emit_op(
         }
 
         Op::Call => {
+            // Fastest path: compile-time inlining of a tiny monomorphic
+            // callee (from the warmup-filled CallIc) — no frame, no call.
+            // Any failed guard falls through to the generic sequence.
+            let inline_generic = c.a.new_label();
+            let inline_done = c.a.new_label();
+            let mut inlined = false;
+            if let (Some(o), Some(Some((pw, callee)))) =
+                (c.offsets, inlines.get(pc))
+            {
+                if callee.arity as usize == ins.b as usize
+                    && (ins.a as usize + 1 + callee.body().n_regs as usize) < 256
+                {
+                    emit_inline_call(
+                        c, ins, *pw, callee, &o, fmod_addr, inline_generic,
+                        inline_done,
+                    );
+                    inlined = true;
+                }
+            }
+            c.a.bind(inline_generic);
             // calls push frames and can GC: full spill/reload around them.
             // Fast path: per-pc direct-call IC (monomorphic compiled sync
             // callee, argc == arity) jumps straight into the callee's
@@ -879,6 +1198,8 @@ fn emit_op(
             c.a.add_reg(R_SLOTS, 1, R_BASE);
             c.a.bind(done);
             c.reload_low();
+            let _ = inlined;
+            c.a.bind(inline_done);
         }
         Op::Return => {
             c.fetch_x(ins.a, 1);
@@ -892,7 +1213,31 @@ fn emit_op(
         Op::GetField => {
             let slow = c.a.new_label();
             let done = c.a.new_label();
+            let full = c.a.new_label();
             if let Some(o) = c.offsets {
+                if *fcache == Some(ins.b) {
+                    // CSE'd: object address in x15 (validated, 0 = cold
+                    // path clobbered it), its shape id in x16 — skip
+                    // tag / arena / shape loads; only this pc's IC check
+                    c.a.cbz(15, full);
+                    if pc < 4096 {
+                        c.a.ldr_imm(14, R_ICS, (pc as u32) * 8);
+                    } else {
+                        c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
+                        c.a.ldr_imm(14, 13, 0);
+                    }
+                    c.a.lsr_imm(13, 14, 32);
+                    c.a.cmp_reg(13, 16);
+                    c.a.b_cond(Cond::Ne, full);
+                    c.a.sub_imm32(13, 14, 1);
+                    c.a.cmp_imm(13, o.obj_inline_n);
+                    c.a.b_cond(Cond::Hs, full);
+                    c.index_addr(17, 15, 13, 8);
+                    c.a.ldr_imm(8, 17, o.obj_inline);
+                    c.put_x(ins.a, 8);
+                    c.a.b(done);
+                }
+                c.a.bind(full);
                 // inline IC'd property load (reads only, no GC)
                 c.fetch_x(ins.b, 8);
                 c.a.lsr_imm(10, 8, 48);
@@ -900,7 +1245,7 @@ fn emit_op(
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
                 c.a.orr_reg32(9, 31, 8); // w9 = payload ref
-                c.arena_base(10, 9, o.realm_objs_ptr, o.nursery_objs_ptr);
+                c.arena_base(10, 9, o.obj_bases_off);
                 c.index_addr(10, 10, 9, o.obj_size);
                 c.a.ldr_imm(11, 10, o.obj_shape_arc);
                 c.a.ldr_w_imm(12, 11, o.shape_id_delta);
@@ -910,16 +1255,21 @@ fn emit_op(
                     c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
                     c.a.ldr_imm(14, 13, 0);
                 }
-                c.a.lsr_imm(16, 14, 32);
-                c.a.cmp_reg(16, 12);
+                c.a.lsr_imm(13, 14, 32);
+                c.a.cmp_reg(13, 12);
                 c.a.b_cond(Cond::Ne, slow);
-                c.a.sub_imm32(16, 14, 1);
-                c.a.cmp_imm(16, o.obj_inline_n);
+                // populate the CSE cache: validated address + shape id
+                c.a.mov(15, 10);
+                c.a.mov(16, 12);
+                c.a.sub_imm32(13, 14, 1);
+                c.a.cmp_imm(13, o.obj_inline_n);
                 c.a.b_cond(Cond::Hs, slow); // overflow slot -> helper
-                c.index_addr(17, 10, 16, 8);
+                c.index_addr(17, 10, 13, 8);
                 c.a.ldr_imm(8, 17, o.obj_inline);
                 c.put_x(ins.a, 8);
                 c.a.b(done);
+            } else {
+                c.a.bind(full);
             }
             c.a.bind(slow);
             c.a.mov(0, R_REALM);
@@ -930,11 +1280,40 @@ fn emit_op(
             c.thin(c.helpers.get_field);
             c.put_x(ins.a, 0);
             c.a.bind(done);
+            if c.offsets.is_some() && ins.a != ins.b {
+                *fcache = Some(ins.b);
+            } else {
+                *fcache = None;
+            }
         }
         Op::SetField => {
             let slow = c.a.new_label();
             let done = c.a.new_label();
+            let full = c.a.new_label();
             if let Some(o) = c.offsets {
+                if *fcache == Some(ins.a) {
+                    // CSE'd store: cached validated address in x15, shape
+                    // id in x16 — only this pc's IC + number-value guard
+                    c.a.cbz(15, full);
+                    c.fetch_x(ins.c, 9);
+                    c.guard_number(9, full);
+                    if pc < 4096 {
+                        c.a.ldr_imm(14, R_ICS, (pc as u32) * 8);
+                    } else {
+                        c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
+                        c.a.ldr_imm(14, 13, 0);
+                    }
+                    c.a.lsr_imm(13, 14, 32);
+                    c.a.cmp_reg(13, 16);
+                    c.a.b_cond(Cond::Ne, full);
+                    c.a.sub_imm32(13, 14, 1);
+                    c.a.cmp_imm(13, o.obj_inline_n);
+                    c.a.b_cond(Cond::Hs, full);
+                    c.index_addr(17, 15, 13, 8);
+                    c.a.str_imm(9, 17, o.obj_inline);
+                    c.a.b(done);
+                }
+                c.a.bind(full);
                 // inline IC'd property store, number values only: a number
                 // stored into any object never needs a write barrier, and
                 // existing-slot stores never transition shapes
@@ -946,7 +1325,7 @@ fn emit_op(
                 c.fetch_x(ins.c, 9);
                 c.guard_number(9, slow); // heap values -> helper (barrier)
                 c.a.orr_reg32(12, 31, 8); // w12 = payload ref
-                c.arena_base(10, 12, o.realm_objs_ptr, o.nursery_objs_ptr);
+                c.arena_base(10, 12, o.obj_bases_off);
                 c.index_addr(10, 10, 12, o.obj_size);
                 c.a.ldr_imm(11, 10, o.obj_shape_arc);
                 c.a.ldr_w_imm(12, 11, o.shape_id_delta);
@@ -956,15 +1335,20 @@ fn emit_op(
                     c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
                     c.a.ldr_imm(14, 13, 0);
                 }
-                c.a.lsr_imm(16, 14, 32);
-                c.a.cmp_reg(16, 12);
+                c.a.lsr_imm(13, 14, 32);
+                c.a.cmp_reg(13, 12);
                 c.a.b_cond(Cond::Ne, slow); // empty IC or shape miss
-                c.a.sub_imm32(16, 14, 1); // slot (+1 encoding)
-                c.a.cmp_imm(16, o.obj_inline_n);
+                // populate the CSE cache: validated address + shape id
+                c.a.mov(15, 10);
+                c.a.mov(16, 12);
+                c.a.sub_imm32(13, 14, 1); // slot (+1 encoding)
+                c.a.cmp_imm(13, o.obj_inline_n);
                 c.a.b_cond(Cond::Hs, slow); // overflow slot -> helper
-                c.index_addr(17, 10, 16, 8);
+                c.index_addr(17, 10, 13, 8);
                 c.a.str_imm(9, 17, o.obj_inline);
                 c.a.b(done);
+            } else {
+                c.a.bind(full);
             }
             c.a.bind(slow);
             c.a.mov(0, R_REALM);
@@ -975,6 +1359,9 @@ fn emit_op(
             c.fetch_x(ins.c, 5);
             c.thin(c.helpers.set_field);
             c.a.bind(done);
+            if c.offsets.is_some() {
+                *fcache = Some(ins.a);
+            }
         }
         Op::GetIndex => {
             let slow = c.a.new_label();
@@ -988,7 +1375,7 @@ fn emit_op(
                 c.fetch_x(ins.c, 9);
                 c.guard_number(9, slow);
                 c.a.orr_reg32(12, 31, 8);
-                c.arena_base(10, 12, o.realm_arrs_ptr, o.nursery_arrs_ptr);
+                c.arena_base(10, 12, o.arr_bases_off);
                 c.index_addr(10, 10, 12, o.arr_size);
                 c.a.fmov_dx(0, 9);
                 c.a.fcvtzs(13, 0);
@@ -1032,7 +1419,7 @@ fn emit_op(
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
                 c.a.orr_reg32(12, 31, 8);
-                c.arena_base(10, 12, o.realm_arrs_ptr, o.nursery_arrs_ptr);
+                c.arena_base(10, 12, o.arr_bases_off);
                 c.index_addr(10, 10, 12, o.arr_size);
                 c.a.ldr_imm(14, 10, o.vec_len);
                 c.a.scvtf(0, 14);
@@ -1145,11 +1532,18 @@ fn emit_op(
                     _ => unreachable!("NewObjectLit const is Keys"),
                 }
             };
-            // helper reads values from slots — flush the ones living in
-            // d-registers (allocation never GCs, no reload needed)
-            for v in ins.b..ins.b + n as u8 {
-                if v < LOW {
-                    c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
+            let bump = ins.op == Op::NewObjectLit
+                && c.offsets.filter(|o| o.bump_alloc).is_some()
+                && lit_shapes
+                    .get(pc)
+                    .is_some_and(|&(sp, sn)| sp != 0 && (sn as usize) <= 3);
+            if !bump {
+                // helper reads values from slots — flush the ones living in
+                // d-registers (allocation never GCs, no reload needed)
+                for v in ins.b..ins.b + n as u8 {
+                    if v < LOW {
+                        c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
+                    }
                 }
             }
             if ins.op == Op::NewArrayLit {
@@ -1159,13 +1553,72 @@ fn emit_op(
                 c.a.mov_imm64(3, n as u64);
                 c.thin(c.helpers.new_array_lit);
             } else if let Some(&(shape_ptr, sn)) = lit_shapes.get(pc).filter(|&&(sp, _)| sp != 0) {
-                // shape baked at compile time: no per-alloc cache lookup
-                c.a.mov(0, R_REALM);
-                c.a.mov(1, R_BASE);
-                c.a.mov_imm64(2, ins.b as u64);
-                c.a.mov_imm64(3, sn as u64);
-                c.a.mov_imm64(4, shape_ptr);
-                c.thin(c.helpers.new_object_lit2);
+                if bump {
+                    // inline nursery bump: len<cap -> write the 64-byte Obj
+                    // at the tail, bump len+bytes, result = len|YOUNG_BIT.
+                    // Values read straight from d-reg homes (no slot flush).
+                    let o = c.offsets.unwrap();
+                    let slow = c.a.new_label();
+                    let done = c.a.new_label();
+                    c.a.ldr_imm(10, R_REALM, o.nursery_objs_len);
+                    c.a.ldr_imm(11, R_REALM, o.nursery_objs_cap);
+                    c.a.cmp_reg(10, 11);
+                    c.a.b_cond(Cond::Hs, slow); // full -> helper (realloc)
+                    c.a.ldr_imm(12, R_REALM, o.nursery_objs_ptr);
+                    c.a.add_reg_lsl(13, 12, 10, 6); // + len * 64
+                    c.a.mov_imm64(14, shape_ptr);
+                    c.a.str_imm(14, 13, 0); // shape
+                    // vlen (u32 + padding: 64-bit store covers both)
+                    c.a.mov_imm64(14, sn as u64);
+                    c.a.str_imm(14, 13, o.obj_vlen);
+                    for i in 0..sn as u8 {
+                        c.fetch_x(ins.b + i, 9);
+                        c.a.str_imm(9, 13, o.obj_inline + i as u32 * 8);
+                    }
+                    if (sn as usize) < 3 {
+                        c.a.mov_imm64(9, Value::UNDEFINED.bits());
+                        for i in sn as u8..3 {
+                            c.a.str_imm(9, 13, o.obj_inline + i as u32 * 8);
+                        }
+                    }
+                    for (i, &w) in o.empty_vec_words.iter().enumerate() {
+                        c.a.mov_imm64(9, w);
+                        c.a.str_imm(9, 13, o.obj_overflow + i as u32 * 8);
+                    }
+                    c.a.add_imm(14, 10, 1);
+                    c.a.str_imm(14, R_REALM, o.nursery_objs_len);
+                    c.a.ldr_imm(14, R_REALM, o.nursery_bytes_off);
+                    c.a.add_imm(14, 14, 72);
+                    c.a.str_imm(14, R_REALM, o.nursery_bytes_off);
+                    // result: TAG_OBJ | YOUNG_BIT | index
+                    c.a.mov_imm64(9, (0xFFFBu64 << 48) | 0x8000_0000);
+                    c.a.orr_reg(9, 9, 10);
+                    c.put_x(ins.a, 9);
+                    c.a.b(done);
+                    c.a.bind(slow);
+                    // helper reads values from slots — flush d-reg homes
+                    for v in ins.b..ins.b + sn as u8 {
+                        if v < LOW {
+                            c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
+                        }
+                    }
+                    c.a.mov(0, R_REALM);
+                    c.a.mov(1, R_BASE);
+                    c.a.mov_imm64(2, ins.b as u64);
+                    c.a.mov_imm64(3, sn as u64);
+                    c.a.mov_imm64(4, shape_ptr);
+                    c.thin(c.helpers.new_object_lit2);
+                    c.put_x(ins.a, 0);
+                    c.a.bind(done);
+                } else {
+                    // shape baked at compile time: no per-alloc cache lookup
+                    c.a.mov(0, R_REALM);
+                    c.a.mov(1, R_BASE);
+                    c.a.mov_imm64(2, ins.b as u64);
+                    c.a.mov_imm64(3, sn as u64);
+                    c.a.mov_imm64(4, shape_ptr);
+                    c.thin(c.helpers.new_object_lit2);
+                }
             } else {
                 c.a.mov(0, R_REALM);
                 c.a.mov(1, R_PROTO);
@@ -1175,7 +1628,9 @@ fn emit_op(
                 c.a.mov_imm64(5, ins.c as u64);
                 c.thin(c.helpers.new_object_lit);
             }
-            c.put_x(ins.a, 0);
+            if !bump {
+                c.put_x(ins.a, 0);
+            }
         }
 
         Op::Closure => {

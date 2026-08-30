@@ -714,6 +714,10 @@ fn run_frame(
                             Value::foreign(start_async(realm, Some(c), callee, new_base))
                         }
                     } else {
+                        // seed the direct-call IC from the interpreter too:
+                        // OSR-compiled callers read it at compile time (the
+                        // tiny-callee inliner needs it filled by warmup)
+                        crate::jit::fill_call_ic(realm, proto, pc, c, callee, argc);
                         // run_one tiers up to JIT when the callee is hot
                         run_one(realm, Some(c), callee, new_base, depth + 1)?
                     };

@@ -121,6 +121,38 @@ pub(crate) struct CallIc {
     pub n_regs: u32,
 }
 
+/// Fill the per-pc direct-call IC once the callee has compiled code.
+/// Also called from the interpreter's Call arm so OSR-compiled callers
+/// see the IC (and can inline tiny callees) at compile time.
+pub(crate) fn fill_call_ic(
+    r: &mut Realm,
+    pr: &FunctionProto,
+    pc: usize,
+    c: tsr_memory::Ref,
+    callee: &FunctionProto,
+    argc: usize,
+) {
+    let code_ptr = callee.jit.code.load(Acquire);
+    if !code_ptr.is_null()
+        && callee.arity as usize == argc
+        && pr.jit.tic_load(pr.body().code.len(), pc).is_null()
+    {
+        let proto_word = unsafe {
+            *(&r.heap.closure(c).proto as *const Arc<FunctionProto> as *const u64)
+        };
+        let ic = Box::into_raw(Box::new(CallIc {
+            proto_word,
+            proto_data: callee as *const FunctionProto as u64,
+            code: code_ptr as u64,
+            arity: callee.arity as u32,
+            n_regs: callee.body().n_regs as u32,
+        })) as *mut u8;
+        if !pr.jit.tic_store(pr.body().code.len(), pc, ic) {
+            drop(unsafe { Box::from_raw(ic as *mut CallIc) });
+        }
+    }
+}
+
 /// Finish a direct call whose callee returned nonzero (deopt or error).
 extern "C" fn h_call_resume(
     p: *mut core::ffi::c_void,
@@ -203,25 +235,7 @@ extern "C" fn h_call(
             }
             // direct-call IC: cache (proto identity -> compiled entry) so
             // the JIT can skip this helper entirely on the next call
-            let code_ptr = callee.jit.code.load(Acquire);
-            if !code_ptr.is_null()
-                && callee.arity as usize == argc
-                && pr.jit.tic_load(pr.body().code.len(), pc).is_null()
-            {
-                let proto_word = unsafe {
-                    *(&r.heap.closure(c).proto as *const Arc<FunctionProto> as *const u64)
-                };
-                let ic = Box::into_raw(Box::new(CallIc {
-                    proto_word,
-                    proto_data: callee as *const FunctionProto as u64,
-                    code: code_ptr as u64,
-                    arity: callee.arity as u32,
-                    n_regs: callee.body().n_regs as u32,
-                })) as *mut u8;
-                if !pr.jit.tic_store(pr.body().code.len(), pc, ic) {
-                    drop(unsafe { Box::from_raw(ic as *mut CallIc) });
-                }
-            }
+            fill_call_ic(r, pr, pc, c, callee, argc);
             crate::interp::run_one(r, Some(c), callee, new_base, depth + 1)
         } else if let Kind::Native(i) = f.kind() {
             let native = r.natives[i as usize].clone();
@@ -1218,6 +1232,15 @@ fn heap_offsets() -> Option<tsr_jit::tier1::HeapOffsets> {
         realm_arrs_ptr: l.realm_arrs_ptr,
         nursery_objs_ptr: l.nursery_objs_ptr,
         nursery_arrs_ptr: l.nursery_arrs_ptr,
+        obj_bases_off: l.obj_bases_off,
+        arr_bases_off: l.arr_bases_off,
+        nursery_objs_len: l.nursery_objs_len,
+        nursery_objs_cap: l.nursery_objs_cap,
+        nursery_bytes_off: l.nursery_bytes_off,
+        empty_vec_words: l.empty_vec_words,
+        obj_vlen: l.obj_vlen,
+        obj_overflow: l.obj_overflow,
+        bump_alloc: std::env::var_os("TSC_NO_NURSERY").is_none(),
         obj_size: l.obj_size,
         obj_shape_arc: l.obj_shape_arc,
         shape_id_delta: l.shape_id_delta,
@@ -1449,6 +1472,43 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
             }
         })
         .collect();
+    // direct-call inlining: warmup filled CallIcs; a tiny eligible callee
+    // gets spliced into the caller at compile time
+    let inlines: Vec<Option<(u64, Arc<FunctionProto>)>> = proto
+        .body()
+        .code
+        .iter()
+        .enumerate()
+        .map(|(pc, i)| {
+            if i.op != Op::Call {
+                return None;
+            }
+            let tic = proto.jit.tic_load(proto.body().code.len(), pc);
+            if tic.is_null() {
+                return None;
+            }
+            let ic = unsafe { &*(tic as *const CallIc) };
+            let callee: &FunctionProto =
+                unsafe { &*(ic.proto_data as *const FunctionProto) };
+            if !tsr_jit::tier2::inlinable(callee) {
+                if std::env::var_os("TSC_JIT_DEBUG").is_some() {
+                    eprintln!("[inline] pc {pc}: callee '{}' not inlinable", callee.name);
+                }
+                return None;
+            }
+            if std::env::var_os("TSC_JIT_DEBUG").is_some() {
+                eprintln!("[inline] pc {pc}: inlining '{}' into '{}'", callee.name, proto.name);
+            }
+            // clone the Arc so the spliced body's proto outlives any
+            // closure churn (ArcInner recovered from the stored word)
+            let arc = unsafe {
+                let p = ic.proto_data as *const FunctionProto;
+                Arc::increment_strong_count(p);
+                Arc::from_raw(p)
+            };
+            Some((ic.proto_word, arc))
+        })
+        .collect();
     tsr_jit::tier2::compile(
         proto,
         helpers(),
@@ -1460,6 +1520,7 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
         ics,
         tics,
         &lit_shapes,
+        &inlines,
     )
 }
 

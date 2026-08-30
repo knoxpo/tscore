@@ -23,6 +23,20 @@ pub struct HeapLayout {
     /// Nursery arena data pointers (young generation).
     pub nursery_objs_ptr: u32,
     pub nursery_arrs_ptr: u32,
+    /// Offsets of the [old, young] base-pair tables inside Realm.
+    pub obj_bases_off: u32,
+    pub arr_bases_off: u32,
+    /// nursery.objs Vec length / capacity word offsets inside Realm, and
+    /// nursery.bytes — for the JIT's inline bump-allocation fast path.
+    pub nursery_objs_len: u32,
+    pub nursery_objs_cap: u32,
+    pub nursery_bytes_off: u32,
+    /// The three raw words of an empty Vec<Value> (written into a freshly
+    /// bumped Obj's overflow field).
+    pub empty_vec_words: [u64; 3],
+    /// Obj field offsets (repr(C)): vlen and overflow.
+    pub obj_vlen: u32,
+    pub obj_overflow: u32,
     pub obj_size: u32,
     pub obj_shape_arc: u32,
     pub shape_id_delta: u32,
@@ -52,6 +66,12 @@ fn find_word(hay: &[u64], needle: u64) -> Option<u32> {
     if hits.len() == 1 {
         Some((hits[0] * 8) as u32)
     } else {
+        if hits.len() > 1 && std::env::var_os("TSC_LAYOUT_DEBUG").is_some() {
+            eprintln!(
+                "[layout] ambiguous needle {needle:#x}: byte offsets {:?}",
+                hits.iter().map(|&i| i * 8).collect::<Vec<_>>()
+            );
+        }
         None // ambiguous or missing: refuse to guess
     }
 }
@@ -202,21 +222,76 @@ pub fn discover() -> Option<HeapLayout> {
     // populate the nursery so its Vec data pointers are real (and unique)
     realm.heap.nursery.objs.push(Obj::default());
     realm.heap.nursery.arrs.push(vec![Value::UNDEFINED]);
-    let realm_words = as_words(&realm);
+    // sentinel the base-pair tables: their live values equal the Vec data
+    // pointers (ambiguous by construction), so probe unique markers
+    realm.heap.obj_bases = [0xB0BA_0001_0001, 0xB0BA_0001_0002];
+    realm.heap.arr_bases = [0xB0BA_0002_0001, 0xB0BA_0002_0002];
+    // Ambiguity happens when a freed block's address survives as a stale
+    // word somewhere in Realm and the target Vec reallocates into that
+    // block. Growing the target moves its pointer; the true field updates,
+    // the stale copy cannot — so grow-and-retry disambiguates.
+    macro_rules! probe_vec_ptr {
+        ($name:literal, $vec:expr, $grow:expr) => {{
+            let mut found = None;
+            for _ in 0..4 {
+                if let Some(off) = find_word(as_words(&realm), $vec(&realm) as u64) {
+                    found = Some(off);
+                    break;
+                }
+                $grow(&mut realm);
+            }
+            probe!($name, found)
+        }};
+    }
     let realm_stack_len =
-        probe!("realm_stack_len", find_word(realm_words, 37));
-    let realm_stack_ptr =
-        probe!("realm_stack_ptr", find_word(realm_words, realm.stack.as_ptr() as u64));
-    let realm_objs_ptr = probe!("realm_objs_ptr", find_word(realm_words, realm.heap.objs.as_ptr() as u64));
-    let realm_arrs_ptr = probe!("realm_arrs_ptr", find_word(realm_words, realm.heap.arrs.as_ptr() as u64));
-    let realm_closures_ptr = probe!(
+        probe!("realm_stack_len", find_word(as_words(&realm), 37));
+    let realm_stack_ptr = probe_vec_ptr!(
+        "realm_stack_ptr",
+        |r: &Realm| r.stack.as_ptr(),
+        |r: &mut Realm| {
+            let n = r.stack.len();
+            r.stack.reserve(r.stack.capacity() + 8);
+            r.stack.resize(n, Value::UNDEFINED);
+        }
+    );
+    let realm_objs_ptr = probe_vec_ptr!(
+        "realm_objs_ptr",
+        |r: &Realm| r.heap.objs.as_ptr(),
+        |r: &mut Realm| {
+            let mut po = Obj::default();
+            po.set(Arc::from("g"), Value::number(1.0));
+            r.heap.alloc_obj(po);
+        }
+    );
+    let realm_arrs_ptr = probe_vec_ptr!(
+        "realm_arrs_ptr",
+        |r: &Realm| r.heap.arrs.as_ptr(),
+        |r: &mut Realm| {
+            r.heap.alloc_arr(vec![Value::number(1.0); 3]);
+        }
+    );
+    let realm_closures_ptr = probe_vec_ptr!(
         "realm_closures_ptr",
-        find_word(realm_words, realm.heap.closures.as_ptr() as u64)
+        |r: &Realm| r.heap.closures.as_ptr(),
+        |r: &mut Realm| {
+            r.heap.alloc_closure(tsr_memory::Closure {
+                proto: dummy_proto.clone(),
+                upvals: vec![Value::number(1.0)],
+            });
+        }
     );
-    let realm_cells_ptr = probe!(
+    let realm_cells_ptr = probe_vec_ptr!(
         "realm_cells_ptr",
-        find_word(realm_words, realm.heap.cells.as_ptr() as u64)
+        |r: &Realm| r.heap.cells.as_ptr(),
+        |r: &mut Realm| {
+            r.heap.alloc_cell(Value::number(1.0));
+        }
     );
+    // growing probes above ran refresh_bases(); re-sentinel both tables so
+    // the nursery/base probes below see unique markers, not live pointers
+    realm.heap.obj_bases = [0xB0BA_0001_0001, 0xB0BA_0001_0002];
+    realm.heap.arr_bases = [0xB0BA_0002_0001, 0xB0BA_0002_0002];
+    let realm_words = as_words(&realm);
     let nursery_objs_ptr = probe!(
         "nursery_objs_ptr",
         find_word(realm_words, realm.heap.nursery.objs.as_ptr() as u64)
@@ -225,6 +300,30 @@ pub fn discover() -> Option<HeapLayout> {
         "nursery_arrs_ptr",
         find_word(realm_words, realm.heap.nursery.arrs.as_ptr() as u64)
     );
+    let obj_bases_off = probe!("obj_bases", find_word(realm_words, 0xB0BA_0001_0001));
+    let arr_bases_off = probe!("arr_bases", find_word(realm_words, 0xB0BA_0002_0001));
+    realm.heap.refresh_bases();
+    // nursery.objs Vec internals: the Vec struct base is where its data
+    // pointer sits minus the (already probed) in-Vec ptr offset; len/cap
+    // words derive from the generic Vec layout (0+8+16 word triple)
+    let vec_cap_off = 24 - vec_ptr - vec_len;
+    let nursery_vec_base = nursery_objs_ptr - vec_ptr;
+    let nursery_objs_len = nursery_vec_base + vec_len;
+    let nursery_objs_cap = nursery_vec_base + vec_cap_off;
+    // nursery.bytes: sentinel probe
+    realm.heap.nursery.bytes = 0xB0BA_0003_0001;
+    let nursery_bytes_off = probe!(
+        "nursery_bytes",
+        find_word(as_words(&realm), 0xB0BA_0003_0001)
+    );
+    realm.heap.nursery.bytes = 0;
+    let empty_vec_words: [u64; 3] = {
+        let ev: Vec<Value> = Vec::new();
+        let w = as_words(&ev);
+        [w[0], w[1], w[2]]
+    };
+    let obj_vlen = std::mem::offset_of!(Obj, vlen) as u32;
+    let obj_overflow = std::mem::offset_of!(Obj, overflow) as u32;
 
     let layout = HeapLayout {
         realm_stack_ptr,
@@ -232,6 +331,14 @@ pub fn discover() -> Option<HeapLayout> {
         realm_arrs_ptr,
         nursery_objs_ptr,
         nursery_arrs_ptr,
+        obj_bases_off,
+        arr_bases_off,
+        nursery_objs_len,
+        nursery_objs_cap,
+        nursery_bytes_off,
+        empty_vec_words,
+        obj_vlen,
+        obj_overflow,
         obj_size: std::mem::size_of::<Obj>() as u32,
         obj_shape_arc,
         shape_id_delta,
@@ -287,7 +394,23 @@ fn verify(realm: &Realm, l: &HeapLayout) -> bool {
 
 pub fn layout() -> Option<&'static HeapLayout> {
     static L: std::sync::OnceLock<Option<HeapLayout>> = std::sync::OnceLock::new();
-    L.get_or_init(discover).as_ref()
+    L.get_or_init(|| {
+        // ambiguity is address-coincidence luck (two words in Realm happen
+        // to hold equal values under this run's allocator layout) — a
+        // fresh probe realm rolls new addresses, so retry before giving
+        // up and silently running with inline paths disabled (~2x on
+        // object-heavy code)
+        for attempt in 0..3 {
+            if let Some(l) = discover() {
+                return Some(l);
+            }
+            if std::env::var_os("TSC_LAYOUT_DEBUG").is_some() {
+                eprintln!("[layout] discovery attempt {} failed, retrying", attempt + 1);
+            }
+        }
+        None
+    })
+    .as_ref()
 }
 
 #[cfg(test)]

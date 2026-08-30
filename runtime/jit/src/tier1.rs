@@ -93,6 +93,20 @@ pub struct HeapOffsets {
     /// payload bit 31 and mask the index.
     pub nursery_objs_ptr: u32,
     pub nursery_arrs_ptr: u32,
+    /// [old, young] base-pair tables in Realm: one shifted load selects.
+    pub obj_bases_off: u32,
+    pub arr_bases_off: u32,
+    /// Inline bump-allocation: nursery.objs len/cap + nursery.bytes word
+    /// offsets in Realm, the raw words of an empty Vec<Value>, and Obj
+    /// field offsets.
+    pub nursery_objs_len: u32,
+    pub nursery_objs_cap: u32,
+    pub nursery_bytes_off: u32,
+    pub empty_vec_words: [u64; 3],
+    pub obj_vlen: u32,
+    pub obj_overflow: u32,
+    /// Inline bump path enabled (nursery on for this process).
+    pub bump_alloc: bool,
     pub obj_size: u32,
     pub obj_shape_arc: u32,
     pub shape_id_delta: u32,
@@ -178,14 +192,17 @@ impl C {
 
     /// x{base} = arena data pointer selected by payload bit 31 of
     /// w{refr} (old vs nursery); leaves the masked index in w{refr}.
-    /// Branchless: both bases loaded, csel on the bit (old refs have
-    /// bit 31 = 0, so the unconditional mask is a no-op for them).
-    fn arena_base(&mut self, base: u32, refr: u32, old_off: u32, young_off: u32) {
-        self.a.ldr_imm(base, R_REALM, old_off);
-        self.a.ldr_imm(11, R_REALM, young_off);
+    /// One shifted load from the realm's [old, young] base-pair table
+    /// (refreshed by Heap::refresh_bases on every pointer move).
+    fn arena_base(&mut self, base: u32, refr: u32, table_off: u32) {
         self.a.lsr_imm(13, refr, 31);
-        self.a.cmp_imm(13, 0);
-        self.a.csel(base, base, 11, Cond::Eq);
+        if table_off < 4096 {
+            self.a.add_imm(11, R_REALM, table_off);
+        } else {
+            self.a.mov_imm64(11, table_off as u64);
+            self.a.add_reg(11, R_REALM, 11);
+        }
+        self.a.ldr_reg_lsl3(base, 11, 13);
         self.a.ubfx32(refr, refr, 0, 31);
     }
     /// x{dst} = x{base} + w{idx} * size (size folded as shift when pow2).
@@ -624,7 +641,7 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
                 c.a.orr_reg32(9, 31, 8); // w9 = payload ref
-                c.arena_base(10, 9, o.realm_objs_ptr, o.nursery_objs_ptr);
+                c.arena_base(10, 9, o.obj_bases_off);
                 c.index_addr(10, 10, 9, o.obj_size);
                 c.a.ldr_imm(11, 10, o.obj_shape_arc);
                 c.a.ldr_w_imm(12, 11, o.shape_id_delta);
@@ -673,7 +690,7 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
                 c.load_slot(9, ins.c);
                 c.guard_number(9, slow);
                 c.a.orr_reg32(12, 31, 8); // ref
-                c.arena_base(10, 12, o.realm_arrs_ptr, o.nursery_arrs_ptr);
+                c.arena_base(10, 12, o.arr_bases_off);
                 c.index_addr(10, 10, 12, o.arr_size);
                 // exact-integer index: fcvtzs/scvtf round trip
                 c.a.fmov_dx(0, 9);
@@ -719,7 +736,7 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow); // strings etc -> helper
                 c.a.orr_reg32(12, 31, 8);
-                c.arena_base(10, 12, o.realm_arrs_ptr, o.nursery_arrs_ptr);
+                c.arena_base(10, 12, o.arr_bases_off);
                 c.index_addr(10, 10, 12, o.arr_size);
                 c.a.ldr_imm(14, 10, o.vec_len);
                 c.a.scvtf(0, 14);
