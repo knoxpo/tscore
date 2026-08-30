@@ -44,6 +44,12 @@ pub fn collect<'a>(
     globals: impl Iterator<Item = &'a Value>,
     stats: &mut GcStats,
 ) {
+    debug_assert!(
+        heap.nursery.objs.is_empty()
+            && heap.nursery.arrs.is_empty()
+            && heap.nursery.strs.is_empty(),
+        "major GC with a non-empty nursery: evacuate first"
+    );
     let t0 = std::time::Instant::now();
     // persistent scratch: no per-collection mark-vector mallocs
     let mut m = std::mem::take(&mut heap.gc_scratch);
@@ -222,86 +228,224 @@ pub fn collect<'a>(
     stats.record_pause(t0);
 }
 
-/// Push v's outgoing edges onto the worklist (shared by minor tracing).
-fn push_children(heap: &Heap, v: Value, work: &mut Vec<Value>) {
-    match v.kind() {
-        Kind::Object(r) => {
-            let o = &heap.objs[r as usize];
-            let n = o.vlen().min(tsr_memory::OBJ_INLINE);
-            work.extend_from_slice(&o.inline[..n]);
-            work.extend_from_slice(&o.overflow);
-        }
-        Kind::Array(r) => work.extend_from_slice(&heap.arrs[r as usize]),
-        Kind::Closure(r) => {
-            work.extend_from_slice(&heap.closures[r as usize].upvals)
-        }
-        Kind::Cell(r) => work.push(heap.cells[r as usize]),
-        Kind::Foreign(r) => match &heap.foreigns[r as usize] {
-            Foreign::Promise(p) => {
-                if let PromiseState::Fulfilled(v) = p.state {
-                    work.push(v);
-                }
-                work.extend(p.reactions.iter().map(|&c| Value::foreign(c)));
-            }
-            Foreign::Coroutine(co) => {
-                work.extend_from_slice(&co.regs);
-                if let Some(c) = co.closure {
-                    work.push(Value::closure(c));
-                }
-                work.push(Value::foreign(co.promise));
-            }
-            Foreign::Handle(..) | Foreign::Free => {}
-        },
-        _ => {}
-    }
-}
 
 /// Minor collection: trace only the young generation. Old objects stop
 /// traversal (their new edges are covered by the remembered set). Sweep
 /// walks the young allocation logs only — O(young), not O(heap).
+// Cheney scan-queue kinds (packed (kind << 32) | ref in GcScratch.scan)
+const K_OBJ: u64 = 0;
+const K_ARR: u64 = 1;
+const K_CLOSURE: u64 = 2;
+const K_CELL: u64 = 3;
+const K_FOREIGN: u64 = 4;
+
+/// Forward one edge: young refs are evacuated into the old arenas (via
+/// the forwarding table) and the edge rewritten; old-space young-log
+/// survivors are marked and queued. Non-moving kinds (closure/cell/
+/// foreign) are marked + queued only.
+fn forward(
+    v: Value,
+    heap: &mut Heap,
+    m: &mut tsr_memory::GcScratch,
+    nur: &mut tsr_memory::Nursery,
+) -> Value {
+    use tsr_memory::YOUNG_BIT;
+    match v.kind() {
+        Kind::Object(r) => {
+            if r & YOUNG_BIT != 0 {
+                let yi = (r & !YOUNG_BIT) as usize;
+                if m.fwd_objs[yi] == u32::MAX {
+                    let o = std::mem::take(&mut nur.objs[yi]);
+                    let nr = heap.promote_obj(o);
+                    m.fwd_objs[yi] = nr;
+                    m.scan.push((K_OBJ << 32) | nr as u64);
+                }
+                Value::object(m.fwd_objs[yi])
+            } else {
+                if !heap.gen_objs.old.get(r) && !m.yobjs.get(r) {
+                    m.yobjs.set(r);
+                    m.scan.push((K_OBJ << 32) | r as u64);
+                }
+                v
+            }
+        }
+        Kind::Array(r) => {
+            if r & YOUNG_BIT != 0 {
+                let yi = (r & !YOUNG_BIT) as usize;
+                if m.fwd_arrs[yi] == u32::MAX {
+                    let a = std::mem::take(&mut nur.arrs[yi]);
+                    let nr = heap.promote_arr(a);
+                    m.fwd_arrs[yi] = nr;
+                    m.scan.push((K_ARR << 32) | nr as u64);
+                }
+                Value::array(m.fwd_arrs[yi])
+            } else {
+                if !heap.gen_arrs.old.get(r) && !m.yarrs.get(r) {
+                    m.yarrs.set(r);
+                    m.scan.push((K_ARR << 32) | r as u64);
+                }
+                v
+            }
+        }
+        Kind::Str(r) => {
+            if r & YOUNG_BIT != 0 {
+                let yi = (r & !YOUNG_BIT) as usize;
+                if m.fwd_strs[yi] == u32::MAX {
+                    let s = std::mem::replace(
+                        &mut nur.strs[yi],
+                        tsr_memory::HStr::Buf(String::new()),
+                    );
+                    m.fwd_strs[yi] = heap.promote_str(s);
+                }
+                Value::str_ref(m.fwd_strs[yi])
+            } else {
+                if !heap.gen_strs.old.get(r) {
+                    m.ystrs.set(r);
+                }
+                v
+            }
+        }
+        Kind::Closure(r) => {
+            if !heap.gen_closures.old.get(r) && !m.yclosures.get(r) {
+                m.yclosures.set(r);
+                m.scan.push((K_CLOSURE << 32) | r as u64);
+            }
+            v
+        }
+        Kind::Cell(r) => {
+            if !heap.gen_cells.old.get(r) && !m.ycells.get(r) {
+                m.ycells.set(r);
+                m.scan.push((K_CELL << 32) | r as u64);
+            }
+            v
+        }
+        Kind::Foreign(r) => {
+            if !heap.gen_foreigns.old.get(r) && !m.yforeigns.get(r) {
+                m.yforeigns.set(r);
+                m.scan.push((K_FOREIGN << 32) | r as u64);
+            }
+            v
+        }
+        _ => v,
+    }
+}
+
+/// Minor collection: evacuating trace. Young (nursery) survivors move to
+/// the old arenas with every reachable edge rewritten; old-space young-log
+/// survivors are marked in place and swept as before. Old containers stop
+/// traversal (remembered set covers their new edges). Dead nursery slots
+/// are never visited beyond a buffer-salvage pass.
 pub fn collect_minor<'a>(
     heap: &mut Heap,
-    stack: &[Value],
-    globals: impl Iterator<Item = &'a Value>,
+    stack: &mut [Value],
+    globals: impl Iterator<Item = &'a mut Value>,
+    extra: &[Value],
     stats: &mut GcStats,
 ) {
     let t0 = std::time::Instant::now();
 
-    // persistent minor-mark bitmaps + worklist (no per-collection mallocs)
+    // persistent minor-mark bitmaps + queues (no per-collection mallocs)
     let mut m = std::mem::take(&mut heap.gc_scratch);
+    let mut nur = std::mem::take(&mut heap.nursery);
     m.ystrs.clear_all();
     m.yobjs.clear_all();
     m.yarrs.clear_all();
     m.yclosures.clear_all();
     m.ycells.clear_all();
     m.yforeigns.clear_all();
+    m.fwd_objs.clear();
+    m.fwd_objs.resize(nur.objs.len(), u32::MAX);
+    m.fwd_arrs.clear();
+    m.fwd_arrs.resize(nur.arrs.len(), u32::MAX);
+    m.fwd_strs.clear();
+    m.fwd_strs.resize(nur.strs.len(), u32::MAX);
+    m.scan.clear();
 
-    let mut work = std::mem::take(&mut m.work);
-    work.clear();
-    work.extend_from_slice(stack);
-    work.extend(globals.copied());
-    // remembered old containers: trace their children, not themselves
+    // roots: rewrite in place
+    for slot in stack.iter_mut() {
+        *slot = forward(*slot, heap, &mut m, &mut nur);
+    }
+    for g in globals {
+        *g = forward(*g, heap, &mut m, &mut nur);
+    }
+    for &v in extra {
+        // pinned/microtask foreigns: non-moving, scan contents only
+        let _ = forward(v, heap, &mut m, &mut nur);
+    }
+    // remembered old containers: fix their edges, not themselves
     let remembered = std::mem::take(&mut heap.remembered);
     stats_remembered_peak(heap, remembered.len());
     for &v in &remembered {
-        push_children(heap, v, &mut work);
+        match v.kind() {
+            Kind::Object(r) => m.scan.push((K_OBJ << 32) | r as u64),
+            Kind::Array(r) => m.scan.push((K_ARR << 32) | r as u64),
+            Kind::Cell(r) => m.scan.push((K_CELL << 32) | r as u64),
+            Kind::Foreign(r) => m.scan.push((K_FOREIGN << 32) | r as u64),
+            _ => {}
+        }
     }
 
-    while let Some(v) = work.pop() {
-        let (gen, marks, r) = match v.kind() {
-            Kind::Str(r) => (&heap.gen_strs, &mut m.ystrs, r),
-            Kind::Object(r) => (&heap.gen_objs, &mut m.yobjs, r),
-            Kind::Array(r) => (&heap.gen_arrs, &mut m.yarrs, r),
-            Kind::Closure(r) => (&heap.gen_closures, &mut m.yclosures, r),
-            Kind::Cell(r) => (&heap.gen_cells, &mut m.ycells, r),
-            Kind::Foreign(r) => (&heap.gen_foreigns, &mut m.yforeigns, r),
-            _ => continue,
-        };
-        if gen.old.get(r) || marks.get(r) {
-            continue;
+    // transitive fixup: index-based re-borrow per edge (forward() may push
+    // into the same arena Vec — no borrow spans a promotion)
+    while let Some(item) = m.scan.pop() {
+        let r = item as u32 as usize;
+        match item >> 32 {
+            K_OBJ => {
+                let n = heap.objs[r].vlen();
+                for i in 0..n {
+                    let v = heap.objs[r].val(i);
+                    let nv = forward(v, heap, &mut m, &mut nur);
+                    heap.objs[r].set_val(i, nv);
+                }
+            }
+            K_ARR => {
+                let n = heap.arrs[r].len();
+                for i in 0..n {
+                    let v = heap.arrs[r][i];
+                    let nv = forward(v, heap, &mut m, &mut nur);
+                    heap.arrs[r][i] = nv;
+                }
+            }
+            K_CLOSURE => {
+                let n = heap.closures[r].upvals.len();
+                for i in 0..n {
+                    let v = heap.closures[r].upvals[i];
+                    let nv = forward(v, heap, &mut m, &mut nur);
+                    heap.closures[r].upvals[i] = nv;
+                }
+            }
+            K_CELL => {
+                let v = heap.cells[r];
+                heap.cells[r] = forward(v, heap, &mut m, &mut nur);
+            }
+            _ => {
+                // K_FOREIGN: take/put-back — cannot hold &mut contents
+                // while forward() needs &mut heap
+                let mut f = std::mem::replace(&mut heap.foreigns[r], Foreign::Free);
+                match &mut f {
+                    Foreign::Promise(p) => {
+                        if let PromiseState::Fulfilled(v) = &mut p.state {
+                            *v = forward(*v, heap, &mut m, &mut nur);
+                        }
+                        for &c in &p.reactions {
+                            let _ = forward(Value::foreign(c), heap, &mut m, &mut nur);
+                        }
+                    }
+                    Foreign::Coroutine(co) => {
+                        for i in 0..co.regs.len() {
+                            let v = co.regs[i];
+                            co.regs[i] = forward(v, heap, &mut m, &mut nur);
+                        }
+                        if let Some(c) = co.closure {
+                            let _ = forward(Value::closure(c), heap, &mut m, &mut nur);
+                        }
+                        let _ = forward(Value::foreign(co.promise), heap, &mut m, &mut nur);
+                    }
+                    _ => {}
+                }
+                heap.foreigns[r] = f;
+            }
         }
-        marks.set(r);
-        push_children(heap, v, &mut work);
     }
 
     // sweep young logs only
@@ -353,16 +497,37 @@ pub fn collect_minor<'a>(
     sweep_young!(gen_cells, m.ycells, free_cells, |h: &mut Heap, r| {
         h.cells[r as usize] = Value::UNDEFINED;
     });
-    sweep_young!(gen_foreigns, m.yforeigns, free_foreigns, |h: &mut Heap, r| {
-        if let Foreign::Promise(p) = &h.foreigns[r as usize] {
-            if let PromiseState::Rejected(e) = &p.state {
-                if p.reactions.is_empty() && !e.cancelled {
-                    eprintln!("warning: unhandled promise rejection: {}", e.msg);
+    {
+        // manual sweep for foreigns: resume() frees consumed coroutine
+        // slots explicitly (free_foreign) while their young-log entry
+        // remains — pushing them to the free list again here would hand
+        // the same slot to two allocations
+        let young = std::mem::take(&mut heap.gen_foreigns.young);
+        for r in young {
+            if matches!(heap.foreigns[r as usize], Foreign::Free) {
+                continue; // already freed explicitly
+            }
+            if m.yforeigns.get(r) {
+                heap.gen_foreigns.old.set(r);
+                promoted += 1;
+                promoted_bytes += slot_bytes(heap, "gen_foreigns", r);
+            } else {
+                if let Foreign::Promise(p) = &heap.foreigns[r as usize] {
+                    if let PromiseState::Rejected(e) = &p.state {
+                        if p.reactions.is_empty() && !e.cancelled {
+                            eprintln!(
+                                "warning: unhandled promise rejection: {}",
+                                e.msg
+                            );
+                        }
+                    }
                 }
+                heap.foreigns[r as usize] = Foreign::Free;
+                heap.free_foreigns.push(r);
+                freed += 1;
             }
         }
-        h.foreigns[r as usize] = Foreign::Free;
-    });
+    }
 
     // clear dirty bits for the remembered containers we consumed
     for v in remembered {
@@ -375,16 +540,62 @@ pub fn collect_minor<'a>(
         }
     }
 
+    // harvest backing buffers from dead nursery slots, then reset by
+    // truncation — dead objects get only this salvage touch
+    let mut evacuated = 0usize;
+    for (i, o) in nur.objs.iter_mut().enumerate() {
+        if m.fwd_objs[i] != u32::MAX {
+            evacuated += 1;
+        } else if o.overflow.capacity() > 0 && heap.pool_arr_bufs.len() < 4096 {
+            let mut b = std::mem::take(&mut o.overflow);
+            b.clear();
+            if b.capacity() <= 1024 {
+                heap.pool_arr_bufs.push(b);
+            }
+        }
+    }
+    for (i, a) in nur.arrs.iter_mut().enumerate() {
+        if m.fwd_arrs[i] != u32::MAX {
+            evacuated += 1;
+        } else if a.capacity() > 0 && heap.pool_arr_bufs.len() < 4096 {
+            let mut b = std::mem::take(a);
+            b.clear();
+            if b.capacity() <= 1024 {
+                heap.pool_arr_bufs.push(b);
+            }
+        }
+    }
+    for (i, hs) in nur.strs.iter_mut().enumerate() {
+        if m.fwd_strs[i] != u32::MAX {
+            evacuated += 1;
+        } else if let tsr_memory::HStr::Buf(b) = hs {
+            if b.capacity() > 0 && heap.pool_str_bufs.len() < 4096 {
+                let mut b = std::mem::take(b);
+                b.clear();
+                if b.capacity() <= 1024 {
+                    heap.pool_str_bufs.push(b);
+                }
+            }
+        }
+    }
+    let nursery_dead =
+        nur.objs.len() + nur.arrs.len() + nur.strs.len() - evacuated;
+    freed += nursery_dead;
+    nur.objs.clear();
+    nur.arrs.clear();
+    nur.strs.clear();
+    nur.bytes = 0;
+    heap.nursery = nur;
+
     heap.promoted_since_major += promoted;
     heap.promoted_bytes_since_major += promoted_bytes;
     heap.allocs_since_gc = 0;
-    m.work = work;
     heap.gc_scratch = m;
     stats.minor_collections += 1;
     stats.last_freed = freed;
     if std::env::var_os("TSC_GC_DEBUG").is_some() {
         eprintln!(
-            "[gc] minor freed={freed} promoted={promoted} arena={} free_objs={} free_arrs={}",
+            "[gc] minor freed={freed} promoted={promoted} evac={evacuated} arena={} free_objs={} free_arrs={}",
             heap.objs.len() + heap.arrs.len(),
             heap.free_objs.len(),
             heap.free_arrs.len()

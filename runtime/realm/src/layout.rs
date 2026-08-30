@@ -20,6 +20,9 @@ pub struct HeapLayout {
     pub realm_stack_ptr: u32,
     pub realm_objs_ptr: u32,
     pub realm_arrs_ptr: u32,
+    /// Nursery arena data pointers (young generation).
+    pub nursery_objs_ptr: u32,
+    pub nursery_arrs_ptr: u32,
     pub obj_size: u32,
     pub obj_shape_arc: u32,
     pub shape_id_delta: u32,
@@ -196,6 +199,9 @@ pub fn discover() -> Option<HeapLayout> {
         realm.heap.alloc_cell(Value::number(i as f64));
     }
     realm.stack.resize(37, Value::UNDEFINED);
+    // populate the nursery so its Vec data pointers are real (and unique)
+    realm.heap.nursery.objs.push(Obj::default());
+    realm.heap.nursery.arrs.push(vec![Value::UNDEFINED]);
     let realm_words = as_words(&realm);
     let realm_stack_len =
         probe!("realm_stack_len", find_word(realm_words, 37));
@@ -211,11 +217,21 @@ pub fn discover() -> Option<HeapLayout> {
         "realm_cells_ptr",
         find_word(realm_words, realm.heap.cells.as_ptr() as u64)
     );
+    let nursery_objs_ptr = probe!(
+        "nursery_objs_ptr",
+        find_word(realm_words, realm.heap.nursery.objs.as_ptr() as u64)
+    );
+    let nursery_arrs_ptr = probe!(
+        "nursery_arrs_ptr",
+        find_word(realm_words, realm.heap.nursery.arrs.as_ptr() as u64)
+    );
 
     let layout = HeapLayout {
         realm_stack_ptr,
         realm_objs_ptr,
         realm_arrs_ptr,
+        nursery_objs_ptr,
+        nursery_arrs_ptr,
         obj_size: std::mem::size_of::<Obj>() as u32,
         obj_shape_arc,
         shape_id_delta,

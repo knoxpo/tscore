@@ -6,24 +6,22 @@
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tsr_memory::Value;
-use tsr_realm::{Realm, RtError};
+use tsr_realm::{NativeArgs, Realm, RtError};
 
-fn num_arg(args: &[Value], i: usize, who: &str) -> Result<f64, RtError> {
-    match args.get(i) {
-        Some(v) if v.is_number() => Ok(v.as_number()),
-        v => Err(RtError::new(format!(
-            "{who}: expected number, got {}",
-            v.map_or("nothing", |v| v.type_of())
-        ))),
+fn num_arg(realm: &Realm, args: NativeArgs, i: usize, who: &str) -> Result<f64, RtError> {
+    let v = args.get(realm, i);
+    if v.is_number() {
+        Ok(v.as_number())
+    } else {
+        Err(RtError::new(format!("{who}: expected number, got {}", v.type_of())))
     }
 }
 
 /// Install console/Math/Date/performance and string helpers into a realm.
 pub fn install(realm: &mut Realm) {
     let log = realm.add_native(|realm, args| {
-        let line = args
-            .iter()
-            .map(|v| v.display(&realm.heap))
+        let line = (0..args.len())
+            .map(|i| args.get(realm, i).display(&realm.heap))
             .collect::<Vec<_>>()
             .join(" ");
         // ponytail: lock stdout per call; enough until output-heavy workloads
@@ -35,17 +33,17 @@ pub fn install(realm: &mut Realm) {
 
     macro_rules! math1 {
         ($realm:ident, $name:literal, $f:expr) => {
-            ($name, $realm.add_native(move |_, args| {
-                Ok(Value::number($f(num_arg(args, 0, $name)?)))
+            ($name, $realm.add_native(move |realm, args| {
+                Ok(Value::number($f(num_arg(realm, args, 0, $name)?)))
             }))
         };
     }
     macro_rules! math2 {
         ($realm:ident, $name:literal, $f:expr) => {
-            ($name, $realm.add_native(move |_, args| {
+            ($name, $realm.add_native(move |realm, args| {
                 Ok(Value::number($f(
-                    num_arg(args, 0, $name)?,
-                    num_arg(args, 1, $name)?,
+                    num_arg(realm, args, 0, $name)?,
+                    num_arg(realm, args, 1, $name)?,
                 )))
             }))
         };
@@ -83,7 +81,7 @@ pub fn install(realm: &mut Realm) {
 
     // sleep(ms) -> Promise<undefined>, via a single shared timer thread
     let sleep = realm.add_native(|realm, args| {
-        let ms = num_arg(args, 0, "sleep")?.max(0.0);
+        let ms = num_arg(realm, args, 0, "sleep")?.max(0.0);
         let (promise, completer) = realm.promise_pair();
         timer_wheel().send((
             std::time::Instant::now()
@@ -96,17 +94,14 @@ pub fn install(realm: &mut Realm) {
 
     // hidden helper: `s.charCodeAt(i)` compiles to `__charCodeAt(s, i)`
     let char_code_at = realm.add_native(|realm, args| {
-        let s = match args.first().and_then(|v| v.as_str_ref()) {
+        let sv = args.get(realm, 0);
+        let i = num_arg(realm, args, 1, "charCodeAt")? as usize;
+        let s = match sv.as_str_ref() {
             Some(r) => realm.heap.str_at(r),
             None => {
-                let v = args.first();
-                return Err(RtError::new(format!(
-                    "charCodeAt on {}",
-                    v.map_or("nothing", |v| v.type_of())
-                )))
+                return Err(RtError::new(format!("charCodeAt on {}", sv.type_of())))
             }
         };
-        let i = num_arg(args, 1, "charCodeAt")? as usize;
         Ok(match s.chars().nth(i) {
             Some(c) => Value::number(c as u32 as f64),
             None => Value::number(f64::NAN),

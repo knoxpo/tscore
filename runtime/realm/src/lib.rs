@@ -93,8 +93,37 @@ impl std::fmt::Display for RtError {
     }
 }
 
+/// Native argument window: indices into `realm.stack`, not copies. A moving
+/// GC (nursery evacuation) can run while a native re-enters the interpreter;
+/// stack slots get fixed up, Rust-local `Value` copies would not. Natives
+/// must re-read through `get` after any re-entry.
+#[derive(Clone, Copy)]
+pub struct NativeArgs {
+    pub base: usize,
+    pub argc: usize,
+}
+
+impl NativeArgs {
+    #[inline(always)]
+    pub fn get(&self, realm: &Realm, i: usize) -> Value {
+        if i < self.argc {
+            realm.stack[self.base + i]
+        } else {
+            Value::UNDEFINED
+        }
+    }
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.argc
+    }
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.argc == 0
+    }
+}
+
 pub type NativeFn =
-    Arc<dyn Fn(&mut Realm, &[Value]) -> Result<Value, RtError> + Send + Sync>;
+    Arc<dyn Fn(&mut Realm, NativeArgs) -> Result<Value, RtError> + Send + Sync>;
 
 pub struct Realm {
     pub heap: Heap,
@@ -126,7 +155,9 @@ pub struct Realm {
     pub microtasks: std::collections::VecDeque<tsr_memory::Ref>,
     /// Foreign refs kept alive across GC (main promise, cross-thread
     /// completions in flight).
-    pub pinned: rustc_hash::FxHashSet<tsr_memory::Ref>,
+    /// Refcounted GC pins: multiple holders (drive loop, resume, external
+    /// completers) can pin the same promise independently.
+    pub pinned: rustc_hash::FxHashMap<tsr_memory::Ref, u32>,
     /// Promises with an outstanding cross-thread Completer.
     pub external_pending: usize,
     /// While waiting for wakes, help execute pool work (set by
@@ -162,7 +193,7 @@ impl Realm {
             concat_buf: String::new(),
             cancel: None,
             microtasks: std::collections::VecDeque::new(),
-            pinned: rustc_hash::FxHashSet::default(),
+            pinned: rustc_hash::FxHashMap::default(),
             external_pending: 0,
             idle_helper: None,
             pool_busy: None,
@@ -173,6 +204,13 @@ impl Realm {
 
     /// Safepoint: cancellation check, then GC check. Called at loop
     /// back-edges and closure calls — keep the no-op path branch-only.
+    ///
+    /// INVARIANT (moving nursery): GC may run here and EVACUATE young
+    /// obj/arr/str refs — it fixes up stack slots, globals, remembered
+    /// containers and coroutine regs, but NOT `Value` copies in Rust
+    /// locals. No obj/arr/str `Value` may be held in a Rust local across
+    /// a safepoint (closures/cells/foreigns don't move and are exempt).
+    /// Natives get args as `NativeArgs` stack indices for this reason.
     #[inline(always)]
     pub fn safepoint(&mut self) -> Result<(), RtError> {
         if let Some(c) = &self.cancel {
@@ -193,9 +231,23 @@ impl Realm {
 
     /// Allocate a pending promise + a Send-able completer for it. The
     /// promise stays pinned (GC root) until its Wake is processed.
+    pub fn pin(&mut self, r: tsr_memory::Ref) {
+        *self.pinned.entry(r).or_insert(0) += 1;
+    }
+
+    pub fn unpin(&mut self, r: tsr_memory::Ref) {
+        match self.pinned.get_mut(&r) {
+            Some(c) if *c > 1 => *c -= 1,
+            Some(_) => {
+                self.pinned.remove(&r);
+            }
+            None => debug_assert!(false, "unpin without pin"),
+        }
+    }
+
     pub fn promise_pair(&mut self) -> (Value, Completer) {
         let promise = self.heap.alloc_promise();
-        self.pinned.insert(promise);
+        self.pin(promise);
         self.external_pending += 1;
         (
             Value::foreign(promise),
@@ -208,7 +260,7 @@ impl Realm {
             let extra: Vec<Value> = self
                 .microtasks
                 .iter()
-                .chain(self.pinned.iter())
+                .chain(self.pinned.keys())
                 .map(|&r| Value::foreign(r))
                 .collect();
             // major when the old generation grew ~50% since the last major
@@ -223,6 +275,17 @@ impl Realm {
                     > (self.gc_stats.last_live_bytes / 2).max(8 << 20)
                 || self.heap.remembered.len() > 32 * 1024;
             if major {
+                // evacuate first when the nursery is live: the major trace
+                // indexes old arenas raw and must never see a young ref
+                if self.heap.nursery.bytes > 0 || !self.heap.nursery.objs.is_empty() {
+                    tsr_gc::collect_minor(
+                        &mut self.heap,
+                        &mut self.stack,
+                        self.globals.values_mut(),
+                        &extra,
+                        &mut self.gc_stats,
+                    );
+                }
                 tsr_gc::collect(
                     &mut self.heap,
                     &self.stack,
@@ -232,8 +295,9 @@ impl Realm {
             } else {
                 tsr_gc::collect_minor(
                     &mut self.heap,
-                    &self.stack,
-                    self.globals.values().chain(extra.iter()),
+                    &mut self.stack,
+                    self.globals.values_mut(),
+                    &extra,
                     &mut self.gc_stats,
                 );
             }
@@ -277,7 +341,7 @@ impl Realm {
 
     pub fn add_native(
         &mut self,
-        f: impl Fn(&mut Realm, &[Value]) -> Result<Value, RtError> + Send + Sync + 'static,
+        f: impl Fn(&mut Realm, NativeArgs) -> Result<Value, RtError> + Send + Sync + 'static,
     ) -> Value {
         self.natives.push(Arc::new(f));
         Value::native((self.natives.len() - 1) as u32)

@@ -67,27 +67,29 @@ pub fn install(realm: &mut Realm) {
     realm.set_global_obj("Runtime", vec![("checkCancellation", check)]);
 }
 
-fn task_scope(realm: &mut Realm, args: &[Value]) -> Result<Value, RtError> {
-    let cb = match args.first() {
-        Some(&f) if f.as_closure().is_some() => f,
-        _ => return Err(RtError::new("task.scope(fn): expected a function")),
-    };
-    let timeout_ms = match args.get(1) {
-        Some(v) if v.as_object().is_some() => {
-            let r = v.as_object().unwrap();
-            match realm.heap.obj(r).get("timeout") {
-                Some(t) if t.is_number() && t.as_number() > 0.0 => Some(t.as_number()),
-                Some(_) => {
-                    return Err(RtError::new(
-                        "task.scope: timeout must be a positive number",
-                    ))
-                }
-                None => None,
+fn task_scope(
+    realm: &mut Realm,
+    args: tsr_realm::NativeArgs,
+) -> Result<Value, RtError> {
+    let cb = args.get(realm, 0);
+    if cb.as_closure().is_none() {
+        return Err(RtError::new("task.scope(fn): expected a function"));
+    }
+    let opts = args.get(realm, 1);
+    let timeout_ms = if let Some(r) = opts.as_object() {
+        match realm.heap.obj(r).get("timeout") {
+            Some(t) if t.is_number() && t.as_number() > 0.0 => Some(t.as_number()),
+            Some(_) => {
+                return Err(RtError::new(
+                    "task.scope: timeout must be a positive number",
+                ))
             }
+            None => None,
         }
-        None => None,
-        Some(v) if *v == Value::UNDEFINED => None,
-        _ => return Err(RtError::new("task.scope: options must be an object")),
+    } else if opts == Value::UNDEFINED {
+        None
+    } else {
+        return Err(RtError::new("task.scope: options must be an object"));
     };
 
     let scope = Arc::new(ScopeState {
@@ -142,13 +144,13 @@ fn task_scope(realm: &mut Realm, args: &[Value]) -> Result<Value, RtError> {
 
 fn spawn_child(
     realm: &mut Realm,
-    args: &[Value],
+    args: tsr_realm::NativeArgs,
     scope: &Arc<ScopeState>,
 ) -> Result<Value, RtError> {
-    let f = match args.first() {
-        Some(&f) if f.as_closure().is_some() => f,
-        _ => return Err(RtError::new("scope.spawn(fn): expected a function")),
-    };
+    let f = args.get(realm, 0);
+    if f.as_closure().is_none() {
+        return Err(RtError::new("scope.spawn(fn): expected a function"));
+    }
     if scope.finished.load(Ordering::SeqCst) {
         return Err(RtError::new("scope.spawn: scope already exited"));
     }

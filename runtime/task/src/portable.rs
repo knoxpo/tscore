@@ -162,11 +162,19 @@ pub fn rehydrate(pv: &PortableValue, heap: &mut Heap) -> Value {
             Value::object(heap.alloc_obj(obj))
         }
         PortableValue::Closure { proto, upvals } => {
+            // cell-ness must match the proto's declaration: the Tier-2
+            // inline GetUpval trusts UpvalSrc statically (ParentLocalValue
+            // = plain value, no cell deref). Wrapping a value capture in a
+            // cell hands compiled code the raw cell.
             let cells: Vec<Value> = upvals
                 .iter()
-                .map(|x| {
+                .enumerate()
+                .map(|(i, x)| {
                     let v = rehydrate(x, heap);
-                    Value::cell(heap.alloc_cell(v))
+                    match proto.upvals.get(i) {
+                        Some(tsc_ir::UpvalSrc::ParentLocalValue(_)) => v,
+                        _ => Value::cell(heap.alloc_cell(v)),
+                    }
                 })
                 .collect();
             Value::closure(heap.alloc_closure(Closure {

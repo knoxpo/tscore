@@ -15,7 +15,11 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
     match f.kind() {
         Kind::Native(i) => {
             let native = realm.natives[i as usize].clone();
-            native(realm, args)
+            // root the caller-built args in stack slots for the duration
+            realm.stack.extend_from_slice(args);
+            let r = native(realm, crate::NativeArgs { base, argc: args.len() });
+            realm.stack.truncate(base);
+            r
         }
         Kind::Closure(c) => {
             let proto = realm.heap.closure(c).proto.clone();
@@ -47,9 +51,9 @@ pub fn run_main(realm: &mut Realm, main: &Arc<FunctionProto>) -> Result<Value, R
     realm.stack.resize(base + main.body().n_regs as usize, Value::UNDEFINED);
     let main_promise = start_async(realm, None, main.clone(), base);
     realm.stack.truncate(base);
-    realm.pinned.insert(main_promise);
+    realm.pin(main_promise);
     let result = drive(realm, main_promise);
-    realm.pinned.remove(&main_promise);
+    realm.unpin(main_promise);
     realm.publish_stats();
     result
 }
@@ -58,6 +62,19 @@ pub fn run_main(realm: &mut Realm, main: &Arc<FunctionProto>) -> Result<Value, R
 /// promise settles.
 pub fn drive(realm: &mut Realm, main_promise: tsr_memory::Ref) -> Result<Value, RtError> {
     let rx = realm.wake_rx.clone();
+    // the driven promise lives only in this Rust local — pin it, or a
+    // minor GC during resume() sweeps it (and skips fixing up its value)
+    realm.pin(main_promise);
+    let out = drive_inner(realm, main_promise, &rx);
+    realm.unpin(main_promise);
+    out
+}
+
+fn drive_inner(
+    realm: &mut Realm,
+    main_promise: tsr_memory::Ref,
+    rx: &crossbeam_channel::Receiver<crate::Wake>,
+) -> Result<Value, RtError> {
     loop {
         while let Some(co) = realm.microtasks.pop_front() {
             resume(realm, co);
@@ -113,7 +130,7 @@ fn process_wake(realm: &mut Realm, wake: crate::Wake) {
         Err(e) => Err(e),
     };
     settle(realm, wake.promise, result);
-    realm.pinned.remove(&wake.promise);
+    realm.unpin(wake.promise);
 }
 
 /// Start an async function whose argument window is already populated at
@@ -233,36 +250,43 @@ fn resume(realm: &mut Realm, co_ref: tsr_memory::Ref) {
     realm.heap.free_foreign(co_ref);
     // the coroutine left the arena: its promise is only reachable through
     // this Rust local until we settle/re-suspend — pin it across execution
-    realm.pinned.insert(co.promise);
+    realm.pin(co.promise);
+    // the closure too: a GC mid-frame would otherwise free it and clear its
+    // upvals (it lives only in `co` here). Park it in a stack slot below the
+    // frame so root scans see it.
+    let pin_slot = realm.stack.len();
+    if let Some(c) = co.closure {
+        realm.stack.push(Value::closure(c));
+    }
     let base = realm.stack.len();
     realm.stack.extend_from_slice(&co.regs);
     let result = run_frame(realm, co.closure, &co.proto.clone(), base, 0, co.resume_pc);
     match result {
         Ok(FrameResult::Return(v)) => {
-            realm.stack.truncate(base);
+            realm.stack.truncate(pin_slot);
             settle(realm, co.promise, Ok(v));
-            realm.pinned.remove(&co.promise);
+            realm.unpin(co.promise);
         }
         Err(e) => {
-            realm.stack.truncate(base);
+            realm.stack.truncate(pin_slot);
             settle(
                 realm,
                 co.promise,
                 Err(PromiseError { msg: e.msg, cancelled: e.cancelled, span: e.span }),
             );
-            realm.pinned.remove(&co.promise);
+            realm.unpin(co.promise);
         }
         Ok(FrameResult::Await { awaited, dst, resume_pc }) => {
             let n = co.regs.len();
             co.regs.copy_from_slice(&realm.stack[base..base + n]);
-            realm.stack.truncate(base);
+            realm.stack.truncate(pin_slot);
             co.resume_pc = resume_pc;
             co.dst = dst;
             let promise = co.promise;
             let new_ref = realm.heap.alloc_foreign(Foreign::Coroutine(co));
             realm.heap.barrier_foreign(awaited);
             realm.heap.promise_mut(awaited).reactions.push(new_ref);
-            realm.pinned.remove(&promise);
+            realm.unpin(promise);
             return;
         }
     }
@@ -696,16 +720,10 @@ fn run_frame(
                     set_reg!(realm, a, result);
                 } else if let Kind::Native(i) = f.kind() {
                     let native = realm.natives[i as usize].clone();
-                    // args on the Rust stack: no per-call Vec alloc
-                    let mut buf = [Value::UNDEFINED; 8];
-                    let result = if argc <= 8 {
-                        buf[..argc].copy_from_slice(&realm.stack[a + 1..a + 1 + argc]);
-                        native(realm, &buf[..argc])
-                    } else {
-                        let args: Vec<Value> = realm.stack[a + 1..a + 1 + argc].to_vec();
-                        native(realm, &args)
-                    }
-                    .map_err(|e| err(proto, pc, e.msg))?;
+                    // args stay in their stack slots (GC fixup sees them)
+                    let result =
+                        native(realm, crate::NativeArgs { base: a + 1, argc })
+                            .map_err(|e| err(proto, pc, e.msg))?;
                     set_reg!(realm, a, result);
                 } else {
                     return Err(err(proto, pc, format!(
@@ -846,7 +864,7 @@ fn run_frame(
             Op::GetField => {
                 let obj = reg!(realm, base + ins.b as usize);
                 if let Some(o) = obj.as_object() {
-                    let objref = &realm.heap.objs[o as usize];
+                    let objref = realm.heap.obj(o);
                     let sid = objref.shape.id;
                     let ic = proto.jit.ic_load(pbody.code.len(), pc);
                     let v = if ic != 0 && (ic >> 32) as u32 == sid {
@@ -873,7 +891,7 @@ fn run_frame(
                 match reg!(realm, a).as_object() {
                     Some(r) => {
                         realm.heap.barrier_obj(r);
-                        let objref = &mut realm.heap.objs[r as usize];
+                        let objref = realm.heap.obj_mut(r);
                         let sid = objref.shape.id;
                         let ic = proto.jit.ic_load(pbody.code.len(), pc);
                         if ic != 0 && (ic >> 32) as u32 == sid {

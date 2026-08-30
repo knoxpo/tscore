@@ -61,7 +61,7 @@ fn core_of(realm: &Realm, v: Value) -> Result<Arc<ChannelCore>, RtError> {
 /// Install the `Channel` global.
 pub fn install(realm: &mut Realm) {
     let create = realm.add_native(|realm, args| {
-        let capacity = match args.first().and_then(|v| v.as_object()) {
+        let capacity = match args.get(realm, 0).as_object() {
             Some(r) => match realm.heap.obj(r).get("capacity") {
                 Some(v) if v.is_number() && v.as_number() >= 0.0 => {
                     v.as_number() as usize
@@ -83,8 +83,8 @@ pub fn install(realm: &mut Realm) {
     });
 
     let send = realm.add_native(|realm, args| {
-        let core = core_of(realm, *args.first().unwrap_or(&Value::UNDEFINED))?;
-        let v = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        let core = core_of(realm, args.get(realm, 0))?;
+        let v = args.get(realm, 1);
         let pv = clone_out(&realm.heap, v).map_err(RtError::new)?;
         let mut inner = core.inner.lock().unwrap();
         if inner.closed {
@@ -106,7 +106,7 @@ pub fn install(realm: &mut Realm) {
     });
 
     let recv = realm.add_native(|realm, args| {
-        let core = core_of(realm, *args.first().unwrap_or(&Value::UNDEFINED))?;
+        let core = core_of(realm, args.get(realm, 0))?;
         let mut inner = core.inner.lock().unwrap();
         if let Some(pv) = inner.q.pop_front() {
             // a queue slot freed: promote a parked sender
@@ -132,7 +132,7 @@ pub fn install(realm: &mut Realm) {
     });
 
     let close = realm.add_native(|realm, args| {
-        let core = core_of(realm, *args.first().unwrap_or(&Value::UNDEFINED))?;
+        let core = core_of(realm, args.get(realm, 0))?;
         let mut inner = core.inner.lock().unwrap();
         inner.closed = true;
         for waiter in inner.recv_waiters.drain(..) {

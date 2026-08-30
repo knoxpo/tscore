@@ -110,9 +110,21 @@ pub fn install(realm: &mut Realm, workers: Option<usize>) {
         let extra: Vec<Value> = realm
             .microtasks
             .iter()
-            .chain(realm.pinned.iter())
+            .chain(realm.pinned.keys())
             .map(|&r| Value::foreign(r))
             .collect();
+        if !realm.heap.nursery.objs.is_empty()
+            || !realm.heap.nursery.arrs.is_empty()
+            || !realm.heap.nursery.strs.is_empty()
+        {
+            tsr_gc::collect_minor(
+                &mut realm.heap,
+                &mut realm.stack,
+                realm.globals.values_mut(),
+                &extra,
+                &mut realm.gc_stats,
+            );
+        }
         tsr_gc::collect(
             &mut realm.heap,
             &realm.stack,
@@ -170,14 +182,14 @@ fn tsr_actor_count() -> usize {
 
 fn run_parallel(
     realm: &mut Realm,
-    args: &[Value],
+    args: tsr_realm::NativeArgs,
     collect: bool,
 ) -> Result<Value, RtError> {
-    let arr = args.first().and_then(|v| v.as_array());
-    let f = args.get(1).copied();
+    let arr = args.get(realm, 0).as_array();
+    let f = args.get(realm, 1);
     let (arr, f) = match (arr, f) {
-        (Some(a), Some(f)) if f.as_closure().is_some() => (a, f),
-        (Some(_), Some(_)) => {
+        (Some(a), f) if f.as_closure().is_some() => (a, f),
+        (Some(_), _) if f != Value::UNDEFINED => {
             return Err(RtError::new(
                 "parallel.map: callback must be a TypeScript function",
             ))

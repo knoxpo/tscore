@@ -225,17 +225,8 @@ extern "C" fn h_call(
             crate::interp::run_one(r, Some(c), callee, new_base, depth + 1)
         } else if let Kind::Native(i) = f.kind() {
             let native = r.natives[i as usize].clone();
-            // args on the Rust stack: no per-call heap alloc (hot path for
-            // Math.* inside compiled loops)
-            let mut buf = [Value::UNDEFINED; 8];
-            let args_vec;
-            let args: &[Value] = if argc <= 8 {
-                buf[..argc].copy_from_slice(&r.stack[abs_a + 1..abs_a + 1 + argc]);
-                &buf[..argc]
-            } else {
-                args_vec = r.stack[abs_a + 1..abs_a + 1 + argc].to_vec();
-                &args_vec
-            };
+            // args stay in their stack slots (GC fixup sees them)
+            let args = crate::NativeArgs { base: abs_a + 1, argc };
             native(r, args).map_err(|mut e| {
                 if e.span.is_none() {
                     e.span = pr.body().spans.get(pc).copied();
@@ -733,7 +724,7 @@ extern "C" fn h_get_field(
     let obj = Value::from_bits(obj_bits);
     // IC fast path (same per-pc caches the interpreter fills)
     if let Some(o) = obj.as_object() {
-        let objref = &r.heap.objs[o as usize];
+        let objref = r.heap.obj(o);
         let sid = objref.shape.id;
         let ic = pr.jit.ic_load(pr.body().code.len(), pc as usize);
         let v = if ic != 0 && (ic >> 32) as u32 == sid {
@@ -775,7 +766,7 @@ extern "C" fn h_set_field(
     match obj.as_object() {
         Some(o) => {
             r.heap.barrier_obj(o);
-            let obj = &mut r.heap.objs[o as usize];
+            let obj = r.heap.obj_mut(o);
             let sid = obj.shape.id;
             let ic = pr.jit.ic_load(pr.body().code.len(), pc as usize);
             if ic != 0 && (ic >> 32) as u32 == sid {
@@ -1225,6 +1216,8 @@ fn heap_offsets() -> Option<tsr_jit::tier1::HeapOffsets> {
         realm_stack_ptr: l.realm_stack_ptr,
         realm_objs_ptr: l.realm_objs_ptr,
         realm_arrs_ptr: l.realm_arrs_ptr,
+        nursery_objs_ptr: l.nursery_objs_ptr,
+        nursery_arrs_ptr: l.nursery_arrs_ptr,
         obj_size: l.obj_size,
         obj_shape_arc: l.obj_shape_arc,
         shape_id_delta: l.shape_id_delta,

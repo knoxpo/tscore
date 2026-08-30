@@ -30,11 +30,11 @@ struct ActorHandle {
 /// Install the `actor` global into a realm.
 pub fn install(realm: &mut Realm) {
     let spawn = realm.add_native(|realm, args| {
-        let setup = match args.first() {
-            Some(&f) if f.as_closure().is_some() => f,
-            _ => return Err(RtError::new("actor(setupFn): expected a function")),
-        };
-        let opts = args.get(1).and_then(|v| v.as_object());
+        let setup = args.get(realm, 0);
+        if setup.as_closure().is_none() {
+            return Err(RtError::new("actor(setupFn): expected a function"));
+        }
+        let opts = args.get(realm, 1).as_object();
         let mailbox_cap = match opts {
             Some(r) => match realm.heap.obj(r).get("mailbox") {
                 Some(v) if v.is_number() && v.as_number() >= 1.0 => {
@@ -88,11 +88,11 @@ pub fn install(realm: &mut Realm) {
 
 fn message_arg(
     realm: &Realm,
-    args: &[Value],
+    args: tsr_realm::NativeArgs,
     h: &ActorHandle,
 ) -> Result<PortableValue, RtError> {
-    match args.first() {
-        Some(&v) if v.as_object().is_some() => clone_out(&realm.heap, v).map_err(RtError::new),
+    match args.get(realm, 0) {
+        v if v.as_object().is_some() => clone_out(&realm.heap, v).map_err(RtError::new),
         _ => Err(RtError::new(format!(
             "actor '{}': message must be an object with a 'type' field",
             h.name

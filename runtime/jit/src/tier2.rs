@@ -142,6 +142,19 @@ impl C {
         self.a.b_cond(Cond::Hs, slow);
     }
 
+
+    /// x{base} = arena data pointer selected by payload bit 31 of
+    /// w{refr} (old vs nursery); leaves the masked index in w{refr}.
+    /// Branchless: both bases loaded, csel on the bit (old refs have
+    /// bit 31 = 0, so the unconditional mask is a no-op for them).
+    fn arena_base(&mut self, base: u32, refr: u32, old_off: u32, young_off: u32) {
+        self.a.ldr_imm(base, R_REALM, old_off);
+        self.a.ldr_imm(11, R_REALM, young_off);
+        self.a.lsr_imm(13, refr, 31);
+        self.a.cmp_imm(13, 0);
+        self.a.csel(base, base, 11, Cond::Eq);
+        self.a.ubfx32(refr, refr, 0, 31);
+    }
     /// x{dst} = x{base} + w{idx} * size.
     fn index_addr(&mut self, dst: u32, base: u32, idx: u32, size: u32) {
         if size.is_power_of_two() {
@@ -887,7 +900,7 @@ fn emit_op(
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
                 c.a.orr_reg32(9, 31, 8); // w9 = payload ref
-                c.a.ldr_imm(10, R_REALM, o.realm_objs_ptr);
+                c.arena_base(10, 9, o.realm_objs_ptr, o.nursery_objs_ptr);
                 c.index_addr(10, 10, 9, o.obj_size);
                 c.a.ldr_imm(11, 10, o.obj_shape_arc);
                 c.a.ldr_w_imm(12, 11, o.shape_id_delta);
@@ -933,7 +946,7 @@ fn emit_op(
                 c.fetch_x(ins.c, 9);
                 c.guard_number(9, slow); // heap values -> helper (barrier)
                 c.a.orr_reg32(12, 31, 8); // w12 = payload ref
-                c.a.ldr_imm(10, R_REALM, o.realm_objs_ptr);
+                c.arena_base(10, 12, o.realm_objs_ptr, o.nursery_objs_ptr);
                 c.index_addr(10, 10, 12, o.obj_size);
                 c.a.ldr_imm(11, 10, o.obj_shape_arc);
                 c.a.ldr_w_imm(12, 11, o.shape_id_delta);
@@ -975,7 +988,7 @@ fn emit_op(
                 c.fetch_x(ins.c, 9);
                 c.guard_number(9, slow);
                 c.a.orr_reg32(12, 31, 8);
-                c.a.ldr_imm(10, R_REALM, o.realm_arrs_ptr);
+                c.arena_base(10, 12, o.realm_arrs_ptr, o.nursery_arrs_ptr);
                 c.index_addr(10, 10, 12, o.arr_size);
                 c.a.fmov_dx(0, 9);
                 c.a.fcvtzs(13, 0);
@@ -1019,7 +1032,7 @@ fn emit_op(
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
                 c.a.orr_reg32(12, 31, 8);
-                c.a.ldr_imm(10, R_REALM, o.realm_arrs_ptr);
+                c.arena_base(10, 12, o.realm_arrs_ptr, o.nursery_arrs_ptr);
                 c.index_addr(10, 10, 12, o.arr_size);
                 c.a.ldr_imm(14, 10, o.vec_len);
                 c.a.scvtf(0, 14);
