@@ -1,126 +1,93 @@
 //! tsc-types
 //!
-//! Forward type dataflow over linear bytecode: per-register `TypeHint`
-//! facts from TS parameter annotations, used to qualify functions for the
-//! Tier-2 (unboxed) JIT and to tell it which guards are provably dead.
+//! Forward type dataflow over linear bytecode. Unified Tier-2 compiles
+//! every op (guarded templates when types unproven), so analysis never
+//! rejects on op kind — facts only pick which sites get unguarded,
+//! unboxed FP lanes. Only async functions reject.
 
 use tsc_ir::{Const, FunctionProto, Op, TypeHint};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CondFact {
+    Num,
+    Bool,
+    Other,
+}
 
 /// Analysis result consumed by the Tier-2 compiler.
 pub struct TypedProto {
     pub tier2_ok: bool,
     pub reason: &'static str,
-    /// Per-pc: JumpIfFalse/True condition is a proven number (else Bool).
-    pub jumpif_num: Vec<bool>,
+    /// Per-pc, per-operand (a,b,c): operand register holds a proven
+    /// number at instruction entry.
+    pub num_facts: Vec<[bool; 3]>,
+    /// Per-pc: JumpIfFalse/True condition fact.
+    pub jumpif: Vec<CondFact>,
+    /// Per-arg: entry guard proves this param numeric (annotation or
+    /// uniform runtime feedback).
+    pub arg_guard: Vec<bool>,
 }
 
-fn join(a: TypeHint, b: TypeHint) -> TypeHint {
+// internal lattice: Num / Bool / Top (strings, objects, etc. all Top —
+// codegen only cares about the two primitive fast lanes)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum T {
+    Num,
+    Bool,
+    Top,
+}
+
+fn join(a: T, b: T) -> T {
     if a == b {
         a
     } else {
-        TypeHint::Top
+        T::Top
     }
-}
-
-/// Ops Tier-2 can compile. Anything else rejects the function.
-fn supported(op: Op) -> bool {
-    matches!(
-        op,
-        Op::LoadInt
-            | Op::LoadConst
-            | Op::LoadBool
-            | Op::LoadUndef
-            | Op::Move
-            | Op::Add
-            | Op::Sub
-            | Op::Mul
-            | Op::Div
-            | Op::Mod
-            | Op::Pow
-            | Op::Neg
-            | Op::BitAnd
-            | Op::BitOr
-            | Op::BitXor
-            | Op::Shl
-            | Op::Shr
-            | Op::UShr
-            | Op::BitNot
-            | Op::Eq
-            | Op::Ne
-            | Op::Lt
-            | Op::Le
-            | Op::Gt
-            | Op::Ge
-            | Op::EqSkip
-            | Op::NeSkip
-            | Op::LtSkip
-            | Op::LeSkip
-            | Op::GtSkip
-            | Op::GeSkip
-            | Op::Jump
-            | Op::JumpIfFalse
-            | Op::JumpIfTrue
-            | Op::Return
-    )
 }
 
 pub fn analyze(proto: &FunctionProto) -> TypedProto {
     let reject = |reason: &'static str| TypedProto {
         tier2_ok: false,
         reason,
-        jumpif_num: Vec::new(),
+        num_facts: Vec::new(),
+        jumpif: Vec::new(),
+        arg_guard: Vec::new(),
     };
-
     if proto.is_async {
         return reject("async");
     }
-    if proto.upvals.is_empty() == false {
-        return reject("captures upvalues");
-    }
-    // each param must be provably numeric: `: number` annotation OR
-    // uniform number-only runtime feedback (entry guards enforce either)
     if proto.arity > 8 {
         return reject("arity > 8 (unprofiled)");
     }
-    for i in 0..proto.arity as usize {
+
+    // entry: param proven Num by annotation or uniform runtime feedback
+    // (entry guard enforces; unproven params flow as Top, no guard)
+    let mut arg_guard = vec![false; proto.arity as usize];
+    for (i, g) in arg_guard.iter_mut().enumerate() {
         let annotated = proto.arg_types.get(i) == Some(&TypeHint::Num);
         let seen = proto.jit.arg_seen[i].load(std::sync::atomic::Ordering::Relaxed);
-        let observed_num_only = seen == 1;
-        if !annotated && !observed_num_only {
-            return reject("param neither annotated `: number` nor observed numeric");
-        }
-    }
-    for ins in &proto.code {
-        if !supported(ins.op) {
-            return reject("unsupported op");
-        }
-        if ins.op == Op::LoadConst {
-            if !matches!(proto.consts[ins.bx() as usize], Const::Number(_)) {
-                return reject("string constant");
-            }
-        }
+        *g = annotated || seen == 1;
     }
 
-    // forward fixpoint: state = per-register fact at instruction entry
     let n = proto.code.len();
     let nregs = proto.n_regs as usize;
-    let mut states: Vec<Option<Vec<TypeHint>>> = vec![None; n + 1];
-    let mut entry = vec![TypeHint::Other; nregs];
-    for i in 0..proto.arity as usize {
-        entry[i] = TypeHint::Num; // entry guards enforce this
+    let mut states: Vec<Option<Vec<T>>> = vec![None; n + 1];
+    let mut entry = vec![T::Top; nregs];
+    for (i, &g) in arg_guard.iter().enumerate() {
+        if g {
+            entry[i] = T::Num;
+        }
     }
     states[0] = Some(entry);
     let mut work = vec![0usize];
-    let mut jumpif_num = vec![false; n];
+    let mut num_facts = vec![[false; 3]; n];
+    let mut jumpif = vec![CondFact::Other; n];
 
-    let merge = |states: &mut Vec<Option<Vec<TypeHint>>>,
-                 work: &mut Vec<usize>,
-                 target: usize,
-                 s: &[TypeHint]| {
-        match &mut states[target] {
+    let merge = |states: &mut Vec<Option<Vec<T>>>, work: &mut Vec<usize>, t: usize, s: &[T]| {
+        match &mut states[t] {
             None => {
-                states[target] = Some(s.to_vec());
-                work.push(target);
+                states[t] = Some(s.to_vec());
+                work.push(t);
             }
             Some(old) => {
                 let mut changed = false;
@@ -132,7 +99,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
                     }
                 }
                 if changed {
-                    work.push(target);
+                    work.push(t);
                 }
             }
         }
@@ -145,76 +112,88 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         let mut s = states[pc].clone().unwrap();
         let ins = proto.code[pc];
         let a = ins.a as usize;
-        let fact = |s: &[TypeHint], r: u8| s[r as usize];
-        let mut next = vec![pc + 1];
+        // b/c bytes overlap the sBx payload on Bx-format ops — out-of-range
+        // "registers" just read as not-Num
+        let fact = |s: &[T], r: u8| s.get(r as usize).copied().unwrap_or(T::Top);
+        // facts monotonically narrow across re-visits (lattice join only
+        // widens toward Top), so last write is the sound fixpoint value
+        num_facts[pc] = [
+            fact(&s, ins.a) == T::Num,
+            fact(&s, ins.b) == T::Num,
+            fact(&s, ins.c) == T::Num,
+        ];
+        let mut next: Vec<usize> = vec![pc + 1];
         match ins.op {
-            Op::LoadInt => s[a] = TypeHint::Num,
-            Op::LoadConst => s[a] = TypeHint::Num, // only Number consts pass the gate
-            Op::LoadBool => s[a] = TypeHint::Bool,
-            Op::LoadUndef => s[a] = TypeHint::Other,
+            Op::LoadInt => s[a] = T::Num,
+            Op::LoadConst => {
+                s[a] = match proto.consts.get(ins.bx() as usize) {
+                    Some(Const::Number(_)) => T::Num,
+                    _ => T::Top,
+                }
+            }
+            Op::LoadBool => s[a] = T::Bool,
+            Op::LoadNull | Op::LoadUndef => s[a] = T::Top,
             Op::Move => s[a] = fact(&s, ins.b),
-            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow => {
-                if fact(&s, ins.b) != TypeHint::Num || fact(&s, ins.c) != TypeHint::Num {
-                    return reject("arithmetic on non-number");
-                }
-                s[a] = TypeHint::Num;
+            Op::Add => {
+                // string concat possible unless both proven Num
+                s[a] = if fact(&s, ins.b) == T::Num && fact(&s, ins.c) == T::Num {
+                    T::Num
+                } else {
+                    T::Top
+                };
             }
-            Op::Neg => {
-                if fact(&s, ins.b) != TypeHint::Num {
-                    return reject("negate non-number");
-                }
-                s[a] = TypeHint::Num;
+            Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Mod
+            | Op::Pow
+            | Op::Neg
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::BitNot => {
+                // numeric result or runtime error — Num either way
+                s[a] = T::Num;
             }
-            Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => {
-                if fact(&s, ins.b) != TypeHint::Num || fact(&s, ins.c) != TypeHint::Num {
-                    return reject("bitwise on non-number");
-                }
-                s[a] = TypeHint::Num;
-            }
-            Op::BitNot => {
-                if fact(&s, ins.b) != TypeHint::Num {
-                    return reject("bitwise on non-number");
-                }
-                s[a] = TypeHint::Num;
-            }
-            Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => {
-                if fact(&s, ins.b) != TypeHint::Num || fact(&s, ins.c) != TypeHint::Num {
-                    return reject("compare non-numbers");
-                }
-                s[a] = TypeHint::Bool;
-            }
+            Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Not => s[a] = T::Bool,
             Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip | Op::GeSkip => {
-                if fact(&s, ins.b) != TypeHint::Num || fact(&s, ins.c) != TypeHint::Num {
-                    return reject("compare non-numbers");
-                }
-                // successors: fallthrough (pc+1, the Jump) and skip (pc+2)
                 next = vec![pc + 1, pc + 2];
             }
             Op::Jump => {
                 next = vec![(pc as i64 + ins.sbx() as i64 + 1) as usize];
             }
             Op::JumpIfFalse | Op::JumpIfTrue => {
-                let f = fact(&s, ins.a);
-                if f != TypeHint::Num && f != TypeHint::Bool {
-                    return reject("branch on non-primitive");
-                }
-                jumpif_num[pc] = f == TypeHint::Num;
+                jumpif[pc] = match fact(&s, ins.a) {
+                    T::Num => CondFact::Num,
+                    T::Bool => CondFact::Bool,
+                    T::Top => CondFact::Other,
+                };
                 next = vec![pc + 1, (pc as i64 + ins.sbx() as i64 + 1) as usize];
             }
-            // Op::Call intentionally unsupported: spill-everything at call
-            // sites made call-in-loop functions slower than Tier-1
-            // (ponytail: liveness-based spilling when it earns its keep)
-            Op::Return => {
-                next = vec![];
+            Op::Len => s[a] = T::Num,
+            Op::Return | Op::Halt => next = vec![],
+            Op::Await => return reject("async op"),
+            _ => {
+                // everything else (Call, heap ops, cells, upvals, globals,
+                // Concat, TypeOf, closures) writes an unproven result
+                s[a] = T::Top;
             }
-            _ => return reject("unsupported op"),
         }
         for t in next {
             merge(&mut states, &mut work, t, &s);
         }
     }
 
-    TypedProto { tier2_ok: true, reason: "", jumpif_num }
+    TypedProto {
+        tier2_ok: true,
+        reason: "",
+        num_facts,
+        jumpif,
+        arg_guard,
+    }
 }
 
 #[cfg(test)]
@@ -240,8 +219,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_numeric_loop() {
-        // r1 = 0; loop: r1 = r1 + r0; jump back; return r1
+    fn num_facts_on_annotated_loop() {
+        // r1 = 0; r1 = r1 + r0; return r1
         let p = proto(
             1,
             vec![TypeHint::Num],
@@ -251,16 +230,25 @@ mod tests {
                 Instr::abc(Op::Return, 1, 0, 0),
             ],
         );
-        assert!(analyze(&p).tier2_ok);
+        let t = analyze(&p);
+        assert!(t.tier2_ok);
+        assert!(t.arg_guard[0]);
+        assert!(t.num_facts[1][1] && t.num_facts[1][2]);
     }
 
     #[test]
-    fn rejects_unannotated() {
+    fn object_code_compiles_without_guard() {
         let p = proto(
             1,
             vec![TypeHint::Top],
-            vec![Instr::abc(Op::Return, 0, 0, 0)],
+            vec![
+                Instr::abc(Op::NewObject, 1, 0, 0),
+                Instr::abc(Op::Return, 1, 0, 0),
+            ],
         );
-        assert!(!analyze(&p).tier2_ok);
+        let t = analyze(&p);
+        assert!(t.tier2_ok);
+        assert!(!t.arg_guard[0]);
+        assert!(!t.num_facts[1][1]); // NewObject result not Num
     }
 }

@@ -150,6 +150,11 @@ pub struct JitState {
     /// Per-pc inline caches for GetField/SetField:
     /// (shape_id << 32) | (slot + 1); 0 = empty. Lazily allocated.
     pub ics: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
+    /// Per-pc shape-transition caches for add-field SetField sites:
+    /// leaked pointer to a realm-defined entry (type-erased — this crate
+    /// can't see ShapeData); null = empty. First writer wins, entries are
+    /// immutable and process-lived.
+    pub tics: std::sync::OnceLock<Box<[std::sync::atomic::AtomicPtr<u8>]>>,
 }
 
 impl JitState {
@@ -184,6 +189,34 @@ impl JitState {
             ((shape_id as u64) << 32) | (slot as u64 + 1),
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    #[inline(always)]
+    pub fn tic_load(&self, code_len: usize, pc: usize) -> *mut u8 {
+        let tics = self.tics.get_or_init(|| {
+            (0..code_len)
+                .map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+                .collect()
+        });
+        tics[pc].load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Publish a transition entry; only the first store wins (returns the
+    /// losing pointer to the caller for cleanup on a race).
+    pub fn tic_store(&self, code_len: usize, pc: usize, entry: *mut u8) -> bool {
+        let tics = self.tics.get_or_init(|| {
+            (0..code_len)
+                .map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+                .collect()
+        });
+        tics[pc]
+            .compare_exchange(
+                std::ptr::null_mut(),
+                entry,
+                std::sync::atomic::Ordering::Release,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
     }
 }
 

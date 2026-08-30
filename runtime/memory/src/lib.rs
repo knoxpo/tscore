@@ -759,6 +759,30 @@ impl Value {
 }
 
 /// Append JS-style number formatting without intermediate allocations.
+/// Integer-to-decimal without core::fmt (measured hot in string concat —
+/// the fmt machinery was ~10% of the alloc benchmark).
+fn push_i64(out: &mut String, mut v: i64) {
+    let mut buf = [0u8; 20];
+    let neg = v < 0;
+    if !neg {
+        v = -v; // negative space covers i64::MIN
+    }
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = (b'0' as i64 - v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    if neg {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+}
+
 pub fn push_number(out: &mut String, n: f64) {
     use std::fmt::Write;
     if n.is_nan() {
@@ -766,7 +790,7 @@ pub fn push_number(out: &mut String, n: f64) {
     } else if n.is_infinite() {
         out.push_str(if n > 0.0 { "Infinity" } else { "-Infinity" });
     } else if n == n.trunc() && n.abs() < 1e21 {
-        let _ = write!(out, "{}", n as i64);
+        push_i64(out, n as i64);
     } else {
         let _ = write!(out, "{n}");
     }
@@ -796,7 +820,9 @@ pub fn fmt_number(n: f64) -> String {
     } else if n.is_infinite() {
         if n > 0.0 { "Infinity".into() } else { "-Infinity".into() }
     } else if n == n.trunc() && n.abs() < 1e21 {
-        format!("{}", n as i64)
+        let mut s = String::with_capacity(20);
+        push_i64(&mut s, n as i64);
+        s
     } else {
         format!("{n}")
     }

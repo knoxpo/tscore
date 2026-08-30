@@ -32,6 +32,44 @@ fn err_at(proto: &FunctionProto, pc: usize, msg: String) -> RtError {
     RtError { msg, span: proto.spans.get(pc).copied(), cancelled: false }
 }
 
+/// Per-pc shape-transition cache entry (leaked once per monomorphic
+/// add-field site; shapes are process-global so cross-thread is fine).
+pub(crate) struct TransIc {
+    pub old_sid: u32,
+    pub shape: std::sync::Arc<tsr_memory::ShapeData>,
+}
+
+/// Add-field SetField: shape transition via the per-pc cache when the
+/// site is monomorphic, `with_field` (RwLock + hash lookup) otherwise.
+#[inline]
+pub(crate) fn set_field_add(
+    pr: &FunctionProto,
+    pc: usize,
+    obj: &mut tsr_memory::Obj,
+    sid: u32,
+    name: impl FnOnce() -> std::sync::Arc<str>,
+    v: Value,
+) {
+    let tic = pr.jit.tic_load(pr.code.len(), pc);
+    if !tic.is_null() {
+        let e = unsafe { &*(tic as *const TransIc) };
+        if e.old_sid == sid {
+            obj.shape = e.shape.clone();
+            obj.values.push(v);
+            return;
+        }
+    }
+    let ns = obj.shape.with_field(name());
+    if tic.is_null() {
+        let b = Box::into_raw(Box::new(TransIc { old_sid: sid, shape: ns.clone() })) as *mut u8;
+        if !pr.jit.tic_store(pr.code.len(), pc, b) {
+            drop(unsafe { Box::from_raw(b as *mut TransIc) });
+        }
+    }
+    obj.shape = ns;
+    obj.values.push(v);
+}
+
 extern "C" fn h_stack_ptr(p: *mut core::ffi::c_void) -> JitRet {
     let r = realm(p);
     JitRet { val: 0, stack: r.stack.as_mut_ptr() as u64 }
@@ -524,8 +562,17 @@ fn step(
         Op::Concat => {
             let b = rb(realm);
             let c = rc(realm);
-            let s = format!("{}{}", b.display(&realm.heap), c.display(&realm.heap));
+            let mut s = std::mem::take(&mut realm.concat_buf);
+            s.clear();
+            if !tsr_memory::display_into(&mut s, b, &realm.heap)
+                || !tsr_memory::display_into(&mut s, c, &realm.heap)
+            {
+                s.clear();
+                s.push_str(&b.display(&realm.heap));
+                s.push_str(&c.display(&realm.heap));
+            }
             let v = realm.alloc_string(&s);
+            realm.concat_buf = s;
             realm.stack[a] = v;
             Ok(0)
         }
@@ -616,16 +663,14 @@ extern "C" fn h_set_field(
                         pr.jit.ic_store(pr.code.len(), pc as usize, sid, i);
                         obj.values[i] = v;
                     }
-                    None => {
-                        let arc = match &pr.consts[cidx as usize] {
+                    None => set_field_add(pr, pc as usize, obj, sid, || {
+                        match &pr.consts[cidx as usize] {
                             Const::Str(s) => s.clone(),
                             Const::Number(n) => {
                                 std::sync::Arc::from(tsr_memory::fmt_number(*n))
                             }
-                        };
-                        obj.shape = obj.shape.with_field(arc);
-                        obj.values.push(v);
-                    }
+                        }
+                    }, v),
                 }
             }
             ok(r, 0)
@@ -815,6 +860,82 @@ extern "C" fn h_get_global(
     }
 }
 
+extern "C" fn h_get_upval(p: *mut core::ffi::c_void, closure_u32: u64, idx: u64) -> JitRet {
+    let r = realm(p);
+    let entry = r.heap.closure(closure_u32 as u32).upvals[idx as usize];
+    let v = match entry.as_cell() {
+        Some(c) => *r.heap.cell(c),
+        None => entry, // immutable value capture
+    };
+    JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 }
+}
+
+extern "C" fn h_set_upval(
+    p: *mut core::ffi::c_void,
+    closure_u32: u64,
+    idx: u64,
+    v_bits: u64,
+) -> JitRet {
+    let r = realm(p);
+    let entry = r.heap.closure(closure_u32 as u32).upvals[idx as usize];
+    let cell = entry.as_cell().expect("SetUpval on value capture");
+    r.heap.barrier_cell(cell);
+    *r.heap.cell_mut(cell) = Value::from_bits(v_bits);
+    ok(r, 0)
+}
+
+extern "C" fn h_load_cell(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    cell_bits: u64,
+) -> JitRet {
+    let r = realm(p);
+    match Value::from_bits(cell_bits).as_cell() {
+        Some(c) => {
+            let v = *r.heap.cell(c);
+            JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 }
+        }
+        None => fail(r, err_at(proto(pp), pc as usize, "internal: LoadCell on non-cell".into())),
+    }
+}
+
+extern "C" fn h_store_cell(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    cell_bits: u64,
+    v_bits: u64,
+) -> JitRet {
+    let r = realm(p);
+    match Value::from_bits(cell_bits).as_cell() {
+        Some(c) => {
+            r.heap.barrier_cell(c);
+            *r.heap.cell_mut(c) = Value::from_bits(v_bits);
+            ok(r, 0)
+        }
+        None => fail(r, err_at(proto(pp), pc as usize, "internal: StoreCell on non-cell".into())),
+    }
+}
+
+extern "C" fn h_new_object(p: *mut core::ffi::c_void) -> JitRet {
+    let r = realm(p);
+    let o = r.heap.alloc_obj_empty();
+    JitRet { val: Value::object(o).bits(), stack: r.stack.as_mut_ptr() as u64 }
+}
+
+extern "C" fn h_new_array(p: *mut core::ffi::c_void, cap: u64) -> JitRet {
+    let r = realm(p);
+    let a = r.heap.alloc_arr_empty(cap as usize);
+    JitRet { val: Value::array(a).bits(), stack: r.stack.as_mut_ptr() as u64 }
+}
+
+extern "C" fn h_new_cell(p: *mut core::ffi::c_void, init_bits: u64) -> JitRet {
+    let r = realm(p);
+    let c = r.heap.alloc_cell(Value::from_bits(init_bits));
+    JitRet { val: Value::cell(c).bits(), stack: r.stack.as_mut_ptr() as u64 }
+}
+
 fn heap_offsets() -> Option<tsr_jit::tier1::HeapOffsets> {
     crate::layout::layout().map(|l| tsr_jit::tier1::HeapOffsets {
         realm_objs_ptr: l.realm_objs_ptr,
@@ -843,6 +964,13 @@ fn helpers() -> Helpers {
         len: h_len as *const () as usize,
         push: h_push as *const () as usize,
         get_global: h_get_global as *const () as usize,
+        get_upval: h_get_upval as *const () as usize,
+        set_upval: h_set_upval as *const () as usize,
+        load_cell: h_load_cell as *const () as usize,
+        store_cell: h_store_cell as *const () as usize,
+        new_cell: h_new_cell as *const () as usize,
+        new_object: h_new_object as *const () as usize,
+        new_array: h_new_array as *const () as usize,
     }
 }
 
@@ -929,7 +1057,9 @@ pub fn osr_slow(proto: &Arc<FunctionProto>) -> Option<CompiledFn> {
         return None;
     }
     let ics = proto.jit.ics_base(proto.code.len()) as u64;
-    match tsr_jit::tier1::compile(proto, helpers(), true, heap_offsets(), ics) {
+    let code = compile_unified(proto, true)
+        .or_else(|| tsr_jit::tier1::compile(proto, helpers(), true, heap_offsets(), ics));
+    match code {
         Some(code) => {
             let ptr = tsr_jit::heap::publish(&code) as *mut u8;
             jit.osr_code.store(ptr, Release);
@@ -962,6 +1092,19 @@ pub fn enter_osr(
     );
     match ret.val {
         0 => Ok(Value::from_bits(ret.stack)),
+        2 => {
+            // Tier-2 entry guard failed mid-loop: resume interpreting at
+            // the OSR pc; repeated failures reject OSR for this proto so
+            // the back-edge fast path stops trying
+            if proto.jit.deopts.fetch_add(1, Relaxed) + 1 >= 10 {
+                proto.jit.backedges.store(u32::MAX, Relaxed);
+            }
+            let resume_pc = ret.stack as usize;
+            match crate::interp::run_frame_pub(realm, closure, proto, base, depth, resume_pc)? {
+                crate::interp::FrameResult::Return(v) => Ok(v),
+                crate::interp::FrameResult::Await { .. } => unreachable!("await in sync frame"),
+            }
+        }
         _ => Err(realm
             .jit_error
             .take()
@@ -969,22 +1112,48 @@ pub fn enter_osr(
     }
 }
 
+/// Unified Tier-2 compile. None = calls-in-loop policy or async/oversize.
+fn compile_unified(proto: &Arc<FunctionProto>, for_osr: bool) -> Option<Vec<u32>> {
+    if !tier2_enabled() {
+        return None;
+    }
+    let typed = tsc_types::analyze(proto);
+    if !typed.tier2_ok {
+        return None;
+    }
+    let jumpif: Vec<tsr_jit::tier2::JCond> = typed
+        .jumpif
+        .iter()
+        .map(|c| match c {
+            tsc_types::CondFact::Num => tsr_jit::tier2::JCond::Num,
+            tsc_types::CondFact::Bool => tsr_jit::tier2::JCond::Bool,
+            tsc_types::CondFact::Other => tsr_jit::tier2::JCond::Other,
+        })
+        .collect();
+    let facts = tsr_jit::tier2::Facts {
+        num: &typed.num_facts,
+        jumpif: &jumpif,
+        arg_guard: &typed.arg_guard,
+    };
+    let ics = proto.jit.ics_base(proto.code.len()) as u64;
+    tsr_jit::tier2::compile(
+        proto,
+        helpers(),
+        &facts,
+        fmod as *const () as usize,
+        pow as *const () as usize,
+        for_osr,
+        heap_offsets(),
+        ics,
+    )
+}
+
 pub fn compile_now(proto: &Arc<FunctionProto>) {
-    if tier2_enabled() {
-        let typed = tsc_types::analyze(proto);
-        if typed.tier2_ok {
-            let code = tsr_jit::tier2::compile(
-                proto,
-                helpers(),
-                &typed.jumpif_num,
-                fmod as *const () as usize,
-                pow as *const () as usize,
-            );
-            let ptr = tsr_jit::heap::publish(&code) as *mut u8;
-            proto.jit.code.store(ptr, Release);
-            proto.jit.tier.store(TIER_OPT, Release);
-            return;
-        }
+    if let Some(code) = compile_unified(proto, false) {
+        let ptr = tsr_jit::heap::publish(&code) as *mut u8;
+        proto.jit.code.store(ptr, Release);
+        proto.jit.tier.store(TIER_OPT, Release);
+        return;
     }
     compile_tier1(proto)
 }

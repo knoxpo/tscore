@@ -41,6 +41,21 @@ pub struct Helpers {
     pub push: usize,
     /// fn(realm, proto, pc, const_idx) -> JitRet{val, stack}
     pub get_global: usize,
+    // closure-cell thin helpers (Tier-2 only; args by value, no GC):
+    /// fn(realm, closure_u32, idx) -> JitRet{val, stack}
+    pub get_upval: usize,
+    /// fn(realm, closure_u32, idx, v_bits) -> JitRet
+    pub set_upval: usize,
+    /// fn(realm, proto, pc, cell_bits) -> JitRet{val, stack}
+    pub load_cell: usize,
+    /// fn(realm, proto, pc, cell_bits, v_bits) -> JitRet
+    pub store_cell: usize,
+    /// fn(realm, init_bits) -> JitRet{cell_value_bits, stack}
+    pub new_cell: usize,
+    /// fn(realm) -> JitRet{obj_value_bits, stack}
+    pub new_object: usize,
+    /// fn(realm, cap) -> JitRet{arr_value_bits, stack}
+    pub new_array: usize,
 }
 
 /// Probed heap layout offsets (tsr-realm::layout). None disables the

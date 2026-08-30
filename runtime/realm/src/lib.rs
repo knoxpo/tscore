@@ -116,6 +116,8 @@ pub struct Realm {
     pub stats_hub: Option<Arc<StatsHub>>,
     /// Error slot for JIT helper failures (out-of-band from the ABI return).
     pub jit_error: Option<RtError>,
+    /// Reused scratch for Concat (avoids a malloc/free per concat).
+    pub concat_buf: String,
     /// Cooperative cancellation flag, checked at interpreter safepoints.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Coroutines (foreign refs) ready to resume.
@@ -150,6 +152,7 @@ impl Realm {
             oom: None,
             stats_hub: None,
             jit_error: None,
+            concat_buf: String::new(),
             cancel: None,
             microtasks: std::collections::VecDeque::new(),
             pinned: rustc_hash::FxHashSet::default(),

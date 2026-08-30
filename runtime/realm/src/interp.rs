@@ -764,11 +764,14 @@ fn run_frame(
                                     proto.jit.ic_store(proto.code.len(), pc, sid, i);
                                     objref.values[i] = v;
                                 }
-                                None => {
-                                    let name = const_str_arc(proto, ins.b as usize);
-                                    objref.shape = objref.shape.with_field(name);
-                                    objref.values.push(v);
-                                }
+                                None => crate::jit::set_field_add(
+                                    proto,
+                                    pc,
+                                    objref,
+                                    sid,
+                                    || const_str_arc(proto, ins.b as usize),
+                                    v,
+                                ),
                             }
                         }
                     }
@@ -868,7 +871,8 @@ fn run_frame(
             Op::Concat => {
                 let b = reg!(realm, base + ins.b as usize);
                 let c = reg!(realm, base + ins.c as usize);
-                let mut s = String::with_capacity(16);
+                let mut s = std::mem::take(&mut realm.concat_buf);
+                s.clear();
                 if !tsr_memory::display_into(&mut s, b, &realm.heap)
                     || !tsr_memory::display_into(&mut s, c, &realm.heap)
                 {
@@ -877,6 +881,7 @@ fn run_frame(
                     s.push_str(&c.display(&realm.heap));
                 }
                 let v = realm.alloc_string(&s);
+                realm.concat_buf = s;
                 set_reg!(realm, a, v);
             }
             Op::TypeOf => {
