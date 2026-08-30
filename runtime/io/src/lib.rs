@@ -81,15 +81,15 @@ pub fn install(realm: &mut Realm) {
     });
     realm.set_global_obj("performance", vec![("now", perf_now)]);
 
-    // sleep(ms) -> Promise<undefined>
-    // ponytail: thread per sleep; timer wheel when timer counts matter
+    // sleep(ms) -> Promise<undefined>, via a single shared timer thread
     let sleep = realm.add_native(|realm, args| {
         let ms = num_arg(args, 0, "sleep")?.max(0.0);
         let (promise, completer) = realm.promise_pair();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_micros((ms * 1000.0) as u64));
-            completer.settle(Ok(tsr_task::PortableValue::Undefined));
-        });
+        timer_wheel().send((
+            std::time::Instant::now()
+                + std::time::Duration::from_micros((ms * 1000.0) as u64),
+            completer,
+        ));
         Ok(promise)
     });
     realm.set_global("sleep", sleep);
@@ -113,4 +113,84 @@ pub fn install(realm: &mut Realm) {
         })
     });
     realm.set_global("__charCodeAt", char_code_at);
+}
+
+/// One process-wide timer thread: min-heap of deadlines, parks until the
+/// nearest one (or a new registration arrives).
+struct TimerWheel {
+    tx: std::sync::mpsc::Sender<(std::time::Instant, tsr_realm::Completer)>,
+}
+
+impl TimerWheel {
+    fn send(&self, t: (std::time::Instant, tsr_realm::Completer)) {
+        let _ = self.tx.send(t);
+    }
+}
+
+fn timer_wheel() -> &'static TimerWheel {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Instant;
+    static WHEEL: std::sync::OnceLock<TimerWheel> = std::sync::OnceLock::new();
+    WHEEL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(Instant, tsr_realm::Completer)>();
+        std::thread::Builder::new()
+            .name("tscore-timers".into())
+            .spawn(move || {
+                struct Entry(Instant, tsr_realm::Completer);
+                impl PartialEq for Entry {
+                    fn eq(&self, o: &Self) -> bool {
+                        self.0 == o.0
+                    }
+                }
+                impl Eq for Entry {}
+                impl PartialOrd for Entry {
+                    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                        Some(self.cmp(o))
+                    }
+                }
+                impl Ord for Entry {
+                    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                        self.0.cmp(&o.0)
+                    }
+                }
+                let mut heap: BinaryHeap<Reverse<Entry>> = BinaryHeap::new();
+                loop {
+                    // fire everything due
+                    let now = Instant::now();
+                    while heap.peek().is_some_and(|Reverse(e)| e.0 <= now) {
+                        let Reverse(Entry(_, c)) = heap.pop().unwrap();
+                        c.settle(Ok(tsr_task::PortableValue::Undefined));
+                    }
+                    // wait for the next deadline or a new timer
+                    let wait = heap
+                        .peek()
+                        .map(|Reverse(e)| e.0.saturating_duration_since(Instant::now()));
+                    match wait {
+                        None => match rx.recv() {
+                            Ok((t, c)) => heap.push(Reverse(Entry(t, c))),
+                            Err(_) => return,
+                        },
+                        Some(d) => match rx.recv_timeout(d) {
+                            Ok((t, c)) => heap.push(Reverse(Entry(t, c))),
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => {
+                                // drain remaining deadlines, then exit
+                                while let Some(Reverse(Entry(t, c))) = heap.pop() {
+                                    let now = Instant::now();
+                                    if t > now {
+                                        std::thread::sleep(t - now);
+                                    }
+                                    c.settle(Ok(tsr_task::PortableValue::Undefined));
+                                }
+                                return;
+                            }
+                        },
+                    }
+                }
+            })
+            .expect("spawn timer thread");
+        TimerWheel { tx }
+    })
 }

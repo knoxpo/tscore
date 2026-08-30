@@ -67,7 +67,7 @@ pub fn collect<'a>(
             }
             Kind::Object(r) => {
                 if !mark(&mut m.objs, r) {
-                    work.extend(heap.objs[r as usize].fields.iter().map(|(_, v)| *v));
+                    work.extend_from_slice(&heap.objs[r as usize].values);
                 }
             }
             Kind::Array(r) => {
@@ -168,7 +168,7 @@ pub fn collect<'a>(
 /// Push v's outgoing edges onto the worklist (shared by minor tracing).
 fn push_children(heap: &Heap, v: Value, work: &mut Vec<Value>) {
     match v.kind() {
-        Kind::Object(r) => work.extend(heap.objs[r as usize].fields.iter().map(|(_, v)| *v)),
+        Kind::Object(r) => work.extend_from_slice(&heap.objs[r as usize].values),
         Kind::Array(r) => work.extend_from_slice(&heap.arrs[r as usize]),
         Kind::Closure(r) => {
             work.extend(heap.closures[r as usize].upvals.iter().map(|&c| Value::cell(c)))
@@ -320,7 +320,7 @@ fn slot_bytes(heap: &Heap, arena: &str, r: tsr_memory::Ref) -> usize {
     let i = r as usize;
     match arena {
         "gen_strs" => 24 + heap.strs[i].len(),
-        "gen_objs" => 32 + heap.objs[i].fields.len() * 24,
+        "gen_objs" => 32 + heap.objs[i].values.len() * 8,
         "gen_arrs" => 32 + heap.arrs[i].capacity() * 8,
         "gen_closures" => 32 + heap.closures[i].upvals.len() * 4,
         "gen_cells" => 8,
@@ -354,7 +354,7 @@ fn approx_live_bytes(heap: &Heap, m: &Marks) -> usize {
     }
     for (i, alive) in m.objs.iter().enumerate() {
         if *alive {
-            bytes += 32 + heap.objs[i].fields.len() * 24;
+            bytes += 32 + heap.objs[i].values.len() * 8;
         }
     }
     for (i, alive) in m.arrs.iter().enumerate() {

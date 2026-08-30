@@ -373,6 +373,13 @@ pub fn run_one(
     depth: u32,
 ) -> Result<Value, RtError> {
     if realm.jit_enabled {
+        // type feedback while cold: which arg tags does this fn really see?
+        if proto.jit.tier.load(std::sync::atomic::Ordering::Relaxed) == tsc_ir::TIER_COLD {
+            for i in 0..(proto.arity as usize).min(8) {
+                let class = if realm.stack[base + i].is_number() { 1 } else { 2 };
+                proto.jit.arg_seen[i].fetch_or(class, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if let Some(f) = crate::jit::tier_up(proto) {
             return crate::jit::enter_jit(realm, f, proto, base, closure, depth);
         }
@@ -678,17 +685,53 @@ fn run_frame(
             }
             Op::GetField => {
                 let obj = reg!(realm, base + ins.b as usize);
-                let name = const_str(proto, ins.c as usize);
-                let v = get_field(realm, obj, name).map_err(|e| err(proto, pc, e.msg))?;
-                set_reg!(realm, a, v);
+                if let Some(o) = obj.as_object() {
+                    let objref = &realm.heap.objs[o as usize];
+                    let sid = objref.shape.id;
+                    let ic = proto.jit.ic_load(proto.code.len(), pc);
+                    let v = if ic != 0 && (ic >> 32) as u32 == sid {
+                        objref.values[(ic & 0xFFFF_FFFF) as usize - 1]
+                    } else {
+                        let name = const_str(proto, ins.c as usize);
+                        match objref.shape.slot_of(name) {
+                            Some(i) => {
+                                proto.jit.ic_store(proto.code.len(), pc, sid, i);
+                                objref.values[i]
+                            }
+                            None => Value::UNDEFINED,
+                        }
+                    };
+                    set_reg!(realm, a, v);
+                } else {
+                    let name = const_str(proto, ins.c as usize);
+                    let v = get_field(realm, obj, name).map_err(|e| err(proto, pc, e.msg))?;
+                    set_reg!(realm, a, v);
+                }
             }
             Op::SetField => {
-                let name = const_str_arc(proto, ins.b as usize);
                 let v = reg!(realm, base + ins.c as usize);
                 match reg!(realm, a).as_object() {
                     Some(r) => {
                         realm.heap.barrier_obj(r);
-                        realm.heap.obj_mut(r).set(name, v)
+                        let objref = &mut realm.heap.objs[r as usize];
+                        let sid = objref.shape.id;
+                        let ic = proto.jit.ic_load(proto.code.len(), pc);
+                        if ic != 0 && (ic >> 32) as u32 == sid {
+                            objref.values[(ic & 0xFFFF_FFFF) as usize - 1] = v;
+                        } else {
+                            let name = const_str(proto, ins.b as usize);
+                            match objref.shape.slot_of(name) {
+                                Some(i) => {
+                                    proto.jit.ic_store(proto.code.len(), pc, sid, i);
+                                    objref.values[i] = v;
+                                }
+                                None => {
+                                    let name = const_str_arc(proto, ins.b as usize);
+                                    objref.shape = objref.shape.with_field(name);
+                                    objref.values.push(v);
+                                }
+                            }
+                        }
                     }
                     None => return Err(err(proto, pc, format!(
                         "cannot set property on {}", reg!(realm, a).type_of()))),

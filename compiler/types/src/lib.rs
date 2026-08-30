@@ -77,11 +77,18 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
     if proto.upvals.is_empty() == false {
         return reject("captures upvalues");
     }
-    // all params must be annotated number (feedback integration later)
-    if proto.arg_types.len() != proto.arity as usize
-        || proto.arg_types.iter().any(|t| *t != TypeHint::Num)
-    {
-        return reject("params not all `: number`");
+    // each param must be provably numeric: `: number` annotation OR
+    // uniform number-only runtime feedback (entry guards enforce either)
+    if proto.arity > 8 {
+        return reject("arity > 8 (unprofiled)");
+    }
+    for i in 0..proto.arity as usize {
+        let annotated = proto.arg_types.get(i) == Some(&TypeHint::Num);
+        let seen = proto.jit.arg_seen[i].load(std::sync::atomic::Ordering::Relaxed);
+        let observed_num_only = seen == 1;
+        if !annotated && !observed_num_only {
+            return reject("param neither annotated `: number` nor observed numeric");
+        }
     }
     for ins in &proto.code {
         if !supported(ins.op) {

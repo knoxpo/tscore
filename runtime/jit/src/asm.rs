@@ -270,6 +270,15 @@ impl Asm {
         self.push(0xD65F_03C0);
     }
 
+    /// SDIV Xd, Xn, Xm.
+    pub fn sdiv(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.push(0x9AC0_0C00 | rm << 16 | rn << 5 | rd);
+    }
+    /// MSUB Xd, Xn, Xm, Xa  (Xd = Xa - Xn*Xm).
+    pub fn msub(&mut self, rd: Reg, rn: Reg, rm: Reg, ra: Reg) {
+        self.push(0x9B00_8000 | rm << 16 | ra << 10 | rn << 5 | rd);
+    }
+
     /// SUB Wd, Wn, #imm12 (32-bit).
     pub fn sub_imm32(&mut self, rd: Reg, rn: Reg, imm12: u32) {
         self.push(0x5100_0000 | imm12 << 10 | rn << 5 | rd);

@@ -223,7 +223,7 @@ fn actor_name(realm: &Realm, handlers: Value) -> String {
     match handlers.as_object() {
         Some(r) => {
             let mut names: Vec<&str> =
-                realm.heap.obj(r).fields.iter().map(|(k, _)| &**k).collect();
+                realm.heap.obj(r).shape.fields.iter().map(|k| &**k).collect();
             names.sort_unstable();
             format!("{{{}}}", names.join(","))
         }

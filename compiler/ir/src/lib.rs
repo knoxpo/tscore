@@ -139,8 +139,37 @@ pub struct JitState {
     pub code: AtomicPtr<u8>,
     /// Tier-2 deoptimization count (demote to Tier-1 at 10).
     pub deopts: AtomicU32,
-    /// Arg-tag bitmasks observed during profiling (NUM=1 BOOL=2 STR=4 OTHER=8).
-    pub arg_seen: Vec<AtomicU8>,
+    /// Arg-tag bitmasks observed during profiling: 1=number seen,
+    /// 2=non-number seen. Fixed 8 slots (args beyond 8 unprofiled).
+    pub arg_seen: [AtomicU8; 8],
+    /// Per-pc inline caches for GetField/SetField:
+    /// (shape_id << 32) | (slot + 1); 0 = empty. Lazily allocated.
+    pub ics: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
+}
+
+impl JitState {
+    #[inline(always)]
+    pub fn ic_load(&self, code_len: usize, pc: usize) -> u64 {
+        let ics = self.ics.get_or_init(|| {
+            (0..code_len)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect()
+        });
+        ics[pc].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn ic_store(&self, code_len: usize, pc: usize, shape_id: u32, slot: usize) {
+        let ics = self.ics.get_or_init(|| {
+            (0..code_len)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect()
+        });
+        ics[pc].store(
+            ((shape_id as u64) << 32) | (slot as u64 + 1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

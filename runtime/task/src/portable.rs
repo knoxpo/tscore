@@ -75,7 +75,7 @@ fn clone_rec(
         Kind::Object(r) => {
             // hidden-handle objects (channels, actor refs) travel as their
             // shared core, not as field-by-field clones
-            for (k, v) in &heap.obj(r).fields {
+            for (k, v) in heap.obj(r).entries() {
                 if k.starts_with("__") {
                     if let Some(f) = v.as_foreign() {
                         if let Foreign::Handle(kind, any) = heap.foreign(f) {
@@ -89,8 +89,7 @@ fn clone_rec(
             }
             let fields = heap
                 .obj(r)
-                .fields
-                .iter()
+                .entries()
                 .map(|(k, x)| Ok((k.clone(), clone_rec(heap, *x, visiting)?)))
                 .collect::<Result<_, String>>()?;
             visiting.remove(&(1, r));

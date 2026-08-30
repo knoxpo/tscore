@@ -259,8 +259,58 @@ fn emit_op(
                 c.a.str_d_imm(dst, R_SLOTS, C::slot(ins.a));
             }
         }
-        Op::Mod | Op::Pow => {
-            // libm call: d0/d1 -> d0; d8-d15 and x19+ are callee-saved
+        Op::Mod => {
+            // integer fast path: both operands round-trip through i64 and
+            // divisor != 0 -> sdiv/msub (exact; sign of dividend, matching
+            // fmod). Zero remainder inherits the dividend's sign (-0 rule).
+            let db = c.fetch(ins.b, 0);
+            let dc = c.fetch(ins.c, 1);
+            let slow = c.a.new_label();
+            let done = c.a.new_label();
+            c.a.fcvtzs(10, db);
+            c.a.scvtf(2, 10);
+            c.a.fcmp(2, db);
+            c.a.b_cond(Cond::Ne, slow); // not an integer (or NaN)
+            c.a.fcvtzs(11, dc);
+            c.a.scvtf(3, 11);
+            c.a.fcmp(3, dc);
+            c.a.b_cond(Cond::Ne, slow);
+            c.a.cbz(11, slow); // x % 0 = NaN: let fmod handle it
+            c.a.sdiv(12, 10, 11);
+            c.a.msub(13, 12, 11, 10); // rem = b - (b/c)*c
+            let nonzero = c.a.new_label();
+            c.a.cbnz(13, nonzero);
+            // remainder 0: result is ±0 with the dividend's sign
+            c.a.fmov_xd(14, db);
+            c.a.mov_imm64(15, 0x8000_0000_0000_0000);
+            c.a.and_reg(14, 14, 15);
+            let dst = if ins.a < LOW { (8 + ins.a) as u32 } else { 2 };
+            c.a.fmov_dx(dst, 14);
+            if ins.a >= LOW {
+                c.a.str_d_imm(dst, R_SLOTS, C::slot(ins.a));
+            }
+            c.a.b(done);
+            c.a.bind(nonzero);
+            let dst = if ins.a < LOW { (8 + ins.a) as u32 } else { 2 };
+            c.a.scvtf(dst, 13);
+            if ins.a >= LOW {
+                c.a.str_d_imm(dst, R_SLOTS, C::slot(ins.a));
+            }
+            c.a.b(done);
+            c.a.bind(slow);
+            // libm fmod: d0/d1 -> d0; d8-d15 and x19+ callee-saved
+            if db != 0 {
+                c.a.fmov_dd(0, db);
+            }
+            if dc != 1 {
+                c.a.fmov_dd(1, dc);
+            }
+            c.a.mov_imm64(8, fmod_addr as u64);
+            c.a.blr(8);
+            c.put(ins.a, 0);
+            c.a.bind(done);
+        }
+        Op::Pow => {
             let db = c.fetch(ins.b, 0);
             let dc = c.fetch(ins.c, 1);
             if db != 0 {
@@ -269,8 +319,7 @@ fn emit_op(
             if dc != 1 {
                 c.a.fmov_dd(1, dc);
             }
-            let addr = if ins.op == Op::Mod { fmod_addr } else { pow_addr };
-            c.a.mov_imm64(8, addr as u64);
+            c.a.mov_imm64(8, pow_addr as u64);
             c.a.blr(8);
             c.put(ins.a, 0);
         }

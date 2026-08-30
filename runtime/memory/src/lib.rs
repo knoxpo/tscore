@@ -255,21 +255,86 @@ pub struct Closure {
     pub upvals: Vec<Ref>,
 }
 
-/// Shapeless object: linear scan is fine at M1 field counts.
-#[derive(Default, Debug)]
+/// Hidden class: objects with the same field history share one shape.
+/// Process-global (ids are stable across realms, so the per-proto inline
+/// caches on Arc-shared code work from every worker thread). Transitions
+/// are rare (one per distinct literal shape) and mutex-guarded; reads are
+/// lock-free through the object's own Arc.
+#[derive(Debug)]
+pub struct ShapeData {
+    pub id: u32,
+    /// Field names in slot order.
+    pub fields: Vec<Arc<str>>,
+    transitions: std::sync::Mutex<Vec<(Arc<str>, Arc<ShapeData>)>>,
+}
+
+static SHAPE_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+pub fn empty_shape() -> Arc<ShapeData> {
+    static EMPTY: std::sync::OnceLock<Arc<ShapeData>> = std::sync::OnceLock::new();
+    EMPTY
+        .get_or_init(|| {
+            Arc::new(ShapeData {
+                id: 0,
+                fields: Vec::new(),
+                transitions: std::sync::Mutex::new(Vec::new()),
+            })
+        })
+        .clone()
+}
+
+impl ShapeData {
+    pub fn slot_of(&self, name: &str) -> Option<usize> {
+        self.fields.iter().position(|f| &**f == name)
+    }
+
+    /// Shape after adding `name` (cached transition).
+    pub fn with_field(self: &Arc<Self>, name: Arc<str>) -> Arc<ShapeData> {
+        let mut tr = self.transitions.lock().unwrap();
+        if let Some((_, next)) = tr.iter().find(|(k, _)| **k == *name) {
+            return next.clone();
+        }
+        let mut fields = self.fields.clone();
+        fields.push(name.clone());
+        let next = Arc::new(ShapeData {
+            id: SHAPE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            fields,
+            transitions: std::sync::Mutex::new(Vec::new()),
+        });
+        tr.push((name, next.clone()));
+        next
+    }
+}
+
+/// Object = shared shape + dense value slots.
+#[derive(Debug)]
 pub struct Obj {
-    pub fields: Vec<(Arc<str>, Value)>,
+    pub shape: Arc<ShapeData>,
+    pub values: Vec<Value>,
+}
+
+impl Default for Obj {
+    fn default() -> Self {
+        Obj { shape: empty_shape(), values: Vec::new() }
+    }
 }
 
 impl Obj {
     pub fn get(&self, name: &str) -> Option<Value> {
-        self.fields.iter().find(|(k, _)| &**k == name).map(|(_, v)| *v)
+        self.shape.slot_of(name).map(|i| self.values[i])
     }
     pub fn set(&mut self, name: Arc<str>, v: Value) {
-        match self.fields.iter_mut().find(|(k, _)| **k == *name) {
-            Some((_, slot)) => *slot = v,
-            None => self.fields.push((name, v)),
+        match self.shape.slot_of(&name) {
+            Some(i) => self.values[i] = v,
+            None => {
+                self.shape = self.shape.with_field(name);
+                self.values.push(v);
+            }
         }
+    }
+    /// (name, value) pairs in slot order.
+    pub fn entries(&self) -> impl Iterator<Item = (&Arc<str>, &Value)> {
+        self.shape.fields.iter().zip(self.values.iter())
     }
 }
 
@@ -545,8 +610,7 @@ impl Value {
             Kind::Object(r) => {
                 let fields: Vec<String> = heap
                     .obj(r)
-                    .fields
-                    .iter()
+                    .entries()
                     .map(|(k, v)| format!("{k}: {}", v.display(heap)))
                     .collect();
                 format!("{{ {} }}", fields.join(", "))

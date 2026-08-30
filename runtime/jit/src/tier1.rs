@@ -26,6 +26,21 @@ pub struct Helpers {
     pub call: usize,
     /// fn(realm) -> JitRet{0|sentinel, stack_ptr}
     pub safepoint: usize,
+    // thin per-op helpers (no instruction re-decode, no Arc clones):
+    /// fn(realm, proto, pc, obj_bits, const_idx) -> JitRet{val, stack}
+    pub get_field: usize,
+    /// fn(realm, proto, pc, obj_bits, const_idx, v_bits) -> JitRet
+    pub set_field: usize,
+    /// fn(realm, proto, pc, obj_bits, idx_bits) -> JitRet{val, stack}
+    pub get_index: usize,
+    /// fn(realm, proto, pc, target_bits, idx_bits, v_bits) -> JitRet
+    pub set_index: usize,
+    /// fn(realm, proto, pc, v_bits) -> JitRet{val, stack}
+    pub len: usize,
+    /// fn(realm, proto, pc, arr_bits, v_bits) -> JitRet
+    pub push: usize,
+    /// fn(realm, proto, pc, const_idx) -> JitRet{val, stack}
+    pub get_global: usize,
 }
 
 #[repr(C)]
@@ -81,6 +96,16 @@ impl C {
         self.a.lsr_imm(10, src, 48);
         self.a.cmp_reg(10, R_TAGLIM);
         self.a.b_cond(Cond::Hs, slow);
+    }
+
+    /// blr a thin helper whose args are already staged; sentinel check +
+    /// stack-ptr refresh.
+    fn thin(&mut self, addr: usize) {
+        self.a.mov_imm64(8, addr as u64);
+        self.a.blr(8);
+        self.a.cmp_reg(0, R_SENTINEL);
+        self.a.b_cond(Cond::Eq, self.bail);
+        self.a.add_reg(R_SLOTS, 1, R_BASE);
     }
 
     /// Call the single-step helper for instruction `pc`; returns with
@@ -216,6 +241,44 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
         Op::Move => {
             c.load_slot(8, ins.b);
             c.store_slot(8, ins.a);
+        }
+
+        Op::Mod => {
+            // guarded integer fast path (sdiv/msub, sign-of-dividend, ±0
+            // via dividend sign); everything else -> step (fmod/errors)
+            let slow = c.a.new_label();
+            let done = c.a.new_label();
+            c.load_slot(8, ins.b);
+            c.load_slot(9, ins.c);
+            c.guard_number(8, slow);
+            c.guard_number(9, slow);
+            c.a.fmov_dx(0, 8);
+            c.a.fmov_dx(1, 9);
+            c.a.fcvtzs(10, 0);
+            c.a.scvtf(2, 10);
+            c.a.fcmp(2, 0);
+            c.a.b_cond(Cond::Ne, slow);
+            c.a.fcvtzs(11, 1);
+            c.a.scvtf(3, 11);
+            c.a.fcmp(3, 1);
+            c.a.b_cond(Cond::Ne, slow);
+            c.a.cbz(11, slow);
+            c.a.sdiv(12, 10, 11);
+            c.a.msub(13, 12, 11, 10);
+            let nonzero = c.a.new_label();
+            c.a.cbnz(13, nonzero);
+            c.a.mov_imm64(14, 0x8000_0000_0000_0000);
+            c.a.and_reg(8, 8, 14); // ±0 bits from dividend sign
+            c.store_slot(8, ins.a);
+            c.a.b(done);
+            c.a.bind(nonzero);
+            c.a.scvtf(0, 13);
+            c.a.fmov_xd(8, 0);
+            c.store_slot(8, ins.a);
+            c.a.b(done);
+            c.a.bind(slow);
+            c.call_step(pc);
+            c.a.bind(done);
         }
 
         // ---- number fast path + step fallback ----
@@ -388,6 +451,71 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
         Op::Halt => {
             c.a.mov_imm64(1, Value::UNDEFINED.bits());
             c.a.b(c.ret);
+        }
+
+        Op::GetField => {
+            c.a.mov(0, R_REALM);
+            c.a.mov(1, R_PROTO);
+            c.a.mov_imm64(2, pc as u64);
+            c.load_slot(3, ins.b);
+            c.a.mov_imm64(4, ins.c as u64);
+            c.thin(c.helpers.get_field);
+            c.a.mov(8, 0);
+            c.store_slot(8, ins.a);
+        }
+        Op::SetField => {
+            c.a.mov(0, R_REALM);
+            c.a.mov(1, R_PROTO);
+            c.a.mov_imm64(2, pc as u64);
+            c.load_slot(3, ins.a);
+            c.a.mov_imm64(4, ins.b as u64);
+            c.load_slot(5, ins.c);
+            c.thin(c.helpers.set_field);
+        }
+        Op::GetIndex => {
+            c.a.mov(0, R_REALM);
+            c.a.mov(1, R_PROTO);
+            c.a.mov_imm64(2, pc as u64);
+            c.load_slot(3, ins.b);
+            c.load_slot(4, ins.c);
+            c.thin(c.helpers.get_index);
+            c.a.mov(8, 0);
+            c.store_slot(8, ins.a);
+        }
+        Op::SetIndex => {
+            c.a.mov(0, R_REALM);
+            c.a.mov(1, R_PROTO);
+            c.a.mov_imm64(2, pc as u64);
+            c.load_slot(3, ins.a);
+            c.load_slot(4, ins.b);
+            c.load_slot(5, ins.c);
+            c.thin(c.helpers.set_index);
+        }
+        Op::Len => {
+            c.a.mov(0, R_REALM);
+            c.a.mov(1, R_PROTO);
+            c.a.mov_imm64(2, pc as u64);
+            c.load_slot(3, ins.b);
+            c.thin(c.helpers.len);
+            c.a.mov(8, 0);
+            c.store_slot(8, ins.a);
+        }
+        Op::ArrayPush => {
+            c.a.mov(0, R_REALM);
+            c.a.mov(1, R_PROTO);
+            c.a.mov_imm64(2, pc as u64);
+            c.load_slot(3, ins.a);
+            c.load_slot(4, ins.b);
+            c.thin(c.helpers.push);
+        }
+        Op::GetGlobal => {
+            c.a.mov(0, R_REALM);
+            c.a.mov(1, R_PROTO);
+            c.a.mov_imm64(2, pc as u64);
+            c.a.mov_imm64(3, ins.bx() as u64);
+            c.thin(c.helpers.get_global);
+            c.a.mov(8, 0);
+            c.store_slot(8, ins.a);
         }
 
         // ---- everything else: exact interpreter semantics via step ----

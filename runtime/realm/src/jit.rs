@@ -518,12 +518,290 @@ fn step(
     }
 }
 
+fn name_const<'a>(pr: &'a FunctionProto, idx: usize) -> &'a str {
+    match &pr.consts[idx] {
+        Const::Str(s) => s,
+        Const::Number(_) => "",
+    }
+}
+
+extern "C" fn h_get_field(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    obj_bits: u64,
+    cidx: u64,
+) -> JitRet {
+    let r = realm(p);
+    let pr = proto(pp);
+    let obj = Value::from_bits(obj_bits);
+    // IC fast path (same per-pc caches the interpreter fills)
+    if let Some(o) = obj.as_object() {
+        let objref = &r.heap.objs[o as usize];
+        let sid = objref.shape.id;
+        let ic = pr.jit.ic_load(pr.code.len(), pc as usize);
+        let v = if ic != 0 && (ic >> 32) as u32 == sid {
+            objref.values[(ic & 0xFFFF_FFFF) as usize - 1]
+        } else {
+            let name = name_const(pr, cidx as usize);
+            match objref.shape.slot_of(name) {
+                Some(i) => {
+                    pr.jit.ic_store(pr.code.len(), pc as usize, sid, i);
+                    objref.values[i]
+                }
+                None => Value::UNDEFINED,
+            }
+        };
+        return JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 };
+    }
+    let name = name_const(pr, cidx as usize).to_string();
+    match get_field(r, obj, &name) {
+        Ok(v) => JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 },
+        Err(mut e) => {
+            e.span = pr.spans.get(pc as usize).copied();
+            fail(r, e)
+        }
+    }
+}
+
+extern "C" fn h_set_field(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    obj_bits: u64,
+    cidx: u64,
+    v_bits: u64,
+) -> JitRet {
+    let r = realm(p);
+    let pr = proto(pp);
+    let obj = Value::from_bits(obj_bits);
+    let v = Value::from_bits(v_bits);
+    match obj.as_object() {
+        Some(o) => {
+            r.heap.barrier_obj(o);
+            let obj = &mut r.heap.objs[o as usize];
+            let sid = obj.shape.id;
+            let ic = pr.jit.ic_load(pr.code.len(), pc as usize);
+            if ic != 0 && (ic >> 32) as u32 == sid {
+                obj.values[(ic & 0xFFFF_FFFF) as usize - 1] = v;
+            } else {
+                let name = name_const(pr, cidx as usize);
+                match obj.shape.slot_of(name) {
+                    Some(i) => {
+                        pr.jit.ic_store(pr.code.len(), pc as usize, sid, i);
+                        obj.values[i] = v;
+                    }
+                    None => {
+                        let arc = match &pr.consts[cidx as usize] {
+                            Const::Str(s) => s.clone(),
+                            Const::Number(n) => {
+                                std::sync::Arc::from(tsr_memory::fmt_number(*n))
+                            }
+                        };
+                        obj.shape = obj.shape.with_field(arc);
+                        obj.values.push(v);
+                    }
+                }
+            }
+            ok(r, 0)
+        }
+        None => fail(
+            r,
+            err_at(pr, pc as usize, format!("cannot set property on {}", obj.type_of())),
+        ),
+    }
+}
+
+extern "C" fn h_get_index(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    obj_bits: u64,
+    idx_bits: u64,
+) -> JitRet {
+    let r = realm(p);
+    let pr = proto(pp);
+    let obj = Value::from_bits(obj_bits);
+    let idx = Value::from_bits(idx_bits);
+    if idx.is_number() {
+        if let Some(ar) = obj.as_array() {
+            let v = r
+                .heap
+                .arr(ar)
+                .get(idx.as_number() as usize)
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
+            return JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 };
+        }
+        return fail(
+            r,
+            err_at(pr, pc as usize, format!("cannot index {} with number", obj.type_of())),
+        );
+    }
+    if let (Some(_), Some(sref)) = (obj.as_object(), idx.as_str_ref()) {
+        let name = r.heap.str_at(sref).clone();
+        return match get_field(r, obj, &name) {
+            Ok(v) => JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 },
+            Err(mut e) => {
+                e.span = pr.spans.get(pc as usize).copied();
+                fail(r, e)
+            }
+        };
+    }
+    fail(
+        r,
+        err_at(
+            pr,
+            pc as usize,
+            format!("cannot index {} with {}", obj.type_of(), idx.type_of()),
+        ),
+    )
+}
+
+extern "C" fn h_set_index(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    target_bits: u64,
+    idx_bits: u64,
+    v_bits: u64,
+) -> JitRet {
+    let r = realm(p);
+    let pr = proto(pp);
+    let target = Value::from_bits(target_bits);
+    let idx = Value::from_bits(idx_bits);
+    let v = Value::from_bits(v_bits);
+    if idx.is_number() {
+        if let Some(ar) = target.as_array() {
+            r.heap.allocs_since_gc += 1;
+            r.heap.barrier_arr(ar);
+            let arr = r.heap.arr_mut(ar);
+            let i = idx.as_number() as usize;
+            if i < arr.len() {
+                arr[i] = v;
+            } else if i == arr.len() {
+                arr.push(v);
+            } else {
+                return fail(
+                    r,
+                    err_at(pr, pc as usize, "sparse arrays not supported in M1".into()),
+                );
+            }
+            return ok(r, 0);
+        }
+        return fail(
+            r,
+            err_at(
+                pr,
+                pc as usize,
+                format!("cannot index-assign {} with number", target.type_of()),
+            ),
+        );
+    }
+    if let (Some(o), Some(sref)) = (target.as_object(), idx.as_str_ref()) {
+        let name = r.heap.str_at(sref).clone();
+        r.heap.barrier_obj(o);
+        r.heap.obj_mut(o).set(name, v);
+        return ok(r, 0);
+    }
+    fail(
+        r,
+        err_at(
+            pr,
+            pc as usize,
+            format!(
+                "cannot index-assign {} with {}",
+                target.type_of(),
+                idx.type_of()
+            ),
+        ),
+    )
+}
+
+extern "C" fn h_len(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    v_bits: u64,
+) -> JitRet {
+    let r = realm(p);
+    let pr = proto(pp);
+    let v = Value::from_bits(v_bits);
+    if let Some(ar) = v.as_array() {
+        let n = r.heap.arr(ar).len() as f64;
+        return JitRet {
+            val: Value::number(n).bits(),
+            stack: r.stack.as_mut_ptr() as u64,
+        };
+    }
+    if let Some(sr) = v.as_str_ref() {
+        let n = r.heap.str_at(sr).chars().count() as f64;
+        return JitRet {
+            val: Value::number(n).bits(),
+            stack: r.stack.as_mut_ptr() as u64,
+        };
+    }
+    fail(
+        r,
+        err_at(pr, pc as usize, format!("{} has no length", v.type_of())),
+    )
+}
+
+extern "C" fn h_push(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    arr_bits: u64,
+    v_bits: u64,
+) -> JitRet {
+    let r = realm(p);
+    let pr = proto(pp);
+    let arrv = Value::from_bits(arr_bits);
+    match arrv.as_array() {
+        Some(ar) => {
+            r.heap.allocs_since_gc += 1;
+            r.heap.barrier_arr(ar);
+            r.heap.arr_mut(ar).push(Value::from_bits(v_bits));
+            ok(r, 0)
+        }
+        None => fail(
+            r,
+            err_at(pr, pc as usize, format!("cannot push onto {}", arrv.type_of())),
+        ),
+    }
+}
+
+extern "C" fn h_get_global(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    cidx: u64,
+) -> JitRet {
+    let r = realm(p);
+    let pr = proto(pp);
+    let name = name_const(pr, cidx as usize);
+    match r.globals.get(name) {
+        Some(v) => JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 },
+        None => {
+            let msg = format!("{name} is not defined");
+            fail(r, err_at(pr, pc as usize, msg))
+        }
+    }
+}
+
 fn helpers() -> Helpers {
     Helpers {
         stack_ptr: h_stack_ptr as *const () as usize,
         step: h_step as *const () as usize,
         call: h_call as *const () as usize,
         safepoint: h_safepoint as *const () as usize,
+        get_field: h_get_field as *const () as usize,
+        set_field: h_set_field as *const () as usize,
+        get_index: h_get_index as *const () as usize,
+        set_index: h_set_index as *const () as usize,
+        len: h_len as *const () as usize,
+        push: h_push as *const () as usize,
+        get_global: h_get_global as *const () as usize,
     }
 }
 
