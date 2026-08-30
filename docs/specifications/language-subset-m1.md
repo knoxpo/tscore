@@ -37,8 +37,12 @@ prime trial division, Mandelbrot — f64 math, bitwise ops, arrays, closures.
 
 Whole-file **syntax** errors always report at startup — the full source is
 parsed before anything runs. **Subset** errors (the "not supported in M1"
-family) report at startup for the top level and for parameter patterns
-everywhere; a subset error **inside a function body** reports when that
-function is first called, with its original source span. A function that
-is never called never reports. `TSC_NO_LAZY=1` restores fully eager
-compilation (and with it, startup-time reporting for every body).
+family) also report at startup for: the top level, parameter patterns,
+and every *statement-level* construct anywhere (class, switch, try/catch,
+throw, do-while, for-in, import/export — a cheap scan walks all bodies,
+in the parallel frontend's workers when that path is active). Rarer
+*expression-level* violations inside a lazily-compiled body (`in`,
+`new`, spread, computed keys, …) report when that function is first
+called, with the original source span; a never-called body stays silent.
+`TSC_NO_LAZY=1` restores fully eager compilation and startup reporting
+for everything.

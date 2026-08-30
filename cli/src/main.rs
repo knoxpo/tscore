@@ -125,7 +125,16 @@ fn main() -> ExitCode {
                 if std::env::var_os("TSC_COMPILE_PHASES").is_some() {
                     eprintln!("[cli] to-exec={:?}", t_start.elapsed());
                 }
-                tsr_realm::interp::run_main(&mut realm, &chunk.main)
+                let r = tsr_realm::interp::run_main(&mut realm, &chunk.main);
+                if std::env::var_os("TSC_COMPILE_PHASES").is_some() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    eprintln!(
+                        "[cli] filled={}/{} lazy protos",
+                        tsc_ir::LAZY_FILLED.load(Relaxed),
+                        tsc_ir::LAZY_TOTAL.load(Relaxed)
+                    );
+                }
+                r
             }
         })
         .expect("spawn main realm thread")

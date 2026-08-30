@@ -270,6 +270,11 @@ pub struct ProtoBody {
     pub spans: Vec<u32>,
 }
 
+/// Observability: lazily-created vs actually-filled proto counts
+/// (`TSC_COMPILE_PHASES=1` prints them at exit).
+pub static LAZY_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static LAZY_FILLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Everything a deferred body compile needs (M6c). The filler lives in
 /// tsc-parser (this crate cannot depend on it), injected as a fn pointer;
 /// `payload` is the parser's own state, downcast on fill.
@@ -334,6 +339,7 @@ impl FunctionProto {
         arg_types: Vec<TypeHint>,
         lazy: LazySource,
     ) -> Self {
+        LAZY_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         FunctionProto {
             name,
             arity,
@@ -362,6 +368,7 @@ impl FunctionProto {
     #[cold]
     fn fill_slow(&self) -> &ProtoBody {
         self.body.get_or_init(|| {
+            LAZY_FILLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let lz = self.lazy.as_ref().expect("proto has neither body nor lazy source");
             match (lz.fill)(lz) {
                 Ok(b) => b,

@@ -6,6 +6,7 @@
 
 mod emit;
 mod resolve;
+mod scan;
 mod split;
 
 use tsc_ast::oxc_allocator::Allocator;
@@ -64,7 +65,8 @@ fn compile_parallel(
     // tables come back keyed by original-file spans.
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
     let chunk = items.len().div_ceil(threads).max(1);
-    let results: Vec<(u32, Vec<String>)> = std::thread::scope(|scope| {
+    type WorkerOut = (u32, Result<Vec<String>, (String, u32)>);
+    let results: Vec<WorkerOut> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for group in items.chunks(chunk) {
             let env_names = &env_names;
@@ -77,9 +79,13 @@ fn compile_parallel(
                     let alloc = Allocator::with_capacity(text.len() * 8);
                     let Ok(prog) = tsc_ast::parse(&alloc, text) else {
                         // serial path will report the error properly
-                        out.push((it.start, Vec::new()));
+                        out.push((it.start, Ok(Vec::new())));
                         continue;
                     };
+                    if let Some((msg, span)) = scan::subset_scan(&prog.body) {
+                        out.push((it.start, Err((msg, span + it.start))));
+                        continue;
+                    }
                     let (_, _, mut caps) =
                         resolve::Resolver::run_seeded(&prog, env_names);
                     // key the result by the snippet's own top-level node
@@ -91,7 +97,7 @@ fn compile_parallel(
                     let caps = top_key
                         .and_then(|k| caps.remove(&k))
                         .unwrap_or_default();
-                    out.push((it.start, caps));
+                    out.push((it.start, Ok(caps)));
                 }
                 out
             }));
@@ -100,10 +106,28 @@ fn compile_parallel(
     });
     let t2 = std::time::Instant::now();
 
+    // eager subset reporting: earliest error across workers and the
+    // hollow rest (bodies are blanked there, so no double-reporting)
+    let mut scan_err: Option<(String, u32)> = None;
+    if let Some((msg, span)) = scan::subset_scan(&program.body) {
+        scan_err = Some((msg, span));
+    }
+    for (_, r) in &results {
+        if let Err((msg, span)) = r {
+            if scan_err.as_ref().is_none_or(|(_, s)| span < s) {
+                scan_err = Some((msg.clone(), *span));
+            }
+        }
+    }
+    if let Some((msg, span_start)) = scan_err {
+        return Err(CompileError { msg, span_start });
+    }
+
     // hollow-file resolve covers the rest statements; worker capture lists
     // supply what the blanked bodies hid
     let (mut captured, mutated, mut fn_caps) = resolve::Resolver::run(&program);
     for (key, caps) in results {
+        let caps = caps.expect("scan errors returned above");
         for name in &caps {
             if let Some((_, id)) = name_ids.iter().find(|(n, _)| n == name) {
                 captured.insert(*id);
@@ -145,6 +169,9 @@ pub fn compile(source: &str, source_name: &str) -> Result<Chunk, CompileError> {
         let e = &errs[0];
         CompileError { msg: format!("parse error: {}", e.msg), span_start: e.span_start }
     })?;
+    if let Some((msg, span_start)) = scan::subset_scan(&program.body) {
+        return Err(CompileError { msg, span_start });
+    }
     let t1 = std::time::Instant::now();
     let (captured, mutated, fn_caps) = resolve::Resolver::run(&program);
     let t2 = std::time::Instant::now();

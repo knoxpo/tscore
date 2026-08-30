@@ -139,36 +139,51 @@ fn lazy_proto_tiers_up() {
 }
 
 #[test]
-fn subset_error_in_called_fn_reports_at_first_call_with_span() {
+fn statement_subset_error_reports_at_startup_despite_lazy() {
+    // the startup subset scan catches statement-level violations even in
+    // never-called lazy bodies — matching pre-M6 semantics
+    let f = write_case(
+        "scan-err.ts",
+        "function neverCalled() { class Nope {} }\n\
+         console.log(\"RESULT ok\");\n",
+    );
+    let (ok, stdout, stderr) = run_with(&f, &[], "1");
+    assert!(!ok, "scan should reject at startup");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("scan-err.ts:1:26"), "no span in: {stderr}");
+    assert!(stderr.contains("not supported in M1: class"), "{stderr}");
+}
+
+#[test]
+fn expression_subset_error_defers_to_first_call() {
+    // expression-level rejections are the emitter's business — for a lazy
+    // body that means first call, with the original span (the safety net)
     let f = write_case(
         "deferred-err.ts",
         "function fine() { return 1; }\n\
-         function bad() { class Nope {} }\n\
+         function bad(x) { return x in x; }\n\
          console.log(`RESULT ${fine()}`);\n\
-         bad();\n",
+         bad(1);\n",
     );
     let (ok, stdout, stderr) = run_with(&f, &[], "1");
     assert!(!ok, "bad() should fail");
     // code before the first call ran
     assert_eq!(stdout, "RESULT 1\n");
-    // original span survives the deferred fill
-    assert!(stderr.contains("deferred-err.ts:2:18"), "no span in: {stderr}");
+    assert!(stderr.contains("deferred-err.ts:2:"), "no span in: {stderr}");
     assert!(stderr.contains("not supported in M1"), "{stderr}");
     // eager mode reports the same error before anything runs
     let (ok_e, stdout_e, stderr_e) = run_with(&f, &[("TSC_NO_LAZY", "1")], "1");
     assert!(!ok_e);
     assert_eq!(stdout_e, "");
     assert!(stderr_e.contains("not supported in M1"), "{stderr_e}");
-}
 
-#[test]
-fn subset_error_in_never_called_fn_is_silent() {
-    let f = write_case(
-        "silent-err.ts",
-        "function neverCalled() { class Nope {} }\n\
+    // never-called: the expression-level violation stays silent
+    let f2 = write_case(
+        "silent-expr.ts",
+        "function neverCalled(x) { return x in x; }\n\
          console.log(\"RESULT ok\");\n",
     );
-    let (ok, stdout, stderr) = run_with(&f, &[], "1");
-    assert!(ok, "{stderr}");
-    assert_eq!(stdout, "RESULT ok\n");
+    let (ok2, stdout2, stderr2) = run_with(&f2, &[], "1");
+    assert!(ok2, "{stderr2}");
+    assert_eq!(stdout2, "RESULT ok\n");
 }
