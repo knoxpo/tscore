@@ -38,6 +38,16 @@ impl Resolver {
     pub fn run(
         program: &Program,
     ) -> (HashSet<BindingId>, HashSet<BindingId>, HashMap<FnId, Vec<String>>) {
+        Self::run_seeded(program, &[])
+    }
+
+    /// Like [`run`], with `env` names pre-declared in the outermost scope
+    /// — used when re-resolving a lazily-compiled function snippet whose
+    /// free names are the stored upvalue environment (M6c).
+    pub fn run_seeded(
+        program: &Program,
+        env: &[String],
+    ) -> (HashSet<BindingId>, HashSet<BindingId>, HashMap<FnId, Vec<String>>) {
         let mut r = Resolver {
             scopes: vec![Scope { names: HashMap::new() }],
             fn_depth: 0,
@@ -46,6 +56,10 @@ impl Resolver {
             mutated: HashSet::new(),
             fn_caps: HashMap::new(),
         };
+        for (i, name) in env.iter().enumerate() {
+            // synthetic binding ids well clear of real source spans
+            r.declare(name, u32::MAX - i as u32);
+        }
         r.hoist_functions(&program.body);
         for s in &program.body {
             r.stmt(s);

@@ -270,6 +270,21 @@ pub struct ProtoBody {
     pub spans: Vec<u32>,
 }
 
+/// Everything a deferred body compile needs (M6c). The filler lives in
+/// tsc-parser (this crate cannot depend on it), injected as a fn pointer;
+/// `payload` is the parser's own state, downcast on fill.
+pub struct LazySource {
+    pub payload: Arc<dyn std::any::Any + Send + Sync>,
+    /// Compile the body now. Errors are (message, source span start).
+    pub fill: fn(&LazySource) -> Result<ProtoBody, (String, u32)>,
+}
+
+impl std::fmt::Debug for LazySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LazySource")
+    }
+}
+
 #[derive(Debug)]
 pub struct FunctionProto {
     pub name: Arc<str>,
@@ -281,6 +296,9 @@ pub struct FunctionProto {
     pub arg_types: Vec<TypeHint>,
     pub jit: JitState,
     body: std::sync::OnceLock<ProtoBody>,
+    lazy: Option<LazySource>,
+    /// Set when a lazy fill failed; raised at the next call boundary.
+    fill_err: std::sync::OnceLock<(String, u32)>,
 }
 
 impl FunctionProto {
@@ -302,15 +320,69 @@ impl FunctionProto {
             arg_types,
             jit: JitState::default(),
             body: cell,
+            lazy: None,
+            fill_err: std::sync::OnceLock::new(),
         }
     }
 
-    /// The function's compiled body. One atomic load; resolve once per
-    /// frame and reuse the reference on hot paths. (M6c makes this fill
-    /// lazily on first use.)
+    /// A proto whose body compiles on first use (M6c).
+    pub fn new_lazy(
+        name: Arc<str>,
+        arity: u8,
+        is_async: bool,
+        upvals: Vec<UpvalSrc>,
+        arg_types: Vec<TypeHint>,
+        lazy: LazySource,
+    ) -> Self {
+        FunctionProto {
+            name,
+            arity,
+            is_async,
+            upvals,
+            arg_types,
+            jit: JitState::default(),
+            body: std::sync::OnceLock::new(),
+            lazy: Some(lazy),
+            fill_err: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The function's compiled body. One atomic load when filled; a lazy
+    /// proto compiles here on first use. Resolve once per frame and reuse
+    /// the reference on hot paths. A failed fill yields an empty Halt body
+    /// — call boundaries check [`fill_error`] and raise properly.
     #[inline(always)]
     pub fn body(&self) -> &ProtoBody {
-        self.body.get().expect("proto body not filled")
+        if let Some(b) = self.body.get() {
+            return b;
+        }
+        self.fill_slow()
+    }
+
+    #[cold]
+    fn fill_slow(&self) -> &ProtoBody {
+        self.body.get_or_init(|| {
+            let lz = self.lazy.as_ref().expect("proto has neither body nor lazy source");
+            match (lz.fill)(lz) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = self.fill_err.set(e);
+                    ProtoBody {
+                        n_regs: 1,
+                        code: vec![Instr::abc(Op::Halt, 0, 0, 0)],
+                        consts: Vec::new(),
+                        protos: Vec::new(),
+                        spans: vec![0],
+                    }
+                }
+            }
+        })
+    }
+
+    /// Deferred compile error from a failed lazy fill, if any.
+    #[inline(always)]
+    pub fn fill_error(&self) -> Option<&(String, u32)> {
+        self.fill_err.get()
     }
 }
 

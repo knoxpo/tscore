@@ -37,7 +37,7 @@ pub fn compile(source: &str, source_name: &str) -> Result<Chunk, CompileError> {
     let t1 = std::time::Instant::now();
     let (captured, mutated, fn_caps) = resolve::Resolver::run(&program);
     let t2 = std::time::Instant::now();
-    let out = emit::Emitter::compile(&program, captured, mutated, fn_caps, source_name);
+    let out = emit::Emitter::compile(&program, captured, mutated, fn_caps, source, source_name);
     if phases {
         eprintln!(
             "[compile] parse={:?} resolve={:?} emit={:?}",

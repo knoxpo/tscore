@@ -108,6 +108,9 @@ fn clone_rec(
                     None => clone_rec(heap, entry, visiting),
                 })
                 .collect::<Result<_, _>>()?;
+            // force-fill before crossing threads: the fill machinery (and
+            // any failed-fill error) stays on the owning realm's side
+            let _ = c.proto.body();
             let pv = PortableValue::Closure { proto: c.proto.clone(), upvals };
             visiting.remove(&(2, r));
             pv

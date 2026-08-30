@@ -66,7 +66,126 @@ pub struct Emitter {
     /// Per-function ordered capture-name lists from the resolver (M6b):
     /// lets a child's upvalue table be built before its body is emitted.
     fn_caps: HashMap<FnId, Vec<String>>,
+    /// Retained source for lazy body fills (M6c); None inside a fill.
+    source: Option<Arc<str>>,
+    /// Defer direct children of <main> (M6c); off inside fills and under
+    /// TSC_NO_LAZY=1.
+    lazy: bool,
     cur_span: u32,
+}
+
+/// Everything a deferred body fill needs (payload of ir::LazySource).
+struct LazyPayload {
+    source: Arc<str>,
+    start: u32,
+    end: u32,
+    /// Expression forms (arrows, function expressions) re-parse wrapped in
+    /// parentheses; declarations parse bare.
+    wrap: bool,
+    name: String,
+    is_async: bool,
+    /// Upvalue names in the proto's stored order — GetUpval indices in the
+    /// filled body must match the table built at closure-creation time.
+    env: Vec<String>,
+}
+
+fn lazy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TSC_NO_LAZY").is_none())
+}
+
+/// Compile a deferred function body (M6c). The snippet is left-padded
+/// with spaces to its original file offset, so every span — error
+/// positions, binding ids, capture-table keys — matches the original
+/// source with no remapping.
+/// ponytail: padding costs O(offset) bytes per fill; slice-relative spans
+/// with an offset field if profiles ever mind.
+fn fill_lazy(lz: &tsc_ir::LazySource) -> Result<tsc_ir::ProtoBody, (String, u32)> {
+    let p: &LazyPayload = lz
+        .payload
+        .downcast_ref()
+        .expect("lazy payload type");
+    let start = p.start as usize;
+    let end = p.end as usize;
+    let mut text = String::with_capacity(end + 1);
+    if p.wrap && start > 0 {
+        text.push_str(&" ".repeat(start - 1));
+        text.push('(');
+    } else {
+        text.push_str(&" ".repeat(start));
+    }
+    text.push_str(&p.source[start..end]);
+    if p.wrap {
+        text.push(')');
+    }
+    let allocator = tsc_ast::oxc_allocator::Allocator::default();
+    let program = tsc_ast::parse(&allocator, &text)
+        .map_err(|errs| (format!("parse error: {}", errs[0].msg), errs[0].span_start))?;
+    let (captured, mutated, fn_caps) = crate::resolve::Resolver::run_seeded(&program, &p.env);
+
+    let mut em = Emitter {
+        fs: Vec::new(),
+        captured,
+        mutated,
+        fn_caps,
+        source: None,
+        lazy: false,
+        cur_span: p.start,
+    };
+    let mut fs = FuncState {
+        name: p.name.clone(),
+        scopes: vec![HashMap::new()],
+        is_async: p.is_async,
+        ..Default::default()
+    };
+    // stored env order is canonical: GetUpval indices in the parent-built
+    // table must match (srcs are unused during body emission)
+    for n in &p.env {
+        fs.upvals.push((n.clone(), UpvalSrc::ParentUpval(0)));
+    }
+    em.fs.push(fs);
+
+    // locate the function node and emit its body
+    let internal =
+        || ("internal: lazy snippet did not re-parse to a function".to_string(), p.start);
+    let r = match program.body.first().ok_or_else(internal)? {
+        Statement::FunctionDeclaration(f) => {
+            let body = f.body.as_ref().ok_or_else(|| {
+                ("not supported in M1: declare function".to_string(), p.start)
+            })?;
+            em.emit_function_body(&f.params, &body.statements, None)
+        }
+        Statement::ExpressionStatement(es) => {
+            let mut e = &es.expression;
+            while let Expression::ParenthesizedExpression(pe) = e {
+                e = &pe.expression;
+            }
+            match e {
+                Expression::ArrowFunctionExpression(a) => {
+                    let expr_body = if a.expression {
+                        match a.body.statements.first() {
+                            Some(Statement::ExpressionStatement(e)) => Some(&e.expression),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    em.emit_function_body(&a.params, &a.body.statements, expr_body)
+                }
+                Expression::FunctionExpression(f) => {
+                    let body = f.body.as_ref().ok_or_else(|| {
+                        ("not supported in M1: declare function".to_string(), p.start)
+                    })?;
+                    em.emit_function_body(&f.params, &body.statements, None)
+                }
+                _ => return Err(internal()),
+            }
+        }
+        _ => return Err(internal()),
+    };
+    r.map_err(|e| (e.msg, e.span_start))?;
+    let fs = em.fs.pop().unwrap();
+    Ok(finish_body(fs))
 }
 
 type R<T = ()> = Result<T, CompileError>;
@@ -77,9 +196,18 @@ impl Emitter {
         captured: HashSet<BindingId>,
         mutated: HashSet<BindingId>,
         fn_caps: HashMap<FnId, Vec<String>>,
+        source: &str,
         source_name: &str,
     ) -> R<tsc_ir::Chunk> {
-        let mut em = Emitter { fs: Vec::new(), captured, mutated, fn_caps, cur_span: 0 };
+        let mut em = Emitter {
+            fs: Vec::new(),
+            captured,
+            mutated,
+            fn_caps,
+            source: Some(Arc::from(source)),
+            lazy: lazy_enabled(),
+            cur_span: 0,
+        };
         em.fs.push(FuncState {
             name: "<main>".into(),
             scopes: vec![HashMap::new()],
@@ -445,6 +573,7 @@ impl Emitter {
                     &f.params,
                     &body.statements,
                     f.r#async,
+                    Some((f.span.start, f.span.end, false)),
                 )?;
                 self.emit_abx(Op::Closure, tmp, proto_idx);
                 let place = self.resolve(&id.name);
@@ -687,6 +816,7 @@ impl Emitter {
 
     // ---------------- functions ----------------
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_function(
         &mut self,
         key: FnId,
@@ -694,10 +824,12 @@ impl Emitter {
         params: &FormalParameters,
         body: &[Statement],
         is_async: bool,
+        lazy_span: Option<(u32, u32, bool)>,
     ) -> R<u16> {
-        self.compile_function_inner(key, name, params, body, None, is_async)
+        self.compile_function_inner(key, name, params, body, None, is_async, lazy_span)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_function_inner(
         &mut self,
         key: FnId,
@@ -706,6 +838,7 @@ impl Emitter {
         body: &[Statement],
         expr_body: Option<&Expression>,
         is_async: bool,
+        lazy_span: Option<(u32, u32, bool)>,
     ) -> R<u16> {
         let mut fs = FuncState {
             name: name.to_string(),
@@ -744,7 +877,64 @@ impl Emitter {
             }
         }
         fs.arity = params.items.len() as u8;
+
+        // M6c: direct children of <main> defer body compilation to first
+        // call. Header (arity, upvals, annotations) is fully known here;
+        // parameter subset errors still report at startup via the scan.
+        if self.lazy && self.fs.len() == 1 {
+            if let (Some((start, end, wrap)), Some(src)) = (lazy_span, self.source.clone()) {
+                let arg_types = param_hints(params)
+                    .map_err(|sp| CompileError {
+                        msg: "not supported in M1: destructuring parameters".into(),
+                        span_start: sp,
+                    })?;
+                let env: Vec<String> =
+                    fs.upvals.iter().map(|(n, _)| n.clone()).collect();
+                let upvals: Vec<UpvalSrc> =
+                    fs.upvals.into_iter().map(|(_, u)| u).collect();
+                let payload = LazyPayload {
+                    source: src,
+                    start,
+                    end,
+                    wrap,
+                    name: name.to_string(),
+                    is_async,
+                    env,
+                };
+                let proto = Arc::new(FunctionProto::new_lazy(
+                    Arc::from(name),
+                    params.items.len() as u8,
+                    is_async,
+                    upvals,
+                    arg_types,
+                    tsc_ir::LazySource { payload: Arc::new(payload), fill: fill_lazy },
+                ));
+                let parent = self.f();
+                parent.protos.push(proto);
+                return Ok((parent.protos.len() - 1) as u16);
+            }
+        }
+
         self.fs.push(fs);
+        self.emit_function_body(params, body, expr_body)?;
+        let fs = self.fs.pop().unwrap();
+        let proto = Arc::new(finish(fs));
+        let parent = self.f();
+        parent.protos.push(proto);
+        Ok((parent.protos.len() - 1) as u16)
+    }
+
+    /// Parameters + body + implicit return, into the already-pushed
+    /// FuncState. Shared by eager compiles and lazy fills.
+    fn emit_function_body(
+        &mut self,
+        params: &FormalParameters,
+        body: &[Statement],
+        expr_body: Option<&Expression>,
+    ) -> R {
+        // arity pins registers 0..arity through the optimizer — must be
+        // set before finish_body regardless of how this FuncState was built
+        self.f().arity = params.items.len() as u8;
         for p in &params.items {
             let BindingPattern::BindingIdentifier(b) = &p.pattern else {
                 return self.unsupported("destructuring parameters", p.span.start);
@@ -783,11 +973,7 @@ impl Emitter {
         f.max_reg = f.max_reg.max(tmp + 1);
         self.emit(Op::LoadUndef, tmp, 0, 0);
         self.emit(Op::Return, tmp, 0, 0);
-        let fs = self.fs.pop().unwrap();
-        let proto = Arc::new(finish(fs));
-        let parent = self.f();
-        parent.protos.push(proto);
-        Ok((parent.protos.len() - 1) as u16)
+        Ok(())
     }
 
     // ---------------- expressions ----------------
@@ -1128,6 +1314,7 @@ impl Emitter {
                     &a.body.statements,
                     expr_body,
                     a.r#async,
+                    Some((a.span.start, a.span.end, true)),
                 )?;
                 self.emit_abx(Op::Closure, dst, idx);
                 Ok(())
@@ -1143,6 +1330,7 @@ impl Emitter {
                     &f.params,
                     &body.statements,
                     f.r#async,
+                    Some((f.span.start, f.span.end, true)),
                 )?;
                 self.emit_abx(Op::Closure, dst, idx);
                 Ok(())
@@ -1336,9 +1524,29 @@ impl Emitter {
     }
 }
 
-fn finish(mut fs: FuncState) -> FunctionProto {
-    // emit-time optimizer: copy-prop, dead stores, loop-invariant consts.
-    // Runs before the proto is sealed so every tier sees canonical code.
+/// Parameter type hints without emission (lazy header construction);
+/// errors with the span of an unsupported pattern.
+fn param_hints(params: &FormalParameters) -> Result<Vec<tsc_ir::TypeHint>, u32> {
+    let mut hints = Vec::with_capacity(params.items.len());
+    for p in &params.items {
+        let BindingPattern::BindingIdentifier(_) = &p.pattern else {
+            return Err(p.span.start);
+        };
+        hints.push(match &p.type_annotation {
+            Some(ann) => match &ann.type_annotation {
+                TSType::TSNumberKeyword(_) => tsc_ir::TypeHint::Num,
+                TSType::TSBooleanKeyword(_) => tsc_ir::TypeHint::Bool,
+                TSType::TSStringKeyword(_) => tsc_ir::TypeHint::Str,
+                _ => tsc_ir::TypeHint::Top,
+            },
+            None => tsc_ir::TypeHint::Top,
+        });
+    }
+    Ok(hints)
+}
+
+/// Optimizer + body construction (shared by eager finish and lazy fills).
+fn finish_body(mut fs: FuncState) -> tsc_ir::ProtoBody {
     let upval_srcs: Vec<Vec<tsc_ir::UpvalSrc>> =
         fs.protos.iter().map(|p| p.upvals.clone()).collect();
     tsc_optimizer::optimize(
@@ -1349,20 +1557,22 @@ fn finish(mut fs: FuncState) -> FunctionProto {
         fs.max_reg.max(1),
         fs.arity,
     );
-    FunctionProto::new(
-        Arc::from(fs.name.as_str()),
-        fs.arity,
-        fs.is_async,
-        fs.upvals.into_iter().map(|(_, s)| s).collect(),
-        fs.arg_types,
-        tsc_ir::ProtoBody {
-            n_regs: fs.max_reg.max(1),
-            code: fs.code,
-            consts: fs.consts,
-            protos: fs.protos,
-            spans: fs.spans,
-        },
-    )
+    tsc_ir::ProtoBody {
+        n_regs: fs.max_reg.max(1),
+        code: fs.code,
+        consts: fs.consts,
+        protos: fs.protos,
+        spans: fs.spans,
+    }
+}
+
+fn finish(fs: FuncState) -> FunctionProto {
+    let name: Arc<str> = Arc::from(fs.name.as_str());
+    let arity = fs.arity;
+    let is_async = fs.is_async;
+    let upvals = fs.upvals.iter().map(|(_, s)| *s).collect();
+    let arg_types = fs.arg_types.clone();
+    FunctionProto::new(name, arity, is_async, upvals, arg_types, finish_body(fs))
 }
 
 fn stmt_kind(s: &Statement) -> &'static str {

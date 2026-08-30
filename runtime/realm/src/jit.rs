@@ -183,6 +183,13 @@ extern "C" fn h_call(
                 unsafe { &*Arc::as_ptr(&r.heap.closure(c).proto) };
             let new_base = abs_a + 1;
             let need = new_base + callee.body().n_regs as usize;
+            if let Some((msg, span)) = callee.fill_error() {
+                return Err(RtError {
+                    msg: msg.clone(),
+                    span: Some(*span),
+                    cancelled: false,
+                });
+            }
             if r.stack.len() < need {
                 r.stack.resize(need, Value::UNDEFINED);
             }

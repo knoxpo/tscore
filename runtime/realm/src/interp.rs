@@ -20,6 +20,9 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
         Kind::Closure(c) => {
             let proto = realm.heap.closure(c).proto.clone();
             realm.stack.resize(base + proto.body().n_regs as usize, Value::UNDEFINED);
+            if let Some((msg, span)) = proto.fill_error() {
+                return Err(RtError { msg: msg.clone(), span: Some(*span), cancelled: false });
+            }
             let n = (proto.arity as usize).min(args.len());
             realm.stack[base..base + n].copy_from_slice(&args[..n]);
             if proto.is_async {
@@ -653,6 +656,13 @@ fn run_frame(
                         unsafe { &*Arc::as_ptr(&realm.heap.closure(c).proto) };
                     let new_base = a + 1;
                     let need = new_base + callee.body().n_regs as usize;
+                    if let Some((msg, span)) = callee.fill_error() {
+                        return Err(RtError {
+                            msg: msg.clone(),
+                            span: Some(*span),
+                            cancelled: false,
+                        });
+                    }
                     if realm.stack.len() < need {
                         realm.stack.resize(need, Value::UNDEFINED);
                     }
