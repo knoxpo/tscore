@@ -8,30 +8,49 @@ use tsc_ast::oxc_ast::ast::*;
 /// Binding identity = span start of its BindingIdentifier.
 pub type BindingId = u32;
 
+/// Function identity = span start of its Function/Arrow node.
+pub type FnId = u32;
+
 struct Scope {
     names: HashMap<String, (BindingId, usize)>,
+}
+
+/// One active function during the walk: collects the ordered list of free
+/// names it (or any descendant) references from enclosing scopes. This is
+/// the child's upvalue table, computed without emitting its body (M6b —
+/// the lazy-compile prerequisite).
+struct FnRec {
+    id: FnId,
+    caps: Vec<String>,
 }
 
 pub struct Resolver {
     scopes: Vec<Scope>,
     fn_depth: usize,
+    fn_stack: Vec<FnRec>,
     pub captured: HashSet<BindingId>,
     pub mutated: HashSet<BindingId>,
+    /// Per-function ordered capture-name lists (first-reference order).
+    pub fn_caps: HashMap<FnId, Vec<String>>,
 }
 
 impl Resolver {
-    pub fn run(program: &Program) -> (HashSet<BindingId>, HashSet<BindingId>) {
+    pub fn run(
+        program: &Program,
+    ) -> (HashSet<BindingId>, HashSet<BindingId>, HashMap<FnId, Vec<String>>) {
         let mut r = Resolver {
             scopes: vec![Scope { names: HashMap::new() }],
             fn_depth: 0,
+            fn_stack: Vec::new(),
             captured: HashSet::new(),
             mutated: HashSet::new(),
+            fn_caps: HashMap::new(),
         };
         r.hoist_functions(&program.body);
         for s in &program.body {
             r.stmt(s);
         }
-        (r.captured, r.mutated)
+        (r.captured, r.mutated, r.fn_caps)
     }
 
     fn mark_mutated(&mut self, name: &str) {
@@ -57,6 +76,15 @@ impl Resolver {
             if let Some(&(id, depth)) = scope.names.get(name) {
                 if depth < self.fn_depth {
                     self.captured.insert(id);
+                    // thread the capture through every enclosing function
+                    // between the owner and the referencing one — mirrors
+                    // the emitter's upvalue chain
+                    for level in depth..self.fn_depth {
+                        let rec = &mut self.fn_stack[level];
+                        if !rec.caps.iter().any(|n| n == name) {
+                            rec.caps.push(name.to_string());
+                        }
+                    }
                 }
                 return;
             }
@@ -75,8 +103,9 @@ impl Resolver {
         }
     }
 
-    fn function(&mut self, params: &FormalParameters, body: &FunctionBody) {
+    fn function(&mut self, id: FnId, params: &FormalParameters, body: &FunctionBody) {
         self.fn_depth += 1;
+        self.fn_stack.push(FnRec { id, caps: Vec::new() });
         self.scopes.push(Scope { names: HashMap::new() });
         for p in &params.items {
             if let BindingPattern::BindingIdentifier(b) = &p.pattern {
@@ -88,6 +117,8 @@ impl Resolver {
             self.stmt(s);
         }
         self.scopes.pop();
+        let rec = self.fn_stack.pop().unwrap();
+        self.fn_caps.insert(rec.id, rec.caps);
         self.fn_depth -= 1;
     }
 
@@ -106,7 +137,7 @@ impl Resolver {
             Statement::FunctionDeclaration(f) => {
                 // name already hoisted
                 if let Some(body) = &f.body {
-                    self.function(&f.params, body);
+                    self.function(f.span.start, &f.params, body);
                 }
             }
             Statement::ExpressionStatement(e) => self.expr(&e.expression),
@@ -253,11 +284,11 @@ impl Resolver {
             }
             Expression::ParenthesizedExpression(p) => self.expr(&p.expression),
             Expression::ArrowFunctionExpression(a) => {
-                self.function(&a.params, &a.body);
+                self.function(a.span.start, &a.params, &a.body);
             }
             Expression::FunctionExpression(f) => {
                 if let Some(body) = &f.body {
-                    self.function(&f.params, body);
+                    self.function(f.span.start, &f.params, body);
                 }
             }
             Expression::TSAsExpression(t) => self.expr(&t.expression),

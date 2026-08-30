@@ -2,7 +2,7 @@
 //! Stack-discipline register allocation: locals hold fixed low registers,
 //! temporaries are allocated above and freed after each expression.
 
-use crate::resolve::BindingId;
+use crate::resolve::{BindingId, FnId};
 use crate::CompileError;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -63,6 +63,9 @@ pub struct Emitter {
     fs: Vec<FuncState>,
     captured: HashSet<BindingId>,
     mutated: HashSet<BindingId>,
+    /// Per-function ordered capture-name lists from the resolver (M6b):
+    /// lets a child's upvalue table be built before its body is emitted.
+    fn_caps: HashMap<FnId, Vec<String>>,
     cur_span: u32,
 }
 
@@ -73,9 +76,10 @@ impl Emitter {
         program: &Program,
         captured: HashSet<BindingId>,
         mutated: HashSet<BindingId>,
+        fn_caps: HashMap<FnId, Vec<String>>,
         source_name: &str,
     ) -> R<tsc_ir::Chunk> {
-        let mut em = Emitter { fs: Vec::new(), captured, mutated, cur_span: 0 };
+        let mut em = Emitter { fs: Vec::new(), captured, mutated, fn_caps, cur_span: 0 };
         em.fs.push(FuncState {
             name: "<main>".into(),
             scopes: vec![HashMap::new()],
@@ -238,6 +242,9 @@ impl Emitter {
                     .expect("upvalue chain broken");
                 UpvalSrc::ParentUpval(i)
             };
+            if std::env::var_os("TSC_CAPS_DEBUG").is_some() {
+                eprintln!("[caps] threading fallback used for '{name}'");
+            }
             self.fs[level].upvals.push((name.to_string(), src));
         }
         Place::Upval(find_upval(&self.fs[top], name).unwrap())
@@ -433,6 +440,7 @@ impl Emitter {
                 let mark = self.mark();
                 let tmp = self.alloc_reg(f.span.start)?;
                 let proto_idx = self.compile_function(
+                    f.span.start,
                     &id.name,
                     &f.params,
                     &body.statements,
@@ -681,16 +689,18 @@ impl Emitter {
 
     fn compile_function(
         &mut self,
+        key: FnId,
         name: &str,
         params: &FormalParameters,
         body: &[Statement],
         is_async: bool,
     ) -> R<u16> {
-        self.compile_function_inner(name, params, body, None, is_async)
+        self.compile_function_inner(key, name, params, body, None, is_async)
     }
 
     fn compile_function_inner(
         &mut self,
+        key: FnId,
         name: &str,
         params: &FormalParameters,
         body: &[Statement],
@@ -703,6 +713,36 @@ impl Emitter {
             is_async,
             ..Default::default()
         };
+        // M6b: build the upvalue table from the resolver's capture list
+        // BEFORE the body is emitted — the lazy-compile prerequisite. The
+        // parent's own table was pre-populated the same way, so chained
+        // captures resolve without threading through live emission.
+        if let Some(caps) = self.fn_caps.get(&key) {
+            let parent = self.fs.last().unwrap();
+            let caps = caps.clone();
+            for cap in caps {
+                let src = if let Some(l) =
+                    parent.scopes.iter().rev().find_map(|s| s.get(&cap).copied())
+                {
+                    debug_assert!(l.captured, "resolver missed a capture");
+                    if l.cell {
+                        UpvalSrc::ParentLocal(l.reg)
+                    } else {
+                        UpvalSrc::ParentLocalValue(l.reg)
+                    }
+                } else if let Some(i) =
+                    parent.upvals.iter().position(|(n, _)| *n == cap)
+                {
+                    UpvalSrc::ParentUpval(i as u8)
+                } else {
+                    // not visible at this point (e.g. declared later in the
+                    // parent) — matches the emission-order semantics: the
+                    // reference will resolve as a global at emit time
+                    continue;
+                };
+                fs.upvals.push((cap, src));
+            }
+        }
         fs.arity = params.items.len() as u8;
         self.fs.push(fs);
         for p in &params.items {
@@ -1082,6 +1122,7 @@ impl Emitter {
                     None
                 };
                 let idx = self.compile_function_inner(
+                    a.span.start,
                     "<arrow>",
                     &a.params,
                     &a.body.statements,
@@ -1097,6 +1138,7 @@ impl Emitter {
                 };
                 let name = f.id.as_ref().map(|i| i.name.to_string());
                 let idx = self.compile_function(
+                    f.span.start,
                     name.as_deref().unwrap_or("<anon>"),
                     &f.params,
                     &body.statements,
