@@ -650,6 +650,9 @@ dependencies = [
 [[package]]
 name = "tsc-types"
 version = "0.1.0"
+dependencies = [
+ "tsc-ir",
+]
 
 [[package]]
 name = "tscore"
@@ -748,6 +751,7 @@ dependencies = [
  "crossbeam-channel",
  "rustc-hash",
  "tsc-ir",
+ "tsc-types",
  "tsr-gc",
  "tsr-jit",
  "tsr-memory",

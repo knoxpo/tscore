@@ -6,3 +6,4 @@
 pub mod asm;
 pub mod heap;
 pub mod tier1;
+pub mod tier2;

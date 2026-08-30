@@ -68,6 +68,11 @@ impl Asm {
         self.code.push(w);
     }
 
+    /// Emit a raw pre-encoded word (for one-off encodings).
+    pub fn raw(&mut self, w: u32) {
+        self.push(w);
+    }
+
     pub fn new_label(&mut self) -> Label {
         self.labels.push(None);
         Label(self.labels.len() - 1)
@@ -318,6 +323,28 @@ impl Asm {
     /// SCVTF Dd, Wn (i32 -> f64).
     pub fn scvtf_w(&mut self, dd: Reg, wn: Reg) {
         self.push(0x1E62_0000 | wn << 5 | dd);
+    }
+    /// UCVTF Dd, Wn (u32 -> f64).
+    pub fn ucvtf_w(&mut self, dd: Reg, wn: Reg) {
+        self.push(0x1E63_0000 | wn << 5 | dd);
+    }
+    /// FMOV Dd, Dn (register move).
+    pub fn fmov_dd(&mut self, dd: Reg, dn: Reg) {
+        self.push(0x1E60_4000 | dn << 5 | dd);
+    }
+    /// 32-bit variable shifts.
+    pub fn lslv32(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.push(0x1AC0_2000 | rm << 16 | rn << 5 | rd);
+    }
+    pub fn lsrv32(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.push(0x1AC0_2400 | rm << 16 | rn << 5 | rd);
+    }
+    pub fn asrv32(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.push(0x1AC0_2800 | rm << 16 | rn << 5 | rd);
+    }
+    /// MVN Wd, Wn (bitwise not, 32-bit) = ORN Wd, WZR, Wn.
+    pub fn mvn32(&mut self, rd: Reg, rn: Reg) {
+        self.push(0x2A20_03E0 | rn << 16 | rd);
     }
 }
 

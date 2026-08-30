@@ -383,6 +383,18 @@ pub fn run_one(
     }
 }
 
+/// Resume a frame at an arbitrary pc (Tier-2 deopt continuation).
+pub fn run_frame_pub(
+    realm: &mut Realm,
+    closure: Option<tsr_memory::Ref>,
+    proto: &Arc<FunctionProto>,
+    base: usize,
+    depth: u32,
+    start_pc: usize,
+) -> Result<FrameResult, RtError> {
+    run_frame(realm, closure, proto, base, depth, start_pc)
+}
+
 /// Outcome of one frame execution: normal return, or suspension at an
 /// `await` on a pending promise (async frames only).
 pub enum FrameResult {

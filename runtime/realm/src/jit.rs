@@ -7,7 +7,7 @@ use crate::interp::{get_field_pub as get_field, start_async};
 use crate::{Realm, RtError};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::Arc;
-use tsc_ir::{Const, FunctionProto, Op, UpvalSrc, TIER_BASELINE, TIER_COLD, TIER_COMPILING, TIER_REJECTED};
+use tsc_ir::{Const, FunctionProto, Op, UpvalSrc, TIER_BASELINE, TIER_COLD, TIER_COMPILING, TIER_OPT, TIER_REJECTED};
 use tsr_jit::tier1::{CompiledFn, Helpers, JitRet};
 use tsr_memory::{to_int32, to_uint32, Closure, Kind, Value, JIT_ERR_SENTINEL};
 
@@ -83,8 +83,18 @@ extern "C" fn h_call(
             crate::interp::run_one(r, Some(c), &callee, new_base, depth + 1)
         } else if let Kind::Native(i) = f.kind() {
             let native = r.natives[i as usize].clone();
-            let args: Vec<Value> = r.stack[abs_a + 1..abs_a + 1 + argc].to_vec();
-            native(r, &args).map_err(|mut e| {
+            // args on the Rust stack: no per-call heap alloc (hot path for
+            // Math.* inside compiled loops)
+            let mut buf = [Value::UNDEFINED; 8];
+            let args_vec;
+            let args: &[Value] = if argc <= 8 {
+                buf[..argc].copy_from_slice(&r.stack[abs_a + 1..abs_a + 1 + argc]);
+                &buf[..argc]
+            } else {
+                args_vec = r.stack[abs_a + 1..abs_a + 1 + argc].to_vec();
+                &args_vec
+            };
+            native(r, args).map_err(|mut e| {
                 if e.span.is_none() {
                     e.span = pr.spans.get(pc).copied();
                 }
@@ -560,7 +570,37 @@ pub fn tier_up(proto: &Arc<FunctionProto>) -> Option<CompiledFn> {
     None
 }
 
+extern "C" {
+    fn fmod(x: f64, y: f64) -> f64;
+    fn pow(x: f64, y: f64) -> f64;
+}
+
+fn tier2_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var_os("TSC_NO_TIER2").is_none())
+}
+
 pub fn compile_now(proto: &Arc<FunctionProto>) {
+    if tier2_enabled() {
+        let typed = tsc_types::analyze(proto);
+        if typed.tier2_ok {
+            let code = tsr_jit::tier2::compile(
+                proto,
+                helpers(),
+                &typed.jumpif_num,
+                fmod as *const () as usize,
+                pow as *const () as usize,
+            );
+            let ptr = tsr_jit::heap::publish(&code) as *mut u8;
+            proto.jit.code.store(ptr, Release);
+            proto.jit.tier.store(TIER_OPT, Release);
+            return;
+        }
+    }
+    compile_tier1(proto)
+}
+
+fn compile_tier1(proto: &Arc<FunctionProto>) {
     match tsr_jit::tier1::compile(proto, helpers()) {
         Some(code) => {
             let ptr = tsr_jit::heap::publish(&code) as *mut u8;
@@ -577,20 +617,35 @@ pub fn compile_now(proto: &Arc<FunctionProto>) {
 pub fn enter_jit(
     realm: &mut Realm,
     f: CompiledFn,
-    proto: &FunctionProto,
+    proto: &Arc<FunctionProto>,
     base: usize,
     closure: Option<u32>,
     depth: u32,
 ) -> Result<Value, RtError> {
     let ret = f(
         realm as *mut Realm as *mut core::ffi::c_void,
-        proto as *const FunctionProto,
+        proto.as_ref() as *const FunctionProto,
         (base * 8) as u64,
         closure.unwrap_or(u32::MAX),
         depth,
     );
     match ret.val {
         0 => Ok(Value::from_bits(ret.stack)),
+        2 => {
+            // deopt: state fully materialized in slots; resume in the
+            // interpreter. Repeated deopts demote the proto to Tier-1.
+            let deopts = proto.jit.deopts.fetch_add(1, Relaxed) + 1;
+            if deopts >= 10 && proto.jit.tier.load(Relaxed) == TIER_OPT {
+                compile_tier1(proto);
+            }
+            let resume_pc = ret.stack as usize;
+            match crate::interp::run_frame_pub(realm, closure, proto, base, depth, resume_pc)? {
+                crate::interp::FrameResult::Return(v) => Ok(v),
+                crate::interp::FrameResult::Await { .. } => {
+                    unreachable!("await in sync frame")
+                }
+            }
+        }
         _ => Err(realm
             .jit_error
             .take()

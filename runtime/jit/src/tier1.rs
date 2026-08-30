@@ -105,6 +105,17 @@ pub fn compile(proto: &FunctionProto, helpers: Helpers) -> Option<Vec<u32>> {
     if proto.is_async || proto.code.len() > MAX_CODE {
         return None;
     }
+    // Calls inside loops lose to the interpreter's inline native-call arm
+    // (helper hop per iteration) — leave those functions interpreted.
+    // ponytail: revisit with an inline native fast path in the template.
+    for (pc, ins) in proto.code.iter().enumerate() {
+        if ins.op == Op::Jump && ins.sbx() < 0 {
+            let target = (pc as i64 + ins.sbx() as i64 + 1) as usize;
+            if proto.code[target..pc].iter().any(|i| i.op == Op::Call) {
+                return None;
+            }
+        }
+    }
     let mut c = {
         let mut a = Asm::new();
         let bail = a.new_label();

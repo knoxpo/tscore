@@ -289,7 +289,6 @@ fn run_chunk(
     // scratch realm: never collects (the rehydrated callback lives in a
     // Rust local, unrooted); the whole arena drops when the chunk ends
     realm.gc_enabled = false;
-    realm.jit_enabled = false;
     realm.cancel = cancel;
     tsr_io::install(&mut realm);
     tsr_channel::install(&mut realm);

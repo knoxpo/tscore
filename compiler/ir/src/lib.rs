@@ -137,6 +137,8 @@ pub struct JitState {
     pub counter: AtomicU32,
     pub tier: AtomicU8,
     pub code: AtomicPtr<u8>,
+    /// Tier-2 deoptimization count (demote to Tier-1 at 10).
+    pub deopts: AtomicU32,
     /// Arg-tag bitmasks observed during profiling (NUM=1 BOOL=2 STR=4 OTHER=8).
     pub arg_seen: Vec<AtomicU8>,
 }

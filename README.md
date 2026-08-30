@@ -10,7 +10,9 @@ const results = await parallel.map(records, processRecord);
 // runtime handles: partitioning, work stealing, core placement, isolation
 ```
 
-**Status:** M4 "GC + Memory Runtime" complete — generational GC (O(young)
+**Status:** M5 "Typed IR + Native Compilation" complete — hand-rolled
+ARM64 two-tier JIT; annotated numeric loops run unboxed at Node speed and
+compose with the multicore scheduler. M4 "GC + Memory Runtime" complete — generational GC (O(young)
 minor pauses), memory limits, runtime telemetry, and a live `tscore top`
 monitor (M1 Multicore Proof, M2 Actors, M3 incl. async/await before it) — custom bytecode interpreter (register machine, per-realm
 isolated heaps, mark-sweep GC), work-stealing scheduler, actor runtime.
@@ -83,6 +85,14 @@ of heap size (measured ~2ms minors vs ~10ms majors on a 2M-object live
 set). `runtime.gc.stats()`, `--max-heap` limits with clean OOM errors,
 `tscore run --stats`, and `tscore top` — a live table of every running
 tscore process. See [GC spec](docs/specifications/gc-m4.md).
+
+## Native compilation (M5)
+
+Hot functions compile to hand-rolled ARM64. Tier-2 uses your TS
+annotations: `function work(n: number)` runs **unboxed** in FP registers —
+measured 7× over the interpreter, matching Node on numeric loops, and it
+multiplies with `parallel.map` (mandelbrot ×8 cores: 17ms vs Node's 22ms
+single-core). See [M5 spec](docs/specifications/native-compilation-m5.md).
 
 ## Try it
 
