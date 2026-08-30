@@ -97,7 +97,7 @@ pub fn install(realm: &mut Realm) {
     // hidden helper: `s.charCodeAt(i)` compiles to `__charCodeAt(s, i)`
     let char_code_at = realm.add_native(|realm, args| {
         let s = match args.first().and_then(|v| v.as_str_ref()) {
-            Some(r) => realm.heap.str_at(r).clone(),
+            Some(r) => realm.heap.str_at(r),
             None => {
                 let v = args.first();
                 return Err(RtError::new(format!(

@@ -116,6 +116,8 @@ pub struct Realm {
     pub stats_hub: Option<Arc<StatsHub>>,
     /// Error slot for JIT helper failures (out-of-band from the ABI return).
     pub jit_error: Option<RtError>,
+    /// Pending-await info from JIT code (h_await): (awaited, dst, resume_pc).
+    pub jit_await: Option<(tsr_memory::Ref, u8, usize)>,
     /// Reused scratch for Concat (avoids a malloc/free per concat).
     pub concat_buf: String,
     /// Cooperative cancellation flag, checked at interpreter safepoints.
@@ -131,6 +133,10 @@ pub struct Realm {
     /// tss-parallel::install; the pred returns true when a wake arrived).
     /// Without it, `--workers 1` (zero pool threads) would deadlock.
     pub idle_helper: Option<fn(&dyn Fn() -> bool)>,
+    /// Whether the pool has unfinished jobs — lets the event loop block on
+    /// the wake channel (zero latency for timer wakes) when the pool is
+    /// idle instead of spin-parking in `idle_helper`.
+    pub pool_busy: Option<fn() -> bool>,
     pub wake_tx: crossbeam_channel::Sender<Wake>,
     pub wake_rx: crossbeam_channel::Receiver<Wake>,
 }
@@ -152,28 +158,35 @@ impl Realm {
             oom: None,
             stats_hub: None,
             jit_error: None,
+            jit_await: None,
             concat_buf: String::new(),
             cancel: None,
             microtasks: std::collections::VecDeque::new(),
             pinned: rustc_hash::FxHashSet::default(),
             external_pending: 0,
             idle_helper: None,
+            pool_busy: None,
             wake_tx: wake_tx.clone(),
             wake_rx,
         }
     }
 
     /// Safepoint: cancellation check, then GC check. Called at loop
-    /// back-edges and closure calls.
+    /// back-edges and closure calls — keep the no-op path branch-only.
+    #[inline(always)]
     pub fn safepoint(&mut self) -> Result<(), RtError> {
         if let Some(c) = &self.cancel {
             if c.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(RtError::cancelled());
             }
         }
-        self.maybe_gc();
-        if let Some(msg) = self.oom.take() {
-            return Err(RtError::new(msg));
+        if self.gc_enabled && self.heap.needs_gc() {
+            self.maybe_gc();
+        }
+        if self.oom.is_some() {
+            if let Some(msg) = self.oom.take() {
+                return Err(RtError::new(msg));
+            }
         }
         Ok(())
     }

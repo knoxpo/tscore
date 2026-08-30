@@ -192,7 +192,7 @@ fn deliver(
     let msg = rehydrate(pv, &mut realm.heap);
     let msg_type = match msg.as_object() {
         Some(r) => match realm.heap.obj(r).get("type").and_then(|v| v.as_str_ref()) {
-            Some(s) => realm.heap.str_at(s).clone(),
+            Some(s) => realm.heap.str_at(s),
             None => return Err("message has no string 'type' field".into()),
         },
         None => return Err("message must be an object".into()),

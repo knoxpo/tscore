@@ -53,9 +53,6 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         jumpif: Vec::new(),
         arg_guard: Vec::new(),
     };
-    if proto.is_async {
-        return reject("async");
-    }
     if proto.arity > 8 {
         return reject("arity > 8 (unprofiled)");
     }
@@ -175,7 +172,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
             }
             Op::Len => s[a] = T::Num,
             Op::Return | Op::Halt => next = vec![],
-            Op::Await => return reject("async op"),
+            Op::Await => s[a] = T::Top,
             _ => {
                 // everything else (Call, heap ops, cells, upvals, globals,
                 // Concat, TypeOf, closures) writes an unproven result

@@ -79,7 +79,7 @@ impl Emitter {
         em.fs.push(FuncState {
             name: "<main>".into(),
             scopes: vec![HashMap::new()],
-            is_async: true, // top-level await
+            is_async: true, // allows top-level await; downgraded after emit if unused
             ..Default::default()
         });
         em.hoist_functions(&program.body)?;
@@ -87,7 +87,10 @@ impl Emitter {
             em.stmt(s)?;
         }
         em.emit(Op::Halt, 0, 0, 0);
-        let fs = em.fs.pop().unwrap();
+        let mut fs = em.fs.pop().unwrap();
+        // Only stay async if top-level await was actually used: a sync
+        // <main> is eligible for OSR/Tier-2 (async frames never JIT).
+        fs.is_async = fs.code.iter().any(|i| i.op == Op::Await);
         Ok(tsc_ir::Chunk {
             main: Arc::new(finish(fs)),
             source_name: source_name.into(),
@@ -146,6 +149,7 @@ impl Emitter {
         let key = match &c {
             Const::Number(n) => ConstKey::Num(n.to_bits()),
             Const::Str(s) => ConstKey::Str(s.to_string()),
+            Const::Keys(ks) => ConstKey::Str(format!("\0keys:{}", ks.join("\0"))),
         };
         let f = self.f();
         if let Some(&i) = f.const_map.get(&key) {
@@ -973,7 +977,23 @@ impl Emitter {
                 Ok(())
             }
             Expression::ArrayExpression(a) => {
-                let n = a.elements.len().min(u8::MAX as usize) as u8;
+                let n = a.elements.len();
+                // fused literal: evaluate elements into contiguous regs,
+                // allocate + copy in one op (small literals only — keeps
+                // register pressure bounded)
+                if n > 0 && n <= 8 && a.elements.iter().all(|el| el.as_expression().is_some())
+                {
+                    let mark = self.mark();
+                    let first = self.mark();
+                    for el in &a.elements {
+                        let r = self.alloc_reg(a.span.start)?;
+                        self.expr(el.as_expression().unwrap(), r)?;
+                    }
+                    self.emit(Op::NewArrayLit, dst, first, n as u8);
+                    self.free_to(mark);
+                    return Ok(());
+                }
+                let n = n.min(u8::MAX as usize) as u8;
                 self.emit(Op::NewArray, dst, n, 0);
                 let mark = self.mark();
                 let tmp = self.alloc_reg(a.span.start)?;
@@ -988,6 +1008,46 @@ impl Emitter {
                 Ok(())
             }
             Expression::ObjectExpression(o) => {
+                // fused literal: all-static small literals evaluate values
+                // into contiguous regs, then allocate with the final shape
+                // in one op (per-pc shape cache fills at runtime)
+                let n = o.properties.len();
+                let static_keys: Option<Vec<Arc<str>>> = if n > 0 && n <= 8 {
+                    o.properties
+                        .iter()
+                        .map(|p| match p {
+                            ObjectPropertyKind::ObjectProperty(p) => match &p.key {
+                                PropertyKey::StaticIdentifier(id) => {
+                                    Some(Arc::from(id.name.as_str()))
+                                }
+                                PropertyKey::StringLiteral(s) => {
+                                    Some(Arc::from(s.value.as_str()))
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .collect()
+                } else {
+                    None
+                };
+                if let Some(keys) = static_keys {
+                    let k = self.konst(Const::Keys(keys.into()));
+                    if k <= u8::MAX as u16 {
+                        let mark = self.mark();
+                        let first = self.mark();
+                        for p in &o.properties {
+                            let ObjectPropertyKind::ObjectProperty(p) = p else {
+                                unreachable!()
+                            };
+                            let r = self.alloc_reg(o.span.start)?;
+                            self.expr(&p.value, r)?;
+                        }
+                        self.emit(Op::NewObjectLit, dst, first, k as u8);
+                        self.free_to(mark);
+                        return Ok(());
+                    }
+                }
                 self.emit(Op::NewObject, dst, 0, 0);
                 let mark = self.mark();
                 let tmp = self.alloc_reg(o.span.start)?;
@@ -1234,7 +1294,19 @@ impl Emitter {
     }
 }
 
-fn finish(fs: FuncState) -> FunctionProto {
+fn finish(mut fs: FuncState) -> FunctionProto {
+    // emit-time optimizer: copy-prop, dead stores, loop-invariant consts.
+    // Runs before the proto is sealed so every tier sees canonical code.
+    let upval_srcs: Vec<Vec<tsc_ir::UpvalSrc>> =
+        fs.protos.iter().map(|p| p.upvals.clone()).collect();
+    tsc_optimizer::optimize(
+        &mut fs.code,
+        &mut fs.spans,
+        &fs.consts,
+        &upval_srcs,
+        fs.max_reg.max(1),
+        fs.arity,
+    );
     FunctionProto {
         name: Arc::from(fs.name.as_str()),
         arity: fs.arity,

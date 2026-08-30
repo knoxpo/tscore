@@ -90,7 +90,7 @@ fn clone_rec(
             let fields = heap
                 .obj(r)
                 .entries()
-                .map(|(k, x)| Ok((k.clone(), clone_rec(heap, *x, visiting)?)))
+                .map(|(k, x)| Ok((k.clone(), clone_rec(heap, x, visiting)?)))
                 .collect::<Result<_, String>>()?;
             visiting.remove(&(1, r));
             PortableValue::Object(fields)

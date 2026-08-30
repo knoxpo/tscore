@@ -36,6 +36,8 @@ const FOREIGN_BASE: u32 = 8;
 
 /// Returned by JIT helpers to signal "error stored in realm.jit_error".
 pub const JIT_ERR_SENTINEL: u64 = (TAG_SPECIAL << TAG_SHIFT) | 4;
+/// Returned by h_await to signal "pending — suspend info in realm.jit_await".
+pub const JIT_AWAIT_SENTINEL: u64 = (TAG_SPECIAL << TAG_SHIFT) | 5;
 
 /// Decoded view of a [`Value`] for match sites off the hot path.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -261,27 +263,32 @@ pub struct Closure {
 /// caches on Arc-shared code work from every worker thread). Transitions
 /// are rare (one per distinct literal shape) and mutex-guarded; reads are
 /// lock-free through the object's own Arc.
+// repr(C): keep `id` at offset 0 — the JIT's shape-guard load hits the
+// pointer's first cache line instead of wherever field reordering puts it
+#[repr(C)]
 #[derive(Debug)]
 pub struct ShapeData {
     pub id: u32,
     /// Field names in slot order.
     pub fields: Vec<Arc<str>>,
-    transitions: std::sync::RwLock<Vec<(Arc<str>, Arc<ShapeData>)>>,
+    transitions: std::sync::RwLock<Vec<(Arc<str>, &'static ShapeData)>>,
 }
 
 static SHAPE_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-pub fn empty_shape() -> Arc<ShapeData> {
-    static EMPTY: std::sync::OnceLock<Arc<ShapeData>> = std::sync::OnceLock::new();
-    EMPTY
-        .get_or_init(|| {
-            Arc::new(ShapeData {
-                id: 0,
-                fields: Vec::new(),
-                transitions: std::sync::RwLock::new(Vec::new()),
-            })
-        })
-        .clone()
+/// Shapes are immutable, process-global, and bounded by the program's
+/// distinct field sequences — leaked (`&'static`) so the hot paths
+/// (allocation, sweep-clear, transitions, TICs) never touch an atomic
+/// refcount.
+pub fn empty_shape() -> &'static ShapeData {
+    static EMPTY: std::sync::OnceLock<&'static ShapeData> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| {
+        Box::leak(Box::new(ShapeData {
+            id: 0,
+            fields: Vec::new(),
+            transitions: std::sync::RwLock::new(Vec::new()),
+        }))
+    })
 }
 
 impl ShapeData {
@@ -291,59 +298,121 @@ impl ShapeData {
 
     /// Shape after adding `name` — read-mostly: cached transitions hit a
     /// shared read lock (object-literal creation is this path, hot).
-    pub fn with_field(self: &Arc<Self>, name: Arc<str>) -> Arc<ShapeData> {
+    pub fn with_field(&'static self, name: Arc<str>) -> &'static ShapeData {
         {
             let tr = self.transitions.read().unwrap();
             if let Some((_, next)) = tr.iter().find(|(k, _)| **k == *name) {
-                return next.clone();
+                return next;
             }
         }
         let mut tr = self.transitions.write().unwrap();
         // re-check under the write lock (racing creator)
         if let Some((_, next)) = tr.iter().find(|(k, _)| **k == *name) {
-            return next.clone();
+            return next;
         }
         let mut fields = self.fields.clone();
         fields.push(name.clone());
-        let next = Arc::new(ShapeData {
+        let next: &'static ShapeData = Box::leak(Box::new(ShapeData {
             id: SHAPE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             fields,
             transitions: std::sync::RwLock::new(Vec::new()),
-        });
-        tr.push((name, next.clone()));
+        }));
+        tr.push((name, next));
         next
     }
 }
 
-/// Object = shared shape + dense value slots.
+/// Inline value slots per object; fields beyond this spill to `overflow`.
+/// 3 keeps Obj at exactly 64 bytes (pow2 arena stride: the JIT indexes
+/// with one shifted add instead of a mul). Bump only with re-measurement.
+pub const OBJ_INLINE: usize = 3;
+
+/// Object = shared shape + value slots. The first OBJ_INLINE values live
+/// inline in the arena slot (no second allocation, no pointer chase on
+/// reads); rare bigger objects spill to `overflow`. repr(C) so the JIT
+/// reads fields at compile-time offsets.
+#[repr(C)]
 #[derive(Debug)]
 pub struct Obj {
-    pub shape: Arc<ShapeData>,
-    pub values: Vec<Value>,
+    pub shape: &'static ShapeData,
+    /// Number of populated value slots (== shape.fields.len()).
+    pub vlen: u32,
+    pub inline: [Value; OBJ_INLINE],
+    pub overflow: Vec<Value>,
 }
 
 impl Default for Obj {
     fn default() -> Self {
-        Obj { shape: empty_shape(), values: Vec::new() }
+        Obj {
+            shape: empty_shape(),
+            vlen: 0,
+            inline: [Value::UNDEFINED; OBJ_INLINE],
+            overflow: Vec::new(),
+        }
     }
 }
 
 impl Obj {
+    #[inline(always)]
+    pub fn vlen(&self) -> usize {
+        self.vlen as usize
+    }
+    #[inline(always)]
+    pub fn val(&self, i: usize) -> Value {
+        if i < OBJ_INLINE {
+            self.inline[i]
+        } else {
+            self.overflow[i - OBJ_INLINE]
+        }
+    }
+    #[inline(always)]
+    pub fn set_val(&mut self, i: usize, v: Value) {
+        if i < OBJ_INLINE {
+            self.inline[i] = v;
+        } else {
+            self.overflow[i - OBJ_INLINE] = v;
+        }
+    }
+    #[inline(always)]
+    pub fn push_val(&mut self, v: Value) {
+        let i = self.vlen as usize;
+        if i < OBJ_INLINE {
+            self.inline[i] = v;
+        } else {
+            self.overflow.push(v);
+        }
+        self.vlen += 1;
+    }
+    #[inline(always)]
+    pub fn extend_vals(&mut self, vals: &[Value]) {
+        let n_inline = vals.len().min(OBJ_INLINE);
+        self.inline[..n_inline].copy_from_slice(&vals[..n_inline]);
+        if vals.len() > OBJ_INLINE {
+            self.overflow.extend_from_slice(&vals[OBJ_INLINE..]);
+        }
+        self.vlen += vals.len() as u32;
+    }
+    /// Reset value storage (keeps overflow capacity for reuse).
+    #[inline(always)]
+    pub fn clear_vals(&mut self) {
+        self.vlen = 0;
+        self.overflow.clear();
+    }
     pub fn get(&self, name: &str) -> Option<Value> {
-        self.shape.slot_of(name).map(|i| self.values[i])
+        self.shape.slot_of(name).map(|i| self.val(i))
     }
     pub fn set(&mut self, name: Arc<str>, v: Value) {
         match self.shape.slot_of(&name) {
-            Some(i) => self.values[i] = v,
+            Some(i) => self.set_val(i, v),
             None => {
                 self.shape = self.shape.with_field(name);
-                self.values.push(v);
+                self.push_val(v);
             }
         }
     }
     /// (name, value) pairs in slot order.
-    pub fn entries(&self) -> impl Iterator<Item = (&Arc<str>, &Value)> {
-        self.shape.fields.iter().zip(self.values.iter())
+    pub fn entries(&self) -> impl Iterator<Item = (&Arc<str>, Value)> {
+        self.shape.fields.iter().zip((0..self.vlen()).map(|i| self.val(i)))
     }
 }
 
@@ -377,6 +446,27 @@ impl Bitmap {
     }
 }
 
+/// Reusable GC scratch: mark vectors, minor-mark bitmaps, and the trace
+/// worklist. Lives on the heap so a collection never allocates
+/// proportionally to arena size (a major used to malloc six full-length
+/// Vec<bool>s per run).
+#[derive(Default)]
+pub struct GcScratch {
+    pub strs: Vec<bool>,
+    pub objs: Vec<bool>,
+    pub arrs: Vec<bool>,
+    pub closures: Vec<bool>,
+    pub cells: Vec<bool>,
+    pub foreigns: Vec<bool>,
+    pub ystrs: Bitmap,
+    pub yobjs: Bitmap,
+    pub yarrs: Bitmap,
+    pub yclosures: Bitmap,
+    pub ycells: Bitmap,
+    pub yforeigns: Bitmap,
+    pub work: Vec<Value>,
+}
+
 /// Per-arena generational state: age bits, barrier dirty bits, and the log
 /// of slots allocated since the last collection (the nursery).
 #[derive(Default)]
@@ -389,8 +479,11 @@ pub struct GenState {
 impl GenState {
     #[inline(always)]
     fn on_alloc(&mut self, r: Ref) {
-        self.old.clear(r);
-        self.dirty.clear(r);
+        // invariant: every slot on a free list has old=0 and dirty=0 —
+        // the major sweep rebuilds `old` from marks (unmarked ⇒ 0) and
+        // clears all dirty bits; minor-freed slots were never old; and
+        // free_foreign clears both explicitly
+        debug_assert!(!self.old.get(r) && !self.dirty.get(r));
         self.young.push(r);
     }
 }
@@ -445,6 +538,8 @@ pub struct Heap {
     /// trigger (slot counts under-estimate big arrays).
     pub promoted_bytes_since_major: usize,
     pub remembered_peak: usize,
+    /// Reusable collection scratch (taken/returned by tsr-gc).
+    pub gc_scratch: GcScratch,
 }
 
 impl Default for Heap {
@@ -474,6 +569,7 @@ impl Default for Heap {
             promoted_since_major: 0,
             promoted_bytes_since_major: 0,
             remembered_peak: 0,
+            gc_scratch: GcScratch::default(),
         }
     }
 }
@@ -522,7 +618,7 @@ impl Heap {
         if let Some(r) = self.free_closures.pop() {
             let c = &mut self.closures[r as usize];
             c.proto = proto;
-            c.upvals.clear();
+            debug_assert!(c.upvals.is_empty()); // sweep pre-clears
             c.upvals.extend_from_slice(upvals);
             self.gen_closures.on_alloc(r);
             return r;
@@ -537,13 +633,11 @@ impl Heap {
     pub fn alloc_str_copy(&mut self, s: &str) -> Ref {
         self.allocs_since_gc += 1;
         if let Some(r) = self.free_strs.pop() {
+            // freed slots arrive pre-cleared (sweep clears + caps capacity)
             let slot = &mut self.strs[r as usize];
             match slot {
                 HStr::Buf(b) => {
-                    b.clear();
-                    if b.capacity() > 1024 {
-                        b.shrink_to(64);
-                    }
+                    debug_assert!(b.is_empty());
                     b.push_str(s);
                 }
                 HStr::Shared(_) => *slot = HStr::Buf(String::from(s)),
@@ -647,11 +741,8 @@ impl Heap {
     pub fn alloc_arr_empty(&mut self, cap: usize) -> Ref {
         self.allocs_since_gc += 1;
         if let Some(r) = self.free_arrs.pop() {
-            let v = &mut self.arrs[r as usize];
-            v.clear();
-            if v.capacity() > 1024 {
-                v.shrink_to(64); // don't hoard giant buffers in the free list
-            }
+            // freed slots arrive pre-cleared (sweep clears + caps capacity)
+            debug_assert!(self.arrs[r as usize].is_empty());
             self.gen_arrs.on_alloc(r);
             return r;
         }
@@ -661,22 +752,51 @@ impl Heap {
         r
     }
 
+    /// Fused object literal: final shape + all values in one allocation.
+    pub fn alloc_obj_lit(&mut self, shape: &'static ShapeData, values: &[Value]) -> Ref {
+        self.allocs_since_gc += 1;
+        if let Some(r) = self.free_objs.pop() {
+            let o = &mut self.objs[r as usize];
+            debug_assert!(o.vlen == 0);
+            o.shape = shape;
+            o.extend_vals(values);
+            self.gen_objs.on_alloc(r);
+            return r;
+        }
+        let mut o = Obj { shape, ..Obj::default() };
+        o.extend_vals(values);
+        self.objs.push(o);
+        let r = (self.objs.len() - 1) as Ref;
+        self.gen_objs.on_alloc(r);
+        r
+    }
+
+    /// Fused array literal: contents in one allocation.
+    pub fn alloc_arr_lit(&mut self, values: &[Value]) -> Ref {
+        self.allocs_since_gc += 1;
+        if let Some(r) = self.free_arrs.pop() {
+            let v = &mut self.arrs[r as usize];
+            debug_assert!(v.is_empty());
+            v.extend_from_slice(values);
+            self.gen_arrs.on_alloc(r);
+            return r;
+        }
+        self.arrs.push(values.to_vec());
+        let r = (self.arrs.len() - 1) as Ref;
+        self.gen_arrs.on_alloc(r);
+        r
+    }
+
     /// Allocate an empty object, reusing a freed slot's values buffer.
     pub fn alloc_obj_empty(&mut self) -> Ref {
         self.allocs_since_gc += 1;
         if let Some(r) = self.free_objs.pop() {
-            let o = &mut self.objs[r as usize];
-            o.shape = empty_shape();
-            o.values.clear();
+            // freed slots arrive pre-cleared: sweep resets shape + values
+            debug_assert!(self.objs[r as usize].vlen == 0);
             self.gen_objs.on_alloc(r);
             return r;
         }
-        self.objs.push(Obj {
-            shape: empty_shape(),
-            // literals typically add 2-4 fields: skip the 1->2->4 realloc
-            // ladder on fresh slots
-            values: Vec::with_capacity(4),
-        });
+        self.objs.push(Obj::default());
         let r = (self.objs.len() - 1) as Ref;
         self.gen_objs.on_alloc(r);
         r

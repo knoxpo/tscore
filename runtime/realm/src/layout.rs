@@ -17,13 +17,23 @@ use tsr_memory::{Obj, Value};
 ///   arr             = arrs_ptr + ref * arr_size; ptr/len via vec offsets
 #[derive(Clone, Copy, Debug)]
 pub struct HeapLayout {
+    pub realm_stack_ptr: u32,
     pub realm_objs_ptr: u32,
     pub realm_arrs_ptr: u32,
     pub obj_size: u32,
     pub obj_shape_arc: u32,
     pub shape_id_delta: u32,
-    pub obj_vals_ptr: u32,
-    pub obj_vals_len: u32,
+    /// Offset of the inline value slots inside Obj (repr(C): exact).
+    pub obj_inline: u32,
+    pub realm_closures_ptr: u32,
+    pub realm_cells_ptr: u32,
+    pub closure_size: u32,
+    /// Offset of the upvals Vec's data pointer inside Closure.
+    pub closure_upvals_ptr: u32,
+    /// Offset of the stored proto Arc word inside Closure.
+    pub closure_proto_off: u32,
+    /// Offset of realm.stack's len inside Realm.
+    pub realm_stack_len: u32,
     pub arr_size: u32,
     pub vec_ptr: u32,
     pub vec_len: u32,
@@ -128,29 +138,94 @@ pub fn discover() -> Option<HeapLayout> {
     };
     let _ = &id_hits;
     let shape_id_delta = shape_data_base_delta + id_off_in_sd;
-    let obj_vals_ptr = probe!("obj_vals_ptr", find_word(obj_words, o.values.as_ptr() as u64));
-    let obj_vals_len = probe!("obj_vals_len", find_word(obj_words, 3));
+    // Obj is repr(C): inline slots at a compile-time offset
+    let obj_inline = std::mem::offset_of!(Obj, inline) as u32;
+
+    // --- Closure internals: upvals Vec data pointer ---
+    let cl = tsr_memory::Closure {
+        proto: {
+            // a dummy proto: only the struct layout matters here
+            std::sync::Arc::new(tsc_ir::FunctionProto::default())
+        },
+        upvals: {
+            let mut u = Vec::with_capacity(7);
+            u.push(Value::number(9.0));
+            u
+        },
+    };
+    let closure_upvals_ptr = probe!(
+        "closure_upvals_ptr",
+        find_word(as_words(&cl), cl.upvals.as_ptr() as u64)
+    );
+    // the stored word is the ArcInner pointer; data sits a small header in
+    let closure_proto_off = {
+        let data = std::sync::Arc::as_ptr(&cl.proto) as u64;
+        let words = as_words(&cl);
+        let hits: Vec<usize> = words
+            .iter()
+            .enumerate()
+            .filter(|(_, &w)| {
+                let delta = data.wrapping_sub(w);
+                w != 0 && delta <= 64 && delta % 8 == 0
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if hits.len() != 1 {
+            if dbg {
+                eprintln!("[layout] probe failed: closure_proto_off");
+            }
+            return None;
+        }
+        (hits[0] * 8) as u32
+    };
 
     // --- Realm -> heap.objs / heap.arrs data pointers ---
     let mut realm = Realm::new();
+    let dummy_proto = std::sync::Arc::new(tsc_ir::FunctionProto::default());
     for i in 0..4 {
         let mut po = Obj::default();
         po.set(Arc::from("k"), Value::number(i as f64));
         realm.heap.alloc_obj(po);
         realm.heap.alloc_arr(vec![Value::number(i as f64); 3]);
+        // populate closures/cells so their arena data pointers are real,
+        // unique words inside Realm (an empty Vec's dangling ptr is not)
+        realm.heap.alloc_closure(tsr_memory::Closure {
+            proto: dummy_proto.clone(),
+            upvals: vec![Value::number(i as f64)],
+        });
+        realm.heap.alloc_cell(Value::number(i as f64));
     }
+    realm.stack.resize(37, Value::UNDEFINED);
     let realm_words = as_words(&realm);
+    let realm_stack_len =
+        probe!("realm_stack_len", find_word(realm_words, 37));
+    let realm_stack_ptr =
+        probe!("realm_stack_ptr", find_word(realm_words, realm.stack.as_ptr() as u64));
     let realm_objs_ptr = probe!("realm_objs_ptr", find_word(realm_words, realm.heap.objs.as_ptr() as u64));
     let realm_arrs_ptr = probe!("realm_arrs_ptr", find_word(realm_words, realm.heap.arrs.as_ptr() as u64));
+    let realm_closures_ptr = probe!(
+        "realm_closures_ptr",
+        find_word(realm_words, realm.heap.closures.as_ptr() as u64)
+    );
+    let realm_cells_ptr = probe!(
+        "realm_cells_ptr",
+        find_word(realm_words, realm.heap.cells.as_ptr() as u64)
+    );
 
     let layout = HeapLayout {
+        realm_stack_ptr,
         realm_objs_ptr,
         realm_arrs_ptr,
         obj_size: std::mem::size_of::<Obj>() as u32,
         obj_shape_arc,
         shape_id_delta,
-        obj_vals_ptr,
-        obj_vals_len,
+        obj_inline,
+        realm_closures_ptr,
+        realm_cells_ptr,
+        closure_size: std::mem::size_of::<tsr_memory::Closure>() as u32,
+        closure_upvals_ptr,
+        closure_proto_off,
+        realm_stack_len,
         arr_size: std::mem::size_of::<Vec<Value>>() as u32,
         vec_ptr,
         vec_len,
@@ -169,9 +244,8 @@ fn verify(realm: &Realm, l: &HeapLayout) -> bool {
         let realm_base = realm as *const Realm as *const u8;
         let objs = *(realm_base.add(l.realm_objs_ptr as usize) as *const *const u8);
         let obj2 = objs.add(2 * l.obj_size as usize);
-        let vlen = *(obj2.add(l.obj_vals_len as usize) as *const u64);
-        let vptr = *(obj2.add(l.obj_vals_ptr as usize) as *const *const u64);
-        let v0 = *vptr;
+        let vlen = realm.heap.objs[2].vlen() as u64;
+        let v0 = *(obj2.add(l.obj_inline as usize) as *const u64);
         let shape_arc = *(obj2.add(l.obj_shape_arc as usize) as *const *const u8);
         let sid = *(shape_arc.add(l.shape_id_delta as usize) as *const u32);
         let arrs = *(realm_base.add(l.realm_arrs_ptr as usize) as *const *const u8);

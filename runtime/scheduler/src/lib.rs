@@ -44,6 +44,9 @@ struct Shared {
     /// notifies when someone is listening.
     sleepers: AtomicUsize,
     shutdown: AtomicBool,
+    /// Jobs submitted or spawned but not yet finished — lets the event loop
+    /// tell "pool has work" from "pool is idle" without touching the deques.
+    pending: AtomicUsize,
     // observability (relaxed; approximate is fine)
     tasks_executed: AtomicUsize,
     steals: AtomicUsize,
@@ -91,6 +94,7 @@ pub struct Ctx<'a> {
 impl Ctx<'_> {
     pub fn spawn(&self, f: impl FnOnce(&Ctx) + Send + 'static) {
         self.batch.remaining.fetch_add(1, Ordering::SeqCst);
+        self.shared.pending.fetch_add(1, Ordering::SeqCst);
         let unit = JobUnit { batch: self.batch.clone(), f: Box::new(f) };
         match self.local {
             Some(w) => w.push(unit),
@@ -122,6 +126,7 @@ impl Pool {
             sleep_cv: Condvar::new(),
             sleepers: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            pending: AtomicUsize::new(0),
             tasks_executed: AtomicUsize::new(0),
             steals: AtomicUsize::new(0),
             submits: AtomicUsize::new(0),
@@ -152,6 +157,11 @@ impl Pool {
         self.n_workers
     }
 
+    /// Whether any submitted/spawned job has not finished yet.
+    pub fn has_pending(&self) -> bool {
+        self.shared.pending.load(Ordering::SeqCst) > 0
+    }
+
     pub fn stats(&self) -> PoolStats {
         PoolStats {
             workers: self.n_workers,
@@ -165,6 +175,7 @@ impl Pool {
     /// Submit one job into a batch; it starts as soon as a worker is free.
     pub fn submit(&self, batch: &Arc<Batch>, f: JobFn) {
         batch.remaining.fetch_add(1, Ordering::SeqCst);
+        self.shared.pending.fetch_add(1, Ordering::SeqCst);
         self.shared.injector.push(JobUnit { batch: batch.clone(), f });
         self.shared.submits.fetch_add(1, Ordering::Relaxed);
         self.shared.notify();
@@ -216,6 +227,7 @@ fn run_unit(unit: JobUnit, local: Option<&Worker<JobUnit>>, shared: &Shared) {
     let ctx = Ctx { batch: &unit.batch, local, shared };
     (unit.f)(&ctx);
     unit.batch.remaining.fetch_sub(1, Ordering::SeqCst);
+    shared.pending.fetch_sub(1, Ordering::SeqCst);
     shared.notify();
 }
 

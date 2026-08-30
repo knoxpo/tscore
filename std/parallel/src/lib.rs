@@ -46,11 +46,27 @@ fn pool_help(done: &dyn Fn() -> bool) {
     shared_pool().help_until(done);
 }
 
+fn pool_busy() -> bool {
+    // POOL.get(), not shared_pool(): never force pool creation just to ask.
+    POOL.get().is_some_and(|p| p.has_pending())
+}
+
 /// Install `parallel` and `runtime.cpu` globals. First call fixes the
 /// worker count for the process.
 pub fn install(realm: &mut Realm, workers: Option<usize>) {
     let n_workers = configure(workers);
     realm.idle_helper = Some(pool_help);
+    realm.pool_busy = Some(pool_busy);
+    // warm the pool off the critical path: worker threads are up before the
+    // first parallel.map instead of being spawned inside its timed region
+    // (configure() above already fixed the worker count, so no race).
+    // Once-guarded: install() also runs per scratch realm.
+    static WARM: std::sync::Once = std::sync::Once::new();
+    WARM.call_once(|| {
+        std::thread::spawn(|| {
+            let _ = shared_pool();
+        });
+    });
 
     let map = realm.add_native(|realm, args| run_parallel(realm, args, true));
     let for_ = realm.add_native(|realm, args| run_parallel(realm, args, false));

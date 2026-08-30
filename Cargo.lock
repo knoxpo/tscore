@@ -638,6 +638,9 @@ version = "0.1.0"
 [[package]]
 name = "tsc-optimizer"
 version = "0.1.0"
+dependencies = [
+ "tsc-ir",
+]
 
 [[package]]
 name = "tsc-parser"
@@ -645,6 +648,7 @@ version = "0.1.0"
 dependencies = [
  "tsc-ast",
  "tsc-ir",
+ "tsc-optimizer",
 ]
 
 [[package]]

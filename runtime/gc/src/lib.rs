@@ -31,13 +31,10 @@ impl GcStats {
     }
 }
 
-struct Marks {
-    strs: Vec<bool>,
-    objs: Vec<bool>,
-    arrs: Vec<bool>,
-    closures: Vec<bool>,
-    cells: Vec<bool>,
-    foreigns: Vec<bool>,
+/// Reset a persistent mark vector: zero what exists, extend to arena size.
+fn reset_marks(v: &mut Vec<bool>, len: usize) {
+    v.clear();
+    v.resize(len, false);
 }
 
 /// Collect the heap given its roots: the register stack and the globals.
@@ -48,15 +45,16 @@ pub fn collect<'a>(
     stats: &mut GcStats,
 ) {
     let t0 = std::time::Instant::now();
-    let mut m = Marks {
-        strs: vec![false; heap.strs.len()],
-        objs: vec![false; heap.objs.len()],
-        arrs: vec![false; heap.arrs.len()],
-        closures: vec![false; heap.closures.len()],
-        cells: vec![false; heap.cells.len()],
-        foreigns: vec![false; heap.foreigns.len()],
-    };
-    let mut work: Vec<Value> = Vec::with_capacity(stack.len() + 16);
+    // persistent scratch: no per-collection mark-vector mallocs
+    let mut m = std::mem::take(&mut heap.gc_scratch);
+    reset_marks(&mut m.strs, heap.strs.len());
+    reset_marks(&mut m.objs, heap.objs.len());
+    reset_marks(&mut m.arrs, heap.arrs.len());
+    reset_marks(&mut m.closures, heap.closures.len());
+    reset_marks(&mut m.cells, heap.cells.len());
+    reset_marks(&mut m.foreigns, heap.foreigns.len());
+    let mut work = std::mem::take(&mut m.work);
+    work.clear();
     work.extend_from_slice(stack);
     work.extend(globals.copied());
 
@@ -67,7 +65,10 @@ pub fn collect<'a>(
             }
             Kind::Object(r) => {
                 if !mark(&mut m.objs, r) {
-                    work.extend_from_slice(&heap.objs[r as usize].values);
+                    let o = &heap.objs[r as usize];
+                    let n = o.vlen().min(tsr_memory::OBJ_INLINE);
+                    work.extend_from_slice(&o.inline[..n]);
+                    work.extend_from_slice(&o.overflow);
                 }
             }
             Kind::Array(r) => {
@@ -109,40 +110,82 @@ pub fn collect<'a>(
         }
     }
 
+    // one fused pass per arena: rebuild the free list, set old bits for
+    // survivors, accumulate live bytes — instead of three separate walks
     let mut freed = 0usize;
-    freed += sweep(&m.strs, &mut heap.free_strs, |r| {
-        // Buf slots keep their buffer for reuse; drop shared refcounts
-        if let tsr_memory::HStr::Shared(_) = heap.strs[r as usize] {
-            heap.strs[r as usize] = tsr_memory::HStr::Buf(String::new());
-        } else if let tsr_memory::HStr::Buf(b) = &mut heap.strs[r as usize] {
-            b.clear();
-        }
-    });
-    freed += sweep(&m.objs, &mut heap.free_objs, |r| {
-        let o = &mut heap.objs[r as usize];
-        o.shape = tsr_memory::empty_shape();
-        o.values.clear(); // keep capacity
-    });
-    freed += sweep(&m.arrs, &mut heap.free_arrs, |r| {
-        heap.arrs[r as usize].clear(); // keep capacity: reuse avoids malloc
-    });
-    freed += sweep(&m.closures, &mut heap.free_closures, |r| {
-        heap.closures[r as usize].upvals.clear();
-    });
-    freed += sweep(&m.cells, &mut heap.free_cells, |r| {
-        heap.cells[r as usize] = Value::UNDEFINED;
-    });
-    freed += sweep(&m.foreigns, &mut heap.free_foreigns, |r| {
-        // unobserved rejection dies here: surface it before dropping
-        if let Foreign::Promise(p) = &heap.foreigns[r as usize] {
-            if let PromiseState::Rejected(e) = &p.state {
-                if p.reactions.is_empty() && !e.cancelled {
-                    eprintln!("warning: unhandled promise rejection: {}", e.msg);
+    let mut live_bytes = 0usize;
+    macro_rules! fused_sweep {
+        ($marks:expr, $free:ident, $gen:ident, $bytes:expr, $clear:expr) => {{
+            heap.$free.clear();
+            heap.$gen.old.clear_all();
+            heap.$gen.dirty.clear_all();
+            heap.$gen.young.clear();
+            for (i, &alive) in $marks.iter().enumerate() {
+                let r = i as Ref;
+                if alive {
+                    heap.$gen.old.set(r);
+                    let b: &dyn Fn(&Heap, Ref) -> usize = &$bytes;
+                    live_bytes += b(&heap, r);
+                } else {
+                    let c: &mut dyn FnMut(&mut Heap, Ref) = &mut $clear;
+                    c(heap, r);
+                    heap.$free.push(r);
+                    freed += 1;
                 }
             }
-        }
-        heap.foreigns[r as usize] = Foreign::Free;
-    });
+        }};
+    }
+    fused_sweep!(m.strs, free_strs, gen_strs,
+        |h: &Heap, r: Ref| 24 + h.strs[r as usize].as_str().len(),
+        |h: &mut Heap, r: Ref| {
+            if let tsr_memory::HStr::Shared(_) = h.strs[r as usize] {
+                h.strs[r as usize] = tsr_memory::HStr::Buf(String::new());
+            } else if let tsr_memory::HStr::Buf(b) = &mut h.strs[r as usize] {
+                b.clear();
+                if b.capacity() > 1024 {
+                    b.shrink_to(64); // don't hoard giant buffers
+                }
+            }
+        });
+    fused_sweep!(m.objs, free_objs, gen_objs,
+        |h: &Heap, r: Ref| 72 + h.objs[r as usize].overflow.len() * 8,
+        |h: &mut Heap, r: Ref| {
+            let o = &mut h.objs[r as usize];
+            o.shape = tsr_memory::empty_shape();
+            o.clear_vals(); // keeps overflow capacity
+        });
+    fused_sweep!(m.arrs, free_arrs, gen_arrs,
+        |h: &Heap, r: Ref| 32 + h.arrs[r as usize].len() * 8,
+        |h: &mut Heap, r: Ref| {
+            let v = &mut h.arrs[r as usize];
+            v.clear(); // keep capacity: reuse avoids malloc
+            if v.capacity() > 1024 {
+                v.shrink_to(64);
+            }
+        });
+    fused_sweep!(m.closures, free_closures, gen_closures,
+        |h: &Heap, r: Ref| 32 + h.closures[r as usize].upvals.len() * 8,
+        |h: &mut Heap, r: Ref| {
+            h.closures[r as usize].upvals.clear();
+        });
+    fused_sweep!(m.cells, free_cells, gen_cells,
+        |_h: &Heap, _r: Ref| 8,
+        |h: &mut Heap, r: Ref| {
+            h.cells[r as usize] = Value::UNDEFINED;
+        });
+    fused_sweep!(m.foreigns, free_foreigns, gen_foreigns,
+        |_h: &Heap, _r: Ref| 96,
+        |h: &mut Heap, r: Ref| {
+            // unobserved rejection dies here: surface it before dropping
+            if let Foreign::Promise(p) = &h.foreigns[r as usize] {
+                if let PromiseState::Rejected(e) = &p.state {
+                    if p.reactions.is_empty() && !e.cancelled {
+                        eprintln!("warning: unhandled promise rejection: {}", e.msg);
+                    }
+                }
+            }
+            h.foreigns[r as usize] = Foreign::Free;
+        });
 
     let total = heap.strs.len()
         + heap.objs.len()
@@ -153,27 +196,41 @@ pub fn collect<'a>(
     stats.major_collections += 1;
     stats.last_freed = freed;
     stats.last_live = total - freed;
-    stats.last_live_bytes = approx_live_bytes(heap, &m);
+    stats.last_live_bytes = live_bytes;
 
-    // sticky-generational major reset: everything live becomes old
-    set_old_from_marks(&mut heap.gen_strs, &m.strs);
-    set_old_from_marks(&mut heap.gen_objs, &m.objs);
-    set_old_from_marks(&mut heap.gen_arrs, &m.arrs);
-    set_old_from_marks(&mut heap.gen_closures, &m.closures);
-    set_old_from_marks(&mut heap.gen_cells, &m.cells);
-    set_old_from_marks(&mut heap.gen_foreigns, &m.foreigns);
     heap.remembered.clear();
     heap.promoted_since_major = 0;
     heap.promoted_bytes_since_major = 0;
 
     heap.allocs_since_gc = 0;
+    // heap-proportional trigger: workloads whose live set genuinely grows
+    // (gc_churn's history chain) would otherwise pay a full trace every
+    // fixed 256k allocations — O(live^2) total GC work
+    heap.gc_threshold = (1 << 18).max(stats.last_live / 2);
+    m.work = work;
+    heap.gc_scratch = m;
+    if std::env::var_os("TSC_GC_DEBUG").is_some() {
+        eprintln!(
+            "[gc] MAJOR freed={} live={} arena={} free_objs={} free_arrs={}",
+            stats.last_freed,
+            stats.last_live,
+            heap.objs.len() + heap.arrs.len(),
+            heap.free_objs.len(),
+            heap.free_arrs.len()
+        );
+    }
     stats.record_pause(t0);
 }
 
 /// Push v's outgoing edges onto the worklist (shared by minor tracing).
 fn push_children(heap: &Heap, v: Value, work: &mut Vec<Value>) {
     match v.kind() {
-        Kind::Object(r) => work.extend_from_slice(&heap.objs[r as usize].values),
+        Kind::Object(r) => {
+            let o = &heap.objs[r as usize];
+            let n = o.vlen().min(tsr_memory::OBJ_INLINE);
+            work.extend_from_slice(&o.inline[..n]);
+            work.extend_from_slice(&o.overflow);
+        }
         Kind::Array(r) => work.extend_from_slice(&heap.arrs[r as usize]),
         Kind::Closure(r) => {
             work.extend_from_slice(&heap.closures[r as usize].upvals)
@@ -208,27 +265,19 @@ pub fn collect_minor<'a>(
     globals: impl Iterator<Item = &'a Value>,
     stats: &mut GcStats,
 ) {
-    use tsr_memory::Bitmap;
     let t0 = std::time::Instant::now();
 
-    struct YoungMarks {
-        strs: Bitmap,
-        objs: Bitmap,
-        arrs: Bitmap,
-        closures: Bitmap,
-        cells: Bitmap,
-        foreigns: Bitmap,
-    }
-    let mut m = YoungMarks {
-        strs: Bitmap::default(),
-        objs: Bitmap::default(),
-        arrs: Bitmap::default(),
-        closures: Bitmap::default(),
-        cells: Bitmap::default(),
-        foreigns: Bitmap::default(),
-    };
+    // persistent minor-mark bitmaps + worklist (no per-collection mallocs)
+    let mut m = std::mem::take(&mut heap.gc_scratch);
+    m.ystrs.clear_all();
+    m.yobjs.clear_all();
+    m.yarrs.clear_all();
+    m.yclosures.clear_all();
+    m.ycells.clear_all();
+    m.yforeigns.clear_all();
 
-    let mut work: Vec<Value> = Vec::with_capacity(stack.len() + 64);
+    let mut work = std::mem::take(&mut m.work);
+    work.clear();
     work.extend_from_slice(stack);
     work.extend(globals.copied());
     // remembered old containers: trace their children, not themselves
@@ -240,12 +289,12 @@ pub fn collect_minor<'a>(
 
     while let Some(v) = work.pop() {
         let (gen, marks, r) = match v.kind() {
-            Kind::Str(r) => (&heap.gen_strs, &mut m.strs, r),
-            Kind::Object(r) => (&heap.gen_objs, &mut m.objs, r),
-            Kind::Array(r) => (&heap.gen_arrs, &mut m.arrs, r),
-            Kind::Closure(r) => (&heap.gen_closures, &mut m.closures, r),
-            Kind::Cell(r) => (&heap.gen_cells, &mut m.cells, r),
-            Kind::Foreign(r) => (&heap.gen_foreigns, &mut m.foreigns, r),
+            Kind::Str(r) => (&heap.gen_strs, &mut m.ystrs, r),
+            Kind::Object(r) => (&heap.gen_objs, &mut m.yobjs, r),
+            Kind::Array(r) => (&heap.gen_arrs, &mut m.yarrs, r),
+            Kind::Closure(r) => (&heap.gen_closures, &mut m.yclosures, r),
+            Kind::Cell(r) => (&heap.gen_cells, &mut m.ycells, r),
+            Kind::Foreign(r) => (&heap.gen_foreigns, &mut m.yforeigns, r),
             _ => continue,
         };
         if gen.old.get(r) || marks.get(r) {
@@ -276,28 +325,35 @@ pub fn collect_minor<'a>(
             }
         }};
     }
-    sweep_young!(gen_strs, m.strs, free_strs, |h: &mut Heap, r| {
+    sweep_young!(gen_strs, m.ystrs, free_strs, |h: &mut Heap, r| {
         if let tsr_memory::HStr::Shared(_) = h.strs[r as usize] {
             h.strs[r as usize] = tsr_memory::HStr::Buf(String::new());
         } else if let tsr_memory::HStr::Buf(b) = &mut h.strs[r as usize] {
             b.clear();
+            if b.capacity() > 1024 {
+                b.shrink_to(64);
+            }
         }
     });
-    sweep_young!(gen_objs, m.objs, free_objs, |h: &mut Heap, r| {
+    sweep_young!(gen_objs, m.yobjs, free_objs, |h: &mut Heap, r| {
         let o = &mut h.objs[r as usize];
         o.shape = tsr_memory::empty_shape();
-        o.values.clear();
+        o.clear_vals();
     });
-    sweep_young!(gen_arrs, m.arrs, free_arrs, |h: &mut Heap, r| {
-        h.arrs[r as usize].clear();
+    sweep_young!(gen_arrs, m.yarrs, free_arrs, |h: &mut Heap, r| {
+        let v = &mut h.arrs[r as usize];
+        v.clear();
+        if v.capacity() > 1024 {
+            v.shrink_to(64);
+        }
     });
-    sweep_young!(gen_closures, m.closures, free_closures, |h: &mut Heap, r| {
+    sweep_young!(gen_closures, m.yclosures, free_closures, |h: &mut Heap, r| {
         h.closures[r as usize].upvals.clear();
     });
-    sweep_young!(gen_cells, m.cells, free_cells, |h: &mut Heap, r| {
+    sweep_young!(gen_cells, m.ycells, free_cells, |h: &mut Heap, r| {
         h.cells[r as usize] = Value::UNDEFINED;
     });
-    sweep_young!(gen_foreigns, m.foreigns, free_foreigns, |h: &mut Heap, r| {
+    sweep_young!(gen_foreigns, m.yforeigns, free_foreigns, |h: &mut Heap, r| {
         if let Foreign::Promise(p) = &h.foreigns[r as usize] {
             if let PromiseState::Rejected(e) = &p.state {
                 if p.reactions.is_empty() && !e.cancelled {
@@ -322,8 +378,18 @@ pub fn collect_minor<'a>(
     heap.promoted_since_major += promoted;
     heap.promoted_bytes_since_major += promoted_bytes;
     heap.allocs_since_gc = 0;
+    m.work = work;
+    heap.gc_scratch = m;
     stats.minor_collections += 1;
     stats.last_freed = freed;
+    if std::env::var_os("TSC_GC_DEBUG").is_some() {
+        eprintln!(
+            "[gc] minor freed={freed} promoted={promoted} arena={} free_objs={} free_arrs={}",
+            heap.objs.len() + heap.arrs.len(),
+            heap.free_objs.len(),
+            heap.free_arrs.len()
+        );
+    }
     stats.record_pause(t0);
 }
 
@@ -331,7 +397,7 @@ fn slot_bytes(heap: &Heap, arena: &str, r: tsr_memory::Ref) -> usize {
     let i = r as usize;
     match arena {
         "gen_strs" => 24 + heap.strs[i].as_str().len(),
-        "gen_objs" => 32 + heap.objs[i].values.len() * 8,
+        "gen_objs" => 72 + heap.objs[i].overflow.len() * 8,
         "gen_arrs" => 32 + heap.arrs[i].len() * 8,
         "gen_closures" => 32 + heap.closures[i].upvals.len() * 8,
         "gen_cells" => 8,
@@ -343,65 +409,10 @@ fn stats_remembered_peak(heap: &mut Heap, n: usize) {
     heap.remembered_peak = heap.remembered_peak.max(n);
 }
 
-fn set_old_from_marks(gen: &mut tsr_memory::GenState, marks: &[bool]) {
-    gen.old.clear_all();
-    gen.dirty.clear_all();
-    for (i, &alive) in marks.iter().enumerate() {
-        if alive {
-            gen.old.set(i as tsr_memory::Ref);
-        }
-    }
-    gen.young.clear();
-}
-
-/// Rough live-byte estimate, computed while everything is already paged
-/// in from the mark phase. Documented approximation.
-fn approx_live_bytes(heap: &Heap, m: &Marks) -> usize {
-    let mut bytes = 0usize;
-    for (i, alive) in m.strs.iter().enumerate() {
-        if *alive {
-            bytes += 24 + heap.strs[i].as_str().len();
-        }
-    }
-    for (i, alive) in m.objs.iter().enumerate() {
-        if *alive {
-            bytes += 32 + heap.objs[i].values.len() * 8;
-        }
-    }
-    for (i, alive) in m.arrs.iter().enumerate() {
-        if *alive {
-            bytes += 32 + heap.arrs[i].len() * 8;
-        }
-    }
-    for (i, alive) in m.closures.iter().enumerate() {
-        if *alive {
-            bytes += 32 + heap.closures[i].upvals.len() * 8;
-        }
-    }
-    bytes += m.cells.iter().filter(|a| **a).count() * 8;
-    bytes += m.foreigns.iter().filter(|a| **a).count() * 96;
-    bytes
-}
-
 fn mark(bits: &mut [bool], r: Ref) -> bool {
     let was = bits[r as usize];
     bits[r as usize] = true;
     was
-}
-
-/// Rebuild one arena's free list from its mark bits; clears dead slots so
-/// dropped payloads (strings, arrays) release memory now.
-fn sweep(marks: &[bool], free: &mut Vec<Ref>, mut clear: impl FnMut(Ref)) -> usize {
-    free.clear();
-    let mut freed = 0;
-    for (i, &alive) in marks.iter().enumerate() {
-        if !alive {
-            clear(i as Ref);
-            free.push(i as Ref);
-            freed += 1;
-        }
-    }
-    freed
 }
 
 #[cfg(test)]

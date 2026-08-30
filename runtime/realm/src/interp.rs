@@ -81,8 +81,11 @@ pub fn drive(realm: &mut Realm, main_promise: tsr_memory::Ref) -> Result<Value, 
                     ));
                 }
                 // help the pool while waiting (a zero-thread pool would
-                // otherwise never run the jobs we're waiting on)
-                if let Some(help) = realm.idle_helper {
+                // otherwise never run the jobs we're waiting on); when the
+                // pool is idle (timers only), block on the wake channel
+                // directly — help_until's 200µs park would add latency
+                let busy = realm.pool_busy.map_or(true, |f| f());
+                if let (Some(help), true) = (realm.idle_helper, busy) {
                     help(&|| !rx.is_empty());
                     while let Ok(wake) = rx.try_recv() {
                         process_wake(realm, wake);
@@ -113,25 +116,29 @@ fn process_wake(realm: &mut Realm, wake: crate::Wake) {
 /// Start an async function whose argument window is already populated at
 /// `base`. Runs the body synchronously to its first await; returns the
 /// promise (foreign ref) it will settle.
-#[cold]
 pub fn start_async(
     realm: &mut Realm,
     closure: Option<tsr_memory::Ref>,
     proto: Arc<FunctionProto>,
     base: usize,
 ) -> tsr_memory::Ref {
-    let promise = realm.heap.alloc_promise();
-    // the promise is otherwise unreachable while the body runs — a GC at
-    // any safepoint inside would free it
-    realm.pinned.insert(promise);
-    match run_frame(realm, closure, &proto, base, 0, 0) {
-        Ok(FrameResult::Return(v)) => settle(realm, promise, Ok(v)),
-        Err(e) => settle(
-            realm,
-            promise,
-            Err(PromiseError { msg: e.msg, cancelled: e.cancelled, span: e.span }),
-        ),
+    // run the body first: if it never suspends (the common case), the
+    // promise is born settled — no pinning, no settle walk, no
+    // pending->fulfilled transition
+    match run_frame_tiered(realm, closure, &proto, base, 0, 0) {
+        Ok(FrameResult::Return(v)) => realm.heap.alloc_foreign(Foreign::Promise(
+            tsr_memory::Promise { state: PromiseState::Fulfilled(v), reactions: Vec::new() },
+        )),
+        Err(e) => realm.heap.alloc_foreign(Foreign::Promise(tsr_memory::Promise {
+            state: PromiseState::Rejected(PromiseError {
+                msg: e.msg,
+                cancelled: e.cancelled,
+                span: e.span,
+            }),
+            reactions: Vec::new(),
+        })),
         Ok(FrameResult::Await { awaited, dst, resume_pc }) => {
+            let promise = realm.heap.alloc_promise();
             let regs = realm.stack[base..base + proto.n_regs as usize].to_vec();
             let co = realm.heap.alloc_foreign(Foreign::Coroutine(Coroutine {
                 closure,
@@ -143,10 +150,73 @@ pub fn start_async(
             }));
             realm.heap.barrier_foreign(awaited);
             realm.heap.promise_mut(awaited).reactions.push(co);
+            promise
         }
     }
-    realm.pinned.remove(&promise);
-    promise
+}
+
+/// `TSC_NO_AWAIT_FUSE=1` disables await-of-call fusion (escape hatch).
+fn await_fuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TSC_NO_AWAIT_FUSE").is_none())
+}
+
+/// Fused `await f()`: run the async body without materializing a promise;
+/// allocate promise + coroutine only if it actually suspends. Errors
+/// propagate directly — the unfused path would settle-then-rethrow at the
+/// following Await anyway.
+fn start_async_fused(
+    realm: &mut Realm,
+    closure: Option<tsr_memory::Ref>,
+    proto: Arc<FunctionProto>,
+    base: usize,
+) -> Result<Value, RtError> {
+    match run_frame_tiered(realm, closure, &proto, base, 0, 0)? {
+        FrameResult::Return(v) => Ok(v),
+        FrameResult::Await { awaited, dst, resume_pc } => {
+            // no safepoint between these allocs and the reactions push, so
+            // the fresh promise/coroutine can't be collected out from under us
+            let promise = realm.heap.alloc_promise();
+            let regs = realm.stack[base..base + proto.n_regs as usize].to_vec();
+            let co = realm.heap.alloc_foreign(Foreign::Coroutine(Coroutine {
+                closure,
+                proto,
+                regs,
+                resume_pc,
+                dst,
+                promise,
+            }));
+            realm.heap.barrier_foreign(awaited);
+            realm.heap.promise_mut(awaited).reactions.push(co);
+            Ok(Value::foreign(promise))
+        }
+    }
+}
+
+/// Try the compiled entry for a frame start (async bodies included:
+/// Tier-2 lowers Await to a bail-out), else interpret. `start_pc != 0`
+/// resumes mid-frame — interpreter only (OSR re-enters native at the next
+/// back-edge).
+fn run_frame_tiered(
+    realm: &mut Realm,
+    closure: Option<tsr_memory::Ref>,
+    proto: &FunctionProto,
+    base: usize,
+    depth: u32,
+    start_pc: usize,
+) -> Result<FrameResult, RtError> {
+    if realm.jit_enabled && start_pc == 0 {
+        if proto.jit.tier.load(std::sync::atomic::Ordering::Relaxed) == tsc_ir::TIER_COLD {
+            for i in 0..(proto.arity as usize).min(8) {
+                let class = if realm.stack[base + i].is_number() { 1 } else { 2 };
+                proto.jit.arg_seen[i].fetch_or(class, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if let Some(f) = crate::jit::tier_up(proto) {
+            return crate::jit::enter_jit_frame(realm, f, proto, base, closure, depth);
+        }
+    }
+    run_frame(realm, closure, proto, base, depth, start_pc)
 }
 
 /// Resume a suspended coroutine (its awaited value is already in
@@ -295,7 +365,7 @@ macro_rules! cmp_eval {
         if $b.is_number() && $c.is_number() {
             $nf(&$b.as_number(), &$c.as_number())
         } else if let (Some(x), Some(y)) = ($b.as_str_ref(), $c.as_str_ref()) {
-            $sf(&*$realm.heap.str_at(x).clone(), &*$realm.heap.str_at(y).clone())
+            $sf($realm.heap.str_at(x), $realm.heap.str_at(y))
         } else {
             return Err(err($proto, $pc, format!(
                 "cannot compare {} and {}", $b.type_of(), $c.type_of())));
@@ -348,7 +418,7 @@ fn at(mut e: RtError, proto: &FunctionProto, pc: usize) -> RtError {
 fn const_str(proto: &FunctionProto, idx: usize) -> &str {
     match &proto.consts[idx] {
         Const::Str(s) => s,
-        Const::Number(_) => "",
+        _ => "",
     }
 }
 
@@ -356,6 +426,7 @@ fn const_str_arc(proto: &FunctionProto, idx: usize) -> Arc<str> {
     match &proto.consts[idx] {
         Const::Str(s) => s.clone(),
         Const::Number(n) => Arc::from(tsr_memory::fmt_number(*n)),
+        Const::Keys(_) => Arc::from(""),
     }
 }
 
@@ -368,7 +439,7 @@ pub const MAX_CALL_DEPTH: u32 = 10_000;
 pub fn run_one(
     realm: &mut Realm,
     closure: Option<tsr_memory::Ref>,
-    proto: &Arc<FunctionProto>,
+    proto: &FunctionProto,
     base: usize,
     depth: u32,
 ) -> Result<Value, RtError> {
@@ -394,7 +465,7 @@ pub fn run_one(
 pub fn run_frame_pub(
     realm: &mut Realm,
     closure: Option<tsr_memory::Ref>,
-    proto: &Arc<FunctionProto>,
+    proto: &FunctionProto,
     base: usize,
     depth: u32,
     start_pc: usize,
@@ -417,7 +488,7 @@ pub enum FrameResult {
 fn run_frame(
     realm: &mut Realm,
     closure: Option<tsr_memory::Ref>,
-    proto: &Arc<FunctionProto>,
+    proto: &FunctionProto,
     base: usize,
     depth: u32,
     start_pc: usize,
@@ -435,6 +506,7 @@ fn run_frame(
                         let s = s.clone();
                         Value::str_ref(realm.heap.alloc_str(s))
                     }
+                    Const::Keys(_) => Value::UNDEFINED,
                 };
                 set_reg!(realm, a, v);
             }
@@ -534,7 +606,7 @@ fn run_frame(
                     // (slot-resident registers make any header enterable).
                     // Fast path is one load + one store; u32::MAX marks
                     // permanently rejected protos.
-                    if realm.jit_enabled && !proto.is_async {
+                    if realm.jit_enabled {
                         use std::sync::atomic::Ordering::Relaxed;
                         let be = proto.jit.backedges.load(Relaxed);
                         if be != u32::MAX {
@@ -543,10 +615,9 @@ fn run_frame(
                                 if let Some(f) = crate::jit::osr_slow(proto) {
                                     let target =
                                         (pc as i64 + ins.sbx() as i64 + 1) as usize;
-                                    let v = crate::jit::enter_osr(
+                                    return crate::jit::enter_osr(
                                         realm, f, proto, base, closure, depth, target,
-                                    )?;
-                                    return Ok(FrameResult::Return(v));
+                                    );
                                 }
                             }
                         }
@@ -574,7 +645,11 @@ fn run_frame(
                         return Err(err(proto, pc,
                             "stack overflow: maximum call depth exceeded".into()));
                     }
-                    let callee = realm.heap.closure(c).proto.clone();
+                    // no Arc clone on the hot path: the proto's target
+                    // never moves (only the Arc handle lives in the arena),
+                    // and the callee closure is rooted via stack[a]
+                    let callee: &FunctionProto =
+                        unsafe { &*Arc::as_ptr(&realm.heap.closure(c).proto) };
                     let new_base = a + 1;
                     let need = new_base + callee.n_regs as usize;
                     if realm.stack.len() < need {
@@ -587,10 +662,25 @@ fn run_frame(
                         set_reg!(realm, new_base + r, Value::UNDEFINED);
                     }
                     let result = if callee.is_async {
-                        Value::foreign(start_async(realm, Some(c), callee, new_base))
+                        // async path owns the proto (coroutine may outlive
+                        // the frame): clone here, off the sync hot path
+                        let callee = realm.heap.closure(c).proto.clone();
+                        // `await f()` fusion: when the very next op awaits
+                        // this result, skip the promise unless the body
+                        // actually suspends (await of a plain value is
+                        // identity, so the Await op passes it through)
+                        let fused = await_fuse_enabled()
+                            && matches!(proto.code.get(pc + 1),
+                                Some(n) if n.op == Op::Await && n.a == ins.a);
+                        if fused {
+                            start_async_fused(realm, Some(c), callee, new_base)
+                                .map_err(|e| at(e, proto, pc))?
+                        } else {
+                            Value::foreign(start_async(realm, Some(c), callee, new_base))
+                        }
                     } else {
                         // run_one tiers up to JIT when the callee is hot
-                        run_one(realm, Some(c), &callee, new_base, depth + 1)?
+                        run_one(realm, Some(c), callee, new_base, depth + 1)?
                     };
                     set_reg!(realm, a, result);
                 } else if let Kind::Native(i) = f.kind() {
@@ -722,6 +812,26 @@ fn run_frame(
                 let r = realm.heap.alloc_arr_empty(ins.b as usize);
                 set_reg!(realm, a, Value::array(r));
             }
+            Op::NewObjectLit => {
+                let shape = crate::jit::lit_shape(proto, pc, ins.c as usize);
+                let first = base + ins.b as usize;
+                let n = shape.fields.len();
+                let r = {
+                    let vals = &realm.stack[first..first + n];
+                    // fresh object is young: no barriers needed
+                    realm.heap.alloc_obj_lit(shape, vals)
+                };
+                set_reg!(realm, a, Value::object(r));
+            }
+            Op::NewArrayLit => {
+                let first = base + ins.b as usize;
+                let n = ins.c as usize;
+                let r = {
+                    let vals = &realm.stack[first..first + n];
+                    realm.heap.alloc_arr_lit(vals)
+                };
+                set_reg!(realm, a, Value::array(r));
+            }
             Op::GetField => {
                 let obj = reg!(realm, base + ins.b as usize);
                 if let Some(o) = obj.as_object() {
@@ -729,13 +839,13 @@ fn run_frame(
                     let sid = objref.shape.id;
                     let ic = proto.jit.ic_load(proto.code.len(), pc);
                     let v = if ic != 0 && (ic >> 32) as u32 == sid {
-                        objref.values[(ic & 0xFFFF_FFFF) as usize - 1]
+                        objref.val((ic & 0xFFFF_FFFF) as usize - 1)
                     } else {
                         let name = const_str(proto, ins.c as usize);
                         match objref.shape.slot_of(name) {
                             Some(i) => {
                                 proto.jit.ic_store(proto.code.len(), pc, sid, i);
-                                objref.values[i]
+                                objref.val(i)
                             }
                             None => Value::UNDEFINED,
                         }
@@ -756,13 +866,13 @@ fn run_frame(
                         let sid = objref.shape.id;
                         let ic = proto.jit.ic_load(proto.code.len(), pc);
                         if ic != 0 && (ic >> 32) as u32 == sid {
-                            objref.values[(ic & 0xFFFF_FFFF) as usize - 1] = v;
+                            objref.set_val((ic & 0xFFFF_FFFF) as usize - 1, v);
                         } else {
                             let name = const_str(proto, ins.b as usize);
                             match objref.shape.slot_of(name) {
                                 Some(i) => {
                                     proto.jit.ic_store(proto.code.len(), pc, sid, i);
-                                    objref.values[i] = v;
+                                    objref.set_val(i, v);
                                 }
                                 None => crate::jit::set_field_add(
                                     proto,

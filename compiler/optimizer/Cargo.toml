@@ -1,8 +1,9 @@
 [package]
 name = "tsc-optimizer"
-description = "Bytecode/IR optimizer (stub until M5)"
+description = "Emit-time bytecode optimizer: copy-prop, dead-store elim, loop-invariant const hoisting"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tsc-ir.workspace = true

@@ -27,13 +27,26 @@ impl CompileError {
 }
 
 pub fn compile(source: &str, source_name: &str) -> Result<Chunk, CompileError> {
+    let phases = std::env::var_os("TSC_COMPILE_PHASES").is_some();
+    let t0 = std::time::Instant::now();
     let allocator = Allocator::default();
     let program = tsc_ast::parse(&allocator, source).map_err(|errs| {
         let e = &errs[0];
         CompileError { msg: format!("parse error: {}", e.msg), span_start: e.span_start }
     })?;
+    let t1 = std::time::Instant::now();
     let (captured, mutated) = resolve::Resolver::run(&program);
-    emit::Emitter::compile(&program, captured, mutated, source_name)
+    let t2 = std::time::Instant::now();
+    let out = emit::Emitter::compile(&program, captured, mutated, source_name);
+    if phases {
+        eprintln!(
+            "[compile] parse={:?} resolve={:?} emit={:?}",
+            t1 - t0,
+            t2 - t1,
+            t2.elapsed()
+        );
+    }
+    out
 }
 
 #[cfg(test)]

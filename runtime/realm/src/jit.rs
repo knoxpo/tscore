@@ -36,7 +36,31 @@ fn err_at(proto: &FunctionProto, pc: usize, msg: String) -> RtError {
 /// add-field site; shapes are process-global so cross-thread is fine).
 pub(crate) struct TransIc {
     pub old_sid: u32,
-    pub shape: std::sync::Arc<tsr_memory::ShapeData>,
+    pub shape: &'static tsr_memory::ShapeData,
+}
+
+/// Final shape for a NewObjectLit site: per-pc cache (tics slot holds the
+/// `&'static ShapeData` directly), cold path walks the transition chain.
+/// A store race is benign — with_field dedups, both walkers get the same
+/// static pointer.
+pub(crate) fn lit_shape(
+    pr: &FunctionProto,
+    pc: usize,
+    cidx: usize,
+) -> &'static tsr_memory::ShapeData {
+    let tic = pr.jit.tic_load(pr.code.len(), pc);
+    if !tic.is_null() {
+        return unsafe { &*(tic as *const tsr_memory::ShapeData) };
+    }
+    let Const::Keys(keys) = &pr.consts[cidx] else {
+        unreachable!("NewObjectLit const is Keys")
+    };
+    let mut s = tsr_memory::empty_shape();
+    for k in keys.iter() {
+        s = s.with_field(k.clone());
+    }
+    let _ = pr.jit.tic_store(pr.code.len(), pc, s as *const _ as *mut u8);
+    s
 }
 
 /// Add-field SetField: shape transition via the per-pc cache when the
@@ -54,20 +78,20 @@ pub(crate) fn set_field_add(
     if !tic.is_null() {
         let e = unsafe { &*(tic as *const TransIc) };
         if e.old_sid == sid {
-            obj.shape = e.shape.clone();
-            obj.values.push(v);
+            obj.shape = e.shape;
+            obj.push_val(v);
             return;
         }
     }
     let ns = obj.shape.with_field(name());
     if tic.is_null() {
-        let b = Box::into_raw(Box::new(TransIc { old_sid: sid, shape: ns.clone() })) as *mut u8;
+        let b = Box::into_raw(Box::new(TransIc { old_sid: sid, shape: ns })) as *mut u8;
         if !pr.jit.tic_store(pr.code.len(), pc, b) {
             drop(unsafe { Box::from_raw(b as *mut TransIc) });
         }
     }
     obj.shape = ns;
-    obj.values.push(v);
+    obj.push_val(v);
 }
 
 extern "C" fn h_stack_ptr(p: *mut core::ffi::c_void) -> JitRet {
@@ -80,6 +104,55 @@ extern "C" fn h_safepoint(p: *mut core::ffi::c_void) -> JitRet {
     match r.safepoint() {
         Ok(()) => ok(r, 0),
         Err(e) => fail(r, e),
+    }
+}
+
+/// Per-pc direct-call cache: monomorphic callee with compiled code.
+/// repr(C): the JIT loads fields at fixed offsets (0/8/16/24/28).
+#[repr(C)]
+pub(crate) struct CallIc {
+    /// Raw Arc word as stored in the closure slot (identity guard).
+    pub proto_word: u64,
+    /// &FunctionProto data pointer.
+    pub proto_data: u64,
+    /// Compiled entry (tier at fill time; stale-but-valid after re-tiering).
+    pub code: u64,
+    pub arity: u32,
+    pub n_regs: u32,
+}
+
+/// Finish a direct call whose callee returned nonzero (deopt or error).
+extern "C" fn h_call_resume(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    ret_val: u64,
+    ret_stack: u64,
+    new_base_bytes: u64,
+    closure: u32,
+    depth: u32,
+) -> JitRet {
+    let r = realm(p);
+    let pr = proto(pp);
+    let base = (new_base_bytes / 8) as usize;
+    match ret_val {
+        2 => {
+            let deopts = pr.jit.deopts.fetch_add(1, Relaxed) + 1;
+            if deopts >= 10 && pr.jit.tier.load(Relaxed) == TIER_OPT {
+                compile_tier1(pr);
+            }
+            let resume_pc = ret_stack as usize;
+            match crate::interp::run_frame_pub(r, Some(closure), pr, base, depth, resume_pc) {
+                Ok(crate::interp::FrameResult::Return(v)) => {
+                    JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 }
+                }
+                Ok(crate::interp::FrameResult::Await { .. }) => {
+                    fail(r, RtError::new("internal: await in direct sync call"))
+                }
+                Err(e) => fail(r, e),
+            }
+        }
+        // 1: error — jit_error is already set by the callee
+        _ => JitRet { val: JIT_ERR_SENTINEL, stack: r.stack.as_mut_ptr() as u64 },
     }
 }
 
@@ -105,7 +178,9 @@ extern "C" fn h_call(
             if depth >= crate::interp::MAX_CALL_DEPTH {
                 return Err(err_at(pr, pc, "stack overflow: maximum call depth exceeded".into()));
             }
-            let callee = r.heap.closure(c).proto.clone();
+            // no Arc clone on the hot path (see interp Op::Call)
+            let callee: &FunctionProto =
+                unsafe { &*Arc::as_ptr(&r.heap.closure(c).proto) };
             let new_base = abs_a + 1;
             let need = new_base + callee.n_regs as usize;
             if r.stack.len() < need {
@@ -115,10 +190,32 @@ extern "C" fn h_call(
                 r.stack[new_base + reg] = Value::UNDEFINED;
             }
             if callee.is_async {
+                let callee = r.heap.closure(c).proto.clone();
                 let pr_ref = start_async(r, Some(c), callee, new_base);
                 return Ok(Value::foreign(pr_ref));
             }
-            crate::interp::run_one(r, Some(c), &callee, new_base, depth + 1)
+            // direct-call IC: cache (proto identity -> compiled entry) so
+            // the JIT can skip this helper entirely on the next call
+            let code_ptr = callee.jit.code.load(Acquire);
+            if !code_ptr.is_null()
+                && callee.arity as usize == argc
+                && pr.jit.tic_load(pr.code.len(), pc).is_null()
+            {
+                let proto_word = unsafe {
+                    *(&r.heap.closure(c).proto as *const Arc<FunctionProto> as *const u64)
+                };
+                let ic = Box::into_raw(Box::new(CallIc {
+                    proto_word,
+                    proto_data: callee as *const FunctionProto as u64,
+                    code: code_ptr as u64,
+                    arity: callee.arity as u32,
+                    n_regs: callee.n_regs as u32,
+                })) as *mut u8;
+                if !pr.jit.tic_store(pr.code.len(), pc, ic) {
+                    drop(unsafe { Box::from_raw(ic as *mut CallIc) });
+                }
+            }
+            crate::interp::run_one(r, Some(c), callee, new_base, depth + 1)
         } else if let Kind::Native(i) = f.kind() {
             let native = r.natives[i as usize].clone();
             // args on the Rust stack: no per-call heap alloc (hot path for
@@ -215,7 +312,7 @@ fn step(
             let r = if b.is_number() && c.is_number() {
                 $nf(&b.as_number(), &c.as_number())
             } else if let (Some(x), Some(y)) = (b.as_str_ref(), c.as_str_ref()) {
-                $sf(&*realm.heap.str_at(x).clone(), &*realm.heap.str_at(y).clone())
+                $sf(realm.heap.str_at(x), realm.heap.str_at(y))
             } else {
                 return Err(e(format!(
                     "cannot compare {} and {}",
@@ -235,6 +332,7 @@ fn step(
                     let s = s.clone();
                     Value::str_ref(realm.heap.alloc_str(s))
                 }
+                Const::Keys(_) => Value::UNDEFINED,
             };
             realm.stack[a] = v;
             Ok(0)
@@ -425,11 +523,27 @@ fn step(
             realm.stack[a] = Value::array(r);
             Ok(0)
         }
+        Op::NewObjectLit => {
+            let shape = lit_shape(proto, pc, ins.c as usize);
+            let first = base + ins.b as usize;
+            let n = shape.fields.len();
+            let r = realm.heap.alloc_obj_lit(shape, &realm.stack[first..first + n]);
+            realm.stack[a] = Value::object(r);
+            Ok(0)
+        }
+        Op::NewArrayLit => {
+            let first = base + ins.b as usize;
+            let n = ins.c as usize;
+            let r = realm.heap.alloc_arr_lit(&realm.stack[first..first + n]);
+            realm.stack[a] = Value::array(r);
+            Ok(0)
+        }
         Op::GetField => {
             let obj = rb(realm);
             let name = match &proto.consts[ins.c as usize] {
                 Const::Str(s) => s.clone(),
                 Const::Number(n) => Arc::from(tsr_memory::fmt_number(*n)),
+                Const::Keys(_) => Arc::from(""),
             };
             let v = get_field(realm, obj, &name).map_err(|er| e(er.msg))?;
             realm.stack[a] = v;
@@ -439,6 +553,7 @@ fn step(
             let name = match &proto.consts[ins.b as usize] {
                 Const::Str(s) => s.clone(),
                 Const::Number(n) => Arc::from(tsr_memory::fmt_number(*n)),
+                Const::Keys(_) => Arc::from(""),
             };
             let v = rc(realm);
             match realm.stack[a].as_object() {
@@ -551,6 +666,7 @@ fn step(
             let name = match &proto.consts[ins.bx() as usize] {
                 Const::Str(s) => s.clone(),
                 Const::Number(n) => Arc::from(tsr_memory::fmt_number(*n)),
+                Const::Keys(_) => Arc::from(""),
             };
             let v = *realm
                 .globals
@@ -593,7 +709,7 @@ fn step(
 fn name_const<'a>(pr: &'a FunctionProto, idx: usize) -> &'a str {
     match &pr.consts[idx] {
         Const::Str(s) => s,
-        Const::Number(_) => "",
+        _ => "",
     }
 }
 
@@ -613,13 +729,13 @@ extern "C" fn h_get_field(
         let sid = objref.shape.id;
         let ic = pr.jit.ic_load(pr.code.len(), pc as usize);
         let v = if ic != 0 && (ic >> 32) as u32 == sid {
-            objref.values[(ic & 0xFFFF_FFFF) as usize - 1]
+            objref.val((ic & 0xFFFF_FFFF) as usize - 1)
         } else {
             let name = name_const(pr, cidx as usize);
             match objref.shape.slot_of(name) {
                 Some(i) => {
                     pr.jit.ic_store(pr.code.len(), pc as usize, sid, i);
-                    objref.values[i]
+                    objref.val(i)
                 }
                 None => Value::UNDEFINED,
             }
@@ -655,13 +771,13 @@ extern "C" fn h_set_field(
             let sid = obj.shape.id;
             let ic = pr.jit.ic_load(pr.code.len(), pc as usize);
             if ic != 0 && (ic >> 32) as u32 == sid {
-                obj.values[(ic & 0xFFFF_FFFF) as usize - 1] = v;
+                obj.set_val((ic & 0xFFFF_FFFF) as usize - 1, v);
             } else {
                 let name = name_const(pr, cidx as usize);
                 match obj.shape.slot_of(name) {
                     Some(i) => {
                         pr.jit.ic_store(pr.code.len(), pc as usize, sid, i);
-                        obj.values[i] = v;
+                        obj.set_val(i, v);
                     }
                     None => set_field_add(pr, pc as usize, obj, sid, || {
                         match &pr.consts[cidx as usize] {
@@ -669,6 +785,7 @@ extern "C" fn h_set_field(
                             Const::Number(n) => {
                                 std::sync::Arc::from(tsr_memory::fmt_number(*n))
                             }
+                            Const::Keys(_) => std::sync::Arc::from(""),
                         }
                     }, v),
                 }
@@ -930,6 +1047,165 @@ extern "C" fn h_new_array(p: *mut core::ffi::c_void, cap: u64) -> JitRet {
     JitRet { val: Value::array(a).bits(), stack: r.stack.as_mut_ptr() as u64 }
 }
 
+extern "C" fn h_new_object_lit(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    base_bytes: u64,
+    first: u64,
+    cidx: u64,
+) -> JitRet {
+    let r = realm(p);
+    let pr = proto(pp);
+    let shape = lit_shape(pr, pc as usize, cidx as usize);
+    let first = (base_bytes / 8) as usize + first as usize;
+    let n = shape.fields.len();
+    let o = r.heap.alloc_obj_lit(shape, &r.stack[first..first + n]);
+    JitRet { val: Value::object(o).bits(), stack: r.stack.as_mut_ptr() as u64 }
+}
+
+extern "C" fn h_new_array_lit(
+    p: *mut core::ffi::c_void,
+    base_bytes: u64,
+    first: u64,
+    n: u64,
+) -> JitRet {
+    let r = realm(p);
+    let first = (base_bytes / 8) as usize + first as usize;
+    let a = r.heap.alloc_arr_lit(&r.stack[first..first + n as usize]);
+    JitRet { val: Value::array(a).bits(), stack: r.stack.as_mut_ptr() as u64 }
+}
+
+extern "C" fn h_new_closure(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    base_bytes: u64,
+    closure: u32,
+) -> JitRet {
+    let r = realm(p);
+    let pr = proto(pp);
+    let pc = pc as usize;
+    let base = (base_bytes / 8) as usize;
+    let ins = pr.code[pc];
+    let child = pr.protos[ins.bx() as usize].clone();
+    let mut upvals_buf = [Value::UNDEFINED; 8];
+    let mut upvals_vec;
+    let n_up = child.upvals.len();
+    let upvals: &mut [Value] = if n_up <= 8 {
+        &mut upvals_buf[..n_up]
+    } else {
+        upvals_vec = vec![Value::UNDEFINED; n_up];
+        &mut upvals_vec
+    };
+    for (i, u) in child.upvals.iter().enumerate() {
+        upvals[i] = match *u {
+            UpvalSrc::ParentLocal(reg) => {
+                let v = r.stack[base + reg as usize];
+                if v.as_cell().is_none() {
+                    return fail(r, err_at(pr, pc, "internal: captured slot is not a cell".into()));
+                }
+                v
+            }
+            UpvalSrc::ParentLocalValue(reg) => r.stack[base + reg as usize],
+            UpvalSrc::ParentUpval(idx) => {
+                debug_assert!(closure != u32::MAX, "upval capture outside closure");
+                r.heap.closure(closure).upvals[idx as usize]
+            }
+        };
+    }
+    let cr = r.heap.alloc_closure_reuse(child, upvals);
+    JitRet { val: Value::closure(cr).bits(), stack: r.stack.as_mut_ptr() as u64 }
+}
+
+extern "C" fn h_concat(
+    p: *mut core::ffi::c_void,
+    b_bits: u64,
+    c_bits: u64,
+) -> JitRet {
+    let r = realm(p);
+    let b = Value::from_bits(b_bits);
+    let c = Value::from_bits(c_bits);
+    let mut s = std::mem::take(&mut r.concat_buf);
+    s.clear();
+    if !tsr_memory::display_into(&mut s, b, &r.heap)
+        || !tsr_memory::display_into(&mut s, c, &r.heap)
+    {
+        s.clear();
+        s.push_str(&b.display(&r.heap));
+        s.push_str(&c.display(&r.heap));
+    }
+    let v = r.alloc_string(&s);
+    r.concat_buf = s;
+    JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 }
+}
+
+extern "C" fn h_load_const(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    bx: u64,
+) -> JitRet {
+    let r = realm(p);
+    let pr = proto(pp);
+    let v = match &pr.consts[bx as usize] {
+        Const::Number(n) => Value::number(*n),
+        Const::Str(s) => Value::str_ref(r.heap.alloc_str(s.clone())),
+        Const::Keys(_) => Value::UNDEFINED,
+    };
+    JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 }
+}
+
+extern "C" fn h_new_object_lit2(
+    p: *mut core::ffi::c_void,
+    base_bytes: u64,
+    first: u64,
+    n: u64,
+    shape: *const tsr_memory::ShapeData,
+) -> JitRet {
+    let r = realm(p);
+    let shape: &'static tsr_memory::ShapeData = unsafe { &*shape };
+    let first = (base_bytes / 8) as usize + first as usize;
+    let o = r.heap.alloc_obj_lit(shape, &r.stack[first..first + n as usize]);
+    JitRet { val: Value::object(o).bits(), stack: r.stack.as_mut_ptr() as u64 }
+}
+
+extern "C" fn h_await(
+    p: *mut core::ffi::c_void,
+    awaited_bits: u64,
+    dst: u64,
+    resume_pc: u64,
+) -> JitRet {
+    let r = realm(p);
+    let v = Value::from_bits(awaited_bits);
+    if let Some(fr) = v.as_foreign() {
+        if let tsr_memory::Foreign::Promise(pr) = r.heap.foreign(fr) {
+            match &pr.state {
+                tsr_memory::PromiseState::Fulfilled(val) => {
+                    let val = *val;
+                    return JitRet { val: val.bits(), stack: r.stack.as_mut_ptr() as u64 };
+                }
+                tsr_memory::PromiseState::Rejected(e) => {
+                    let err = RtError {
+                        msg: e.msg.clone(),
+                        span: e.span,
+                        cancelled: e.cancelled,
+                    };
+                    return fail(r, err);
+                }
+                tsr_memory::PromiseState::Pending => {
+                    r.jit_await = Some((fr, dst as u8, resume_pc as usize));
+                    return JitRet {
+                        val: tsr_memory::JIT_AWAIT_SENTINEL,
+                        stack: r.stack.as_mut_ptr() as u64,
+                    };
+                }
+            }
+        }
+    }
+    // await of a non-promise is identity
+    JitRet { val: awaited_bits, stack: r.stack.as_mut_ptr() as u64 }
+}
+
 extern "C" fn h_new_cell(p: *mut core::ffi::c_void, init_bits: u64) -> JitRet {
     let r = realm(p);
     let c = r.heap.alloc_cell(Value::from_bits(init_bits));
@@ -938,13 +1214,20 @@ extern "C" fn h_new_cell(p: *mut core::ffi::c_void, init_bits: u64) -> JitRet {
 
 fn heap_offsets() -> Option<tsr_jit::tier1::HeapOffsets> {
     crate::layout::layout().map(|l| tsr_jit::tier1::HeapOffsets {
+        realm_stack_ptr: l.realm_stack_ptr,
         realm_objs_ptr: l.realm_objs_ptr,
         realm_arrs_ptr: l.realm_arrs_ptr,
         obj_size: l.obj_size,
         obj_shape_arc: l.obj_shape_arc,
         shape_id_delta: l.shape_id_delta,
-        obj_vals_ptr: l.obj_vals_ptr,
-        obj_vals_len: l.obj_vals_len,
+        obj_inline: l.obj_inline,
+        obj_inline_n: tsr_memory::OBJ_INLINE as u32,
+        realm_closures_ptr: l.realm_closures_ptr,
+        realm_cells_ptr: l.realm_cells_ptr,
+        closure_size: l.closure_size,
+        closure_upvals_ptr: l.closure_upvals_ptr,
+        closure_proto_off: l.closure_proto_off,
+        realm_stack_len: l.realm_stack_len,
         arr_size: l.arr_size,
         vec_ptr: l.vec_ptr,
         vec_len: l.vec_len,
@@ -971,6 +1254,14 @@ fn helpers() -> Helpers {
         new_cell: h_new_cell as *const () as usize,
         new_object: h_new_object as *const () as usize,
         new_array: h_new_array as *const () as usize,
+        new_object_lit: h_new_object_lit as *const () as usize,
+        new_array_lit: h_new_array_lit as *const () as usize,
+        new_closure: h_new_closure as *const () as usize,
+        concat: h_concat as *const () as usize,
+        load_const: h_load_const as *const () as usize,
+        new_object_lit2: h_new_object_lit2 as *const () as usize,
+        await_: h_await as *const () as usize,
+        call_resume: h_call_resume as *const () as usize,
     }
 }
 
@@ -992,7 +1283,7 @@ pub fn jit_enabled() -> bool {
 
 /// Count a call; compile when hot. Returns the code pointer when available.
 #[inline]
-pub fn tier_up(proto: &Arc<FunctionProto>) -> Option<CompiledFn> {
+pub fn tier_up(proto: &FunctionProto) -> Option<CompiledFn> {
     let jit = &proto.jit;
     let code = jit.code.load(Acquire);
     if !code.is_null() {
@@ -1046,7 +1337,7 @@ pub fn osr_threshold_pub() -> u32 {
 /// threshold (interpreter keeps a one-load fast path). Compiles once,
 /// returns the code, or marks the proto permanently un-OSR-able
 /// (backedges = u32::MAX) so the fast path never returns here.
-pub fn osr_slow(proto: &Arc<FunctionProto>) -> Option<CompiledFn> {
+pub fn osr_slow(proto: &FunctionProto) -> Option<CompiledFn> {
     let jit = &proto.jit;
     let code = jit.osr_code.load(Acquire);
     if !code.is_null() {
@@ -1076,22 +1367,22 @@ pub fn osr_slow(proto: &Arc<FunctionProto>) -> Option<CompiledFn> {
 pub fn enter_osr(
     realm: &mut Realm,
     f: CompiledFn,
-    proto: &Arc<FunctionProto>,
+    proto: &FunctionProto,
     base: usize,
     closure: Option<u32>,
     depth: u32,
     target_pc: usize,
-) -> Result<Value, RtError> {
+) -> Result<crate::interp::FrameResult, RtError> {
     let ret = f(
         realm as *mut Realm as *mut core::ffi::c_void,
-        proto.as_ref() as *const FunctionProto,
+        proto as *const FunctionProto,
         (base * 8) as u64,
         closure.unwrap_or(u32::MAX),
         depth,
         target_pc as u64,
     );
     match ret.val {
-        0 => Ok(Value::from_bits(ret.stack)),
+        0 => Ok(crate::interp::FrameResult::Return(Value::from_bits(ret.stack))),
         2 => {
             // Tier-2 entry guard failed mid-loop: resume interpreting at
             // the OSR pc; repeated failures reject OSR for this proto so
@@ -1100,10 +1391,14 @@ pub fn enter_osr(
                 proto.jit.backedges.store(u32::MAX, Relaxed);
             }
             let resume_pc = ret.stack as usize;
-            match crate::interp::run_frame_pub(realm, closure, proto, base, depth, resume_pc)? {
-                crate::interp::FrameResult::Return(v) => Ok(v),
-                crate::interp::FrameResult::Await { .. } => unreachable!("await in sync frame"),
-            }
+            crate::interp::run_frame_pub(realm, closure, proto, base, depth, resume_pc)
+        }
+        3 => {
+            let (awaited, dst, resume_pc) = realm
+                .jit_await
+                .take()
+                .expect("await exit without stashed info");
+            Ok(crate::interp::FrameResult::Await { awaited, dst, resume_pc })
         }
         _ => Err(realm
             .jit_error
@@ -1113,7 +1408,7 @@ pub fn enter_osr(
 }
 
 /// Unified Tier-2 compile. None = calls-in-loop policy or async/oversize.
-fn compile_unified(proto: &Arc<FunctionProto>, for_osr: bool) -> Option<Vec<u32>> {
+fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
     if !tier2_enabled() {
         return None;
     }
@@ -1136,6 +1431,22 @@ fn compile_unified(proto: &Arc<FunctionProto>, for_osr: bool) -> Option<Vec<u32>
         arg_guard: &typed.arg_guard,
     };
     let ics = proto.jit.ics_base(proto.code.len()) as u64;
+    let tics = proto.jit.tics_base(proto.code.len()) as u64;
+    // bake NewObjectLit shapes at compile time: the shape is process-global
+    // and fully determined by the site's key list
+    let lit_shapes: Vec<(u64, u32)> = proto
+        .code
+        .iter()
+        .enumerate()
+        .map(|(pc, i)| {
+            if i.op == Op::NewObjectLit {
+                let s = lit_shape(proto, pc, i.c as usize);
+                (s as *const _ as u64, s.fields.len() as u32)
+            } else {
+                (0, 0)
+            }
+        })
+        .collect();
     tsr_jit::tier2::compile(
         proto,
         helpers(),
@@ -1145,10 +1456,12 @@ fn compile_unified(proto: &Arc<FunctionProto>, for_osr: bool) -> Option<Vec<u32>
         for_osr,
         heap_offsets(),
         ics,
+        tics,
+        &lit_shapes,
     )
 }
 
-pub fn compile_now(proto: &Arc<FunctionProto>) {
+pub fn compile_now(proto: &FunctionProto) {
     if let Some(code) = compile_unified(proto, false) {
         let ptr = tsr_jit::heap::publish(&code) as *mut u8;
         proto.jit.code.store(ptr, Release);
@@ -1158,7 +1471,7 @@ pub fn compile_now(proto: &Arc<FunctionProto>) {
     compile_tier1(proto)
 }
 
-fn compile_tier1(proto: &Arc<FunctionProto>) {
+fn compile_tier1(proto: &FunctionProto) {
     let ics = proto.jit.ics_base(proto.code.len()) as u64;
     match tsr_jit::tier1::compile(proto, helpers(), false, heap_offsets(), ics) {
         Some(code) => {
@@ -1172,18 +1485,59 @@ fn compile_tier1(proto: &Arc<FunctionProto>) {
     }
 }
 
+/// Run a compiled (possibly async) function; returns the frame outcome.
+pub fn enter_jit_frame(
+    realm: &mut Realm,
+    f: CompiledFn,
+    proto: &FunctionProto,
+    base: usize,
+    closure: Option<u32>,
+    depth: u32,
+) -> Result<crate::interp::FrameResult, RtError> {
+    let ret = f(
+        realm as *mut Realm as *mut core::ffi::c_void,
+        proto as *const FunctionProto,
+        (base * 8) as u64,
+        closure.unwrap_or(u32::MAX),
+        depth,
+        0,
+    );
+    match ret.val {
+        0 => Ok(crate::interp::FrameResult::Return(Value::from_bits(ret.stack))),
+        2 => {
+            let deopts = proto.jit.deopts.fetch_add(1, Relaxed) + 1;
+            if deopts >= 10 && proto.jit.tier.load(Relaxed) == TIER_OPT {
+                compile_tier1(proto);
+            }
+            let resume_pc = ret.stack as usize;
+            crate::interp::run_frame_pub(realm, closure, proto, base, depth, resume_pc)
+        }
+        3 => {
+            let (awaited, dst, resume_pc) = realm
+                .jit_await
+                .take()
+                .expect("await exit without stashed info");
+            Ok(crate::interp::FrameResult::Await { awaited, dst, resume_pc })
+        }
+        _ => Err(realm
+            .jit_error
+            .take()
+            .unwrap_or_else(|| RtError::new("internal: jit error missing"))),
+    }
+}
+
 /// Run a compiled function whose argument window is prepared at `base`.
 pub fn enter_jit(
     realm: &mut Realm,
     f: CompiledFn,
-    proto: &Arc<FunctionProto>,
+    proto: &FunctionProto,
     base: usize,
     closure: Option<u32>,
     depth: u32,
 ) -> Result<Value, RtError> {
     let ret = f(
         realm as *mut Realm as *mut core::ffi::c_void,
-        proto.as_ref() as *const FunctionProto,
+        proto as *const FunctionProto,
         (base * 8) as u64,
         closure.unwrap_or(u32::MAX),
         depth,

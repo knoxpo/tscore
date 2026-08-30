@@ -98,6 +98,12 @@ pub enum Op {
     // heap
     NewObject, // A = {}
     NewArray,  // A = [] with capacity hint B
+    /// A = object with const[C] (Const::Keys) fields, values from
+    /// registers B..B+n (contiguous). Fused literal: one allocation, one
+    /// shape lookup (per-pc cache), no per-field transitions.
+    NewObjectLit,
+    /// A = array of registers B..B+C (contiguous).
+    NewArrayLit,
     GetField,  // A = B[const[C] as name]
     SetField,  // A[const[B] as name] = C
     GetIndex,  // A = B[C]
@@ -191,6 +197,16 @@ impl JitState {
         );
     }
 
+    /// Force-init and return the TIC table base (for baking into JIT code).
+    pub fn tics_base(&self, code_len: usize) -> *const std::sync::atomic::AtomicPtr<u8> {
+        let tics = self.tics.get_or_init(|| {
+            (0..code_len)
+                .map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+                .collect()
+        });
+        tics.as_ptr()
+    }
+
     #[inline(always)]
     pub fn tic_load(&self, code_len: usize, pc: usize) -> *mut u8 {
         let tics = self.tics.get_or_init(|| {
@@ -224,6 +240,8 @@ impl JitState {
 pub enum Const {
     Number(f64),
     Str(Arc<str>),
+    /// Field-name list for a NewObjectLit site.
+    Keys(Arc<[Arc<str>]>),
 }
 
 /// Where a closure's upvalue comes from at `Closure` execution time.
@@ -255,6 +273,24 @@ pub struct FunctionProto {
     /// TS parameter annotations (Top when unannotated).
     pub arg_types: Vec<TypeHint>,
     pub jit: JitState,
+}
+
+impl Default for FunctionProto {
+    fn default() -> Self {
+        FunctionProto {
+            name: Arc::from(""),
+            arity: 0,
+            is_async: false,
+            n_regs: 0,
+            code: Vec::new(),
+            consts: Vec::new(),
+            upvals: Vec::new(),
+            protos: Vec::new(),
+            spans: Vec::new(),
+            arg_types: Vec::new(),
+            jit: JitState::default(),
+        }
+    }
 }
 
 /// A compiled program: the top-level function.

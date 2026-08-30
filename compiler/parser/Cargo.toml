@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 tsc-ast.workspace = true
 tsc-ir.workspace = true
+tsc-optimizer.workspace = true

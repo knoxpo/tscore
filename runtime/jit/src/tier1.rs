@@ -56,19 +56,52 @@ pub struct Helpers {
     pub new_object: usize,
     /// fn(realm, cap) -> JitRet{arr_value_bits, stack}
     pub new_array: usize,
+    /// fn(realm, proto, pc, base_bytes, first, cidx) -> JitRet{obj_bits, stack}
+    /// Fused object literal: values read from slots [first, first+n).
+    pub new_object_lit: usize,
+    /// fn(realm, base_bytes, first, n) -> JitRet{arr_bits, stack}
+    pub new_array_lit: usize,
+    /// fn(realm, proto, pc, base_bytes, closure_u32) -> JitRet{closure_bits, stack}
+    /// Builds the closure for Op::Closure at pc (upval sources read from slots).
+    pub new_closure: usize,
+    /// fn(realm, b_bits, c_bits) -> JitRet{str_bits, stack}
+    pub concat: usize,
+    /// fn(realm, proto, bx) -> JitRet{val_bits, stack} — string constants.
+    pub load_const: usize,
+    /// fn(realm, base_bytes, first, n, shape_ptr) -> JitRet{obj_bits, stack}
+    /// Fused object literal with the final shape baked in at compile time.
+    pub new_object_lit2: usize,
+    /// fn(realm, awaited_bits, dst, resume_pc) -> JitRet{val | sentinels, stack}
+    /// Settled: the value. Rejected: error sentinel. Pending: the await
+    /// sentinel, with suspend info stashed in realm.jit_await.
+    pub await_: usize,
+    /// fn(realm, proto, ret_val, ret_stack, new_base_bytes, closure, depth)
+    /// -> JitRet{result_bits | err sentinel, stack}. Finishes a direct call
+    /// that bailed (deopt) or errored.
+    pub call_resume: usize,
 }
 
 /// Probed heap layout offsets (tsr-realm::layout). None disables the
 /// inline read paths — helpers still handle everything.
 #[derive(Clone, Copy)]
 pub struct HeapOffsets {
+    /// Offset of realm.stack's data pointer inside Realm.
+    pub realm_stack_ptr: u32,
     pub realm_objs_ptr: u32,
     pub realm_arrs_ptr: u32,
     pub obj_size: u32,
     pub obj_shape_arc: u32,
     pub shape_id_delta: u32,
-    pub obj_vals_ptr: u32,
-    pub obj_vals_len: u32,
+    /// Offset of the inline value slots inside Obj.
+    pub obj_inline: u32,
+    /// Number of inline slots (IC slots >= this take the helper).
+    pub obj_inline_n: u32,
+    pub realm_closures_ptr: u32,
+    pub realm_cells_ptr: u32,
+    pub closure_size: u32,
+    pub closure_upvals_ptr: u32,
+    pub closure_proto_off: u32,
+    pub realm_stack_len: u32,
     pub arr_size: u32,
     pub vec_ptr: u32,
     pub vec_len: u32,
@@ -203,6 +236,8 @@ pub fn compile(
                 | Op::ArrayPush
                 | Op::NewObject
                 | Op::NewArray
+                | Op::NewObjectLit
+                | Op::NewArrayLit
                 | Op::Closure
                 | Op::Concat
         )
@@ -581,8 +616,10 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
                 c.a.cmp_reg(15, 12);
                 c.a.b_cond(Cond::Ne, slow); // empty IC or shape miss
                 c.a.sub_imm32(16, 14, 1); // slot (+1 encoding)
-                c.a.ldr_imm(17, 10, o.obj_vals_ptr);
-                c.a.ldr_reg_lsl3(8, 17, 16);
+                c.a.cmp_imm(16, o.obj_inline_n);
+                c.a.b_cond(Cond::Hs, slow); // overflow slot -> helper
+                c.index_addr(17, 10, 16, 8);
+                c.a.ldr_imm(8, 17, o.obj_inline);
                 c.store_slot(8, ins.a);
                 c.a.b(done);
             }
