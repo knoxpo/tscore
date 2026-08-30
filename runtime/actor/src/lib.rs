@@ -14,6 +14,8 @@ use tsr_task::PortableValue;
 
 const DEFAULT_MAILBOX_CAP: usize = 1024;
 
+pub use tss_parallel::ACTOR_COUNT_HOOK as ACTOR_COUNT;
+
 enum Msg {
     /// (message, reply completer — Some for send, None for post)
     Deliver(PortableValue, Option<Completer>),
@@ -32,7 +34,8 @@ pub fn install(realm: &mut Realm) {
             Some(&f) if f.as_closure().is_some() => f,
             _ => return Err(RtError::new("actor(setupFn): expected a function")),
         };
-        let mailbox_cap = match args.get(1).and_then(|v| v.as_object()) {
+        let opts = args.get(1).and_then(|v| v.as_object());
+        let mailbox_cap = match opts {
             Some(r) => match realm.heap.obj(r).get("mailbox") {
                 Some(v) if v.is_number() && v.as_number() >= 1.0 => {
                     v.as_number() as usize
@@ -46,8 +49,12 @@ pub fn install(realm: &mut Realm) {
             },
             None => DEFAULT_MAILBOX_CAP,
         };
+        let max_heap = opts
+            .and_then(|r| realm.heap.obj(r).get("maxHeap"))
+            .filter(|v| v.is_number())
+            .map(|v| v.as_number() as usize);
         let pv_setup = clone_out(&realm.heap, setup).map_err(RtError::new)?;
-        let handle = Arc::new(spawn_actor(pv_setup, mailbox_cap)?);
+        let handle = Arc::new(spawn_actor(pv_setup, mailbox_cap, max_heap)?);
 
         // handle object: { send, post, stop } natives capturing the mailbox
         let h = handle.clone();
@@ -98,14 +105,18 @@ fn stopped(h: &ActorHandle) -> RtError {
 }
 
 /// Boot the actor thread; blocks until setup ran (or failed) inside it.
-fn spawn_actor(pv_setup: PortableValue, mailbox_cap: usize) -> Result<ActorHandle, RtError> {
+fn spawn_actor(
+    pv_setup: PortableValue,
+    mailbox_cap: usize,
+    max_heap: Option<usize>,
+) -> Result<ActorHandle, RtError> {
     let (tx, rx) = bounded::<Msg>(mailbox_cap);
     let (ready_tx, ready_rx) = bounded::<Result<String, String>>(1);
 
     std::thread::Builder::new()
         .name("tscore-actor".into())
         .stack_size(32 << 20)
-        .spawn(move || actor_main(pv_setup, rx, ready_tx))
+        .spawn(move || actor_main(pv_setup, rx, ready_tx, max_heap))
         .map_err(|e| RtError::new(format!("cannot spawn actor thread: {e}")))?;
 
     match ready_rx.recv() {
@@ -119,8 +130,12 @@ fn actor_main(
     pv_setup: PortableValue,
     rx: Receiver<Msg>,
     ready_tx: Sender<Result<String, String>>,
+    max_heap: Option<usize>,
 ) {
+    ACTOR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _guard = scopeguard();
     let mut realm = Realm::new();
+    realm.max_heap_bytes = max_heap;
     tsr_io::install(&mut realm);
     install(&mut realm); // actors can spawn actors
     tsr_channel::install(&mut realm);
@@ -191,6 +206,16 @@ fn deliver(
         .and_then(|v| tss_parallel::settle_if_promise(realm, v))
         .map_err(|e| e.msg)?;
     clone_out(&realm.heap, result)
+}
+
+struct ActorCountGuard;
+impl Drop for ActorCountGuard {
+    fn drop(&mut self) {
+        ACTOR_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+fn scopeguard() -> ActorCountGuard {
+    ActorCountGuard
 }
 
 /// Actor display name = sorted handler names, for error messages.

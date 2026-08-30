@@ -72,6 +72,7 @@ console/time, actors, Node compatibility, full ECMAScript.
 - [actors-m2.md](../specifications/actors-m2.md)
 - [structured-concurrency-m3.md](../specifications/structured-concurrency-m3.md)
 - [async-await-m3.md](../specifications/async-await-m3.md)
+- [gc-m4.md](../specifications/gc-m4.md)
 - [bytecode.md](../specifications/bytecode.md)
 - [concurrency-semantics.md](../specifications/concurrency-semantics.md)
 - [memory-ownership.md](../specifications/memory-ownership.md)

@@ -783,6 +783,7 @@ name = "tss-parallel"
 version = "0.1.0"
 dependencies = [
  "tsr-channel",
+ "tsr-gc",
  "tsr-io",
  "tsr-memory",
  "tsr-realm",

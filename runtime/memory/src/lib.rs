@@ -260,6 +260,54 @@ impl Obj {
     }
 }
 
+/// Growable bitmap (1 bit per arena slot).
+#[derive(Default)]
+pub struct Bitmap(Vec<u64>);
+
+impl Bitmap {
+    #[inline(always)]
+    pub fn get(&self, i: Ref) -> bool {
+        let w = (i >> 6) as usize;
+        self.0.get(w).is_some_and(|&b| b & (1 << (i & 63)) != 0)
+    }
+    #[inline(always)]
+    pub fn set(&mut self, i: Ref) {
+        let w = (i >> 6) as usize;
+        if w >= self.0.len() {
+            self.0.resize(w + 1, 0);
+        }
+        self.0[w] |= 1 << (i & 63);
+    }
+    #[inline(always)]
+    pub fn clear(&mut self, i: Ref) {
+        let w = (i >> 6) as usize;
+        if let Some(b) = self.0.get_mut(w) {
+            *b &= !(1 << (i & 63));
+        }
+    }
+    pub fn clear_all(&mut self) {
+        self.0.iter_mut().for_each(|b| *b = 0);
+    }
+}
+
+/// Per-arena generational state: age bits, barrier dirty bits, and the log
+/// of slots allocated since the last collection (the nursery).
+#[derive(Default)]
+pub struct GenState {
+    pub old: Bitmap,
+    pub dirty: Bitmap,
+    pub young: Vec<Ref>,
+}
+
+impl GenState {
+    #[inline(always)]
+    fn on_alloc(&mut self, r: Ref) {
+        self.old.clear(r);
+        self.dirty.clear(r);
+        self.young.push(r);
+    }
+}
+
 pub struct Heap {
     pub strs: Vec<Arc<str>>,
     pub objs: Vec<Obj>,
@@ -277,6 +325,20 @@ pub struct Heap {
     pub free_foreigns: Vec<Ref>,
     pub allocs_since_gc: usize,
     pub gc_threshold: usize,
+    // generational state (sticky in-place mark-sweep)
+    pub gen_strs: GenState,
+    pub gen_objs: GenState,
+    pub gen_arrs: GenState,
+    pub gen_closures: GenState,
+    pub gen_cells: GenState,
+    pub gen_foreigns: GenState,
+    /// Old containers mutated since the last collection (write barrier log).
+    pub remembered: Vec<Value>,
+    pub promoted_since_major: usize,
+    /// Approximate bytes promoted to old since the last major — the major
+    /// trigger (slot counts under-estimate big arrays).
+    pub promoted_bytes_since_major: usize,
+    pub remembered_peak: usize,
 }
 
 impl Default for Heap {
@@ -296,20 +358,33 @@ impl Default for Heap {
             free_foreigns: Vec::new(),
             allocs_since_gc: 0,
             gc_threshold: 1 << 18, // 256k allocations between collections
+            gen_strs: GenState::default(),
+            gen_objs: GenState::default(),
+            gen_arrs: GenState::default(),
+            gen_closures: GenState::default(),
+            gen_cells: GenState::default(),
+            gen_foreigns: GenState::default(),
+            remembered: Vec::new(),
+            promoted_since_major: 0,
+            promoted_bytes_since_major: 0,
+            remembered_peak: 0,
         }
     }
 }
 
 macro_rules! alloc {
-    ($fn_name:ident, $get:ident, $get_mut:ident, $field:ident, $free:ident, $t:ty) => {
+    ($fn_name:ident, $get:ident, $get_mut:ident, $field:ident, $free:ident, $gen:ident, $t:ty) => {
         pub fn $fn_name(&mut self, v: $t) -> Ref {
             self.allocs_since_gc += 1;
             if let Some(r) = self.$free.pop() {
                 self.$field[r as usize] = v;
+                self.$gen.on_alloc(r);
                 return r;
             }
             self.$field.push(v);
-            (self.$field.len() - 1) as Ref
+            let r = (self.$field.len() - 1) as Ref;
+            self.$gen.on_alloc(r);
+            r
         }
         pub fn $get(&self, r: Ref) -> &$t {
             &self.$field[r as usize]
@@ -324,12 +399,54 @@ impl Heap {
     pub fn new() -> Self {
         Self::default()
     }
-    alloc!(alloc_str, str_at, str_at_mut, strs, free_strs, Arc<str>);
-    alloc!(alloc_obj, obj, obj_mut, objs, free_objs, Obj);
-    alloc!(alloc_arr, arr, arr_mut, arrs, free_arrs, Vec<Value>);
-    alloc!(alloc_closure, closure, closure_mut, closures, free_closures, Closure);
-    alloc!(alloc_cell, cell, cell_mut, cells, free_cells, Value);
-    alloc!(alloc_foreign, foreign, foreign_mut, foreigns, free_foreigns, Foreign);
+    alloc!(alloc_str, str_at, str_at_mut, strs, free_strs, gen_strs, Arc<str>);
+    alloc!(alloc_obj, obj, obj_mut, objs, free_objs, gen_objs, Obj);
+    alloc!(alloc_arr, arr, arr_mut, arrs, free_arrs, gen_arrs, Vec<Value>);
+    alloc!(alloc_closure, closure, closure_mut, closures, free_closures, gen_closures, Closure);
+    alloc!(alloc_cell, cell, cell_mut, cells, free_cells, gen_cells, Value);
+    alloc!(alloc_foreign, foreign, foreign_mut, foreigns, free_foreigns, gen_foreigns, Foreign);
+
+    /// The only sanctioned way to free a foreign slot outside the sweep:
+    /// keeps generation bookkeeping consistent for slot reuse.
+    pub fn free_foreign(&mut self, r: Ref) {
+        self.foreigns[r as usize] = Foreign::Free;
+        self.gen_foreigns.old.clear(r);
+        self.gen_foreigns.dirty.clear(r);
+        self.free_foreigns.push(r);
+    }
+
+    // ---- write barriers: record old containers that gain new edges ----
+    // Container-only, dedup via dirty bit. Zero cost when the container is
+    // young (the common case in churn) — one bitmap test.
+
+    #[inline(always)]
+    pub fn barrier_obj(&mut self, r: Ref) {
+        if self.gen_objs.old.get(r) && !self.gen_objs.dirty.get(r) {
+            self.gen_objs.dirty.set(r);
+            self.remembered.push(Value::object(r));
+        }
+    }
+    #[inline(always)]
+    pub fn barrier_arr(&mut self, r: Ref) {
+        if self.gen_arrs.old.get(r) && !self.gen_arrs.dirty.get(r) {
+            self.gen_arrs.dirty.set(r);
+            self.remembered.push(Value::array(r));
+        }
+    }
+    #[inline(always)]
+    pub fn barrier_cell(&mut self, r: Ref) {
+        if self.gen_cells.old.get(r) && !self.gen_cells.dirty.get(r) {
+            self.gen_cells.dirty.set(r);
+            self.remembered.push(Value::cell(r));
+        }
+    }
+    #[inline(always)]
+    pub fn barrier_foreign(&mut self, r: Ref) {
+        if self.gen_foreigns.old.get(r) && !self.gen_foreigns.dirty.get(r) {
+            self.gen_foreigns.dirty.set(r);
+            self.remembered.push(Value::foreign(r));
+        }
+    }
 
     pub fn alloc_promise(&mut self) -> Ref {
         self.alloc_foreign(Foreign::Promise(Promise {

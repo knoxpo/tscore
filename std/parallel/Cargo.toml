@@ -12,3 +12,4 @@ tsr-scheduler.workspace = true
 tsr-task.workspace = true
 tsr-io.workspace = true
 tsr-channel.workspace = true
+tsr-gc.workspace = true

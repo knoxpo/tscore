@@ -34,6 +34,14 @@ pub fn shared_pool() -> &'static Pool {
     POOL.get_or_init(|| Pool::new(configure(None)))
 }
 
+/// Pool stats without forcing pool creation (observability must never
+/// decide the worker count by initializing the pool first — shared_pool()
+/// from an observer thread races install() and locks the worker count at
+/// available_parallelism before --workers is applied).
+pub fn pool_stats_if_started() -> Option<tsr_scheduler::PoolStats> {
+    POOL.get().map(|p| p.stats())
+}
+
 fn pool_help(done: &dyn Fn() -> bool) {
     shared_pool().help_until(done);
 }
@@ -52,7 +60,93 @@ pub fn install(realm: &mut Realm, workers: Option<usize>) {
     let mut cpu = tsr_memory::Obj::default();
     cpu.set(Arc::from("count"), Value::number(n_workers as f64));
     let cpu_ref = realm.heap.alloc_obj(cpu);
-    realm.set_global_obj("runtime", vec![("cpu", Value::object(cpu_ref))]);
+
+    // runtime.gc.{stats, collect}
+    let gc_stats = realm.add_native(|realm, _| {
+        let st = realm.gc_stats;
+        let heap_slots = realm.heap.objs.len()
+            + realm.heap.arrs.len()
+            + realm.heap.strs.len()
+            + realm.heap.closures.len()
+            + realm.heap.cells.len()
+            + realm.heap.foreigns.len();
+        let mut o = tsr_memory::Obj::default();
+        let fields: Vec<(&str, f64)> = vec![
+            ("minorCollections", st.minor_collections as f64),
+            ("majorCollections", st.major_collections as f64),
+            ("lastFreed", st.last_freed as f64),
+            ("lastLive", st.last_live as f64),
+            ("liveBytes", st.last_live_bytes as f64),
+            ("lastPauseUs", st.last_pause_us as f64),
+            ("maxPauseUs", st.max_pause_us as f64),
+            ("heapSlots", heap_slots as f64),
+            ("promotedSinceMajor", realm.heap.promoted_since_major as f64),
+            ("rememberedPeak", realm.heap.remembered_peak as f64),
+        ];
+        for (k, v) in fields {
+            o.set(Arc::from(k), Value::number(v));
+        }
+        Ok(Value::object(realm.heap.alloc_obj(o)))
+    });
+    let gc_collect = realm.add_native(|realm, _| {
+        let extra: Vec<Value> = realm
+            .microtasks
+            .iter()
+            .chain(realm.pinned.iter())
+            .map(|&r| Value::foreign(r))
+            .collect();
+        tsr_gc::collect(
+            &mut realm.heap,
+            &realm.stack,
+            realm.globals.values().chain(extra.iter()),
+            &mut realm.gc_stats,
+        );
+        Ok(Value::UNDEFINED)
+    });
+    let mut gc = tsr_memory::Obj::default();
+    gc.set(Arc::from("stats"), gc_stats);
+    gc.set(Arc::from("collect"), gc_collect);
+    let gc_ref = realm.heap.alloc_obj(gc);
+
+    // runtime.stats(): scheduler + actors + gc counters
+    let stats = realm.add_native(|realm, _| {
+        let ps = shared_pool().stats();
+        let mut o = tsr_memory::Obj::default();
+        let fields: Vec<(&str, f64)> = vec![
+            ("workers", ps.workers as f64),
+            ("tasksExecuted", ps.tasks_executed as f64),
+            ("steals", ps.steals as f64),
+            ("submits", ps.submits as f64),
+            ("parks", ps.parks as f64),
+            (
+                "actors",
+                tsr_actor_count() as f64,
+            ),
+            ("gcMinor", realm.gc_stats.minor_collections as f64),
+            ("gcMajor", realm.gc_stats.major_collections as f64),
+        ];
+        for (k, v) in fields {
+            o.set(Arc::from(k), Value::number(v));
+        }
+        Ok(Value::object(realm.heap.alloc_obj(o)))
+    });
+
+    realm.set_global_obj(
+        "runtime",
+        vec![
+            ("cpu", Value::object(cpu_ref)),
+            ("gc", Value::object(gc_ref)),
+            ("stats", stats),
+        ],
+    );
+}
+
+/// Actor count without a dependency edge to tsr-actor (set by tsr-actor).
+pub static ACTOR_COUNT_HOOK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn tsr_actor_count() -> usize {
+    ACTOR_COUNT_HOOK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 

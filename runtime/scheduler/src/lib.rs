@@ -44,6 +44,20 @@ struct Shared {
     /// notifies when someone is listening.
     sleepers: AtomicUsize,
     shutdown: AtomicBool,
+    // observability (relaxed; approximate is fine)
+    tasks_executed: AtomicUsize,
+    steals: AtomicUsize,
+    submits: AtomicUsize,
+    parks: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoolStats {
+    pub workers: usize,
+    pub tasks_executed: usize,
+    pub steals: usize,
+    pub submits: usize,
+    pub parks: usize,
 }
 
 impl Shared {
@@ -54,6 +68,7 @@ impl Shared {
     }
 
     fn park(&self, timeout: Duration, recheck: impl Fn() -> bool) {
+        self.parks.fetch_add(1, Ordering::Relaxed);
         self.sleepers.fetch_add(1, Ordering::SeqCst);
         let mut g = self.sleep_m.lock();
         if !recheck() {
@@ -107,6 +122,10 @@ impl Pool {
             sleep_cv: Condvar::new(),
             sleepers: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            tasks_executed: AtomicUsize::new(0),
+            steals: AtomicUsize::new(0),
+            submits: AtomicUsize::new(0),
+            parks: AtomicUsize::new(0),
         });
         let handles = workers
             .into_iter()
@@ -133,10 +152,21 @@ impl Pool {
         self.n_workers
     }
 
+    pub fn stats(&self) -> PoolStats {
+        PoolStats {
+            workers: self.n_workers,
+            tasks_executed: self.shared.tasks_executed.load(Ordering::Relaxed),
+            steals: self.shared.steals.load(Ordering::Relaxed),
+            submits: self.shared.submits.load(Ordering::Relaxed),
+            parks: self.shared.parks.load(Ordering::Relaxed),
+        }
+    }
+
     /// Submit one job into a batch; it starts as soon as a worker is free.
     pub fn submit(&self, batch: &Arc<Batch>, f: JobFn) {
         batch.remaining.fetch_add(1, Ordering::SeqCst);
         self.shared.injector.push(JobUnit { batch: batch.clone(), f });
+        self.shared.submits.fetch_add(1, Ordering::Relaxed);
         self.shared.notify();
     }
 
@@ -182,6 +212,7 @@ impl Drop for Pool {
 }
 
 fn run_unit(unit: JobUnit, local: Option<&Worker<JobUnit>>, shared: &Shared) {
+    shared.tasks_executed.fetch_add(1, Ordering::Relaxed);
     let ctx = Ctx { batch: &unit.batch, local, shared };
     (unit.f)(&ctx);
     unit.batch.remaining.fetch_sub(1, Ordering::SeqCst);
@@ -216,7 +247,10 @@ fn find_job(
         }
         loop {
             match shared.stealers[i].steal() {
-                crossbeam_deque::Steal::Success(u) => return Some(u),
+                crossbeam_deque::Steal::Success(u) => {
+                    shared.steals.fetch_add(1, Ordering::Relaxed);
+                    return Some(u);
+                }
                 crossbeam_deque::Steal::Retry => continue,
                 crossbeam_deque::Steal::Empty => break,
             }

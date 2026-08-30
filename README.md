@@ -10,8 +10,9 @@ const results = await parallel.map(records, processRecord);
 // runtime handles: partitioning, work stealing, core placement, isolation
 ```
 
-**Status:** M3 complete INCLUDING async/await, Promises, per-realm event
-loops, and channels (M1 Multicore Proof, M2 Actors before it) — custom bytecode interpreter (register machine, per-realm
+**Status:** M4 "GC + Memory Runtime" complete — generational GC (O(young)
+minor pauses), memory limits, runtime telemetry, and a live `tscore top`
+monitor (M1 Multicore Proof, M2 Actors, M3 incl. async/await before it) — custom bytecode interpreter (register machine, per-realm
 isolated heaps, mark-sweep GC), work-stealing scheduler, actor runtime.
 ARM64 macOS/Linux.
 
@@ -74,6 +75,14 @@ Child errors cancel siblings and propagate to the parent; cancellation is
 cooperative at interpreter safepoints (`handle.cancel()`, scope timeouts,
 `Runtime.checkCancellation()`), and cascades through nested scopes. See
 [structured concurrency spec](docs/specifications/structured-concurrency-m3.md).
+
+## GC + observability (M4)
+
+Sticky generational mark-sweep: minor pauses are O(young) and independent
+of heap size (measured ~2ms minors vs ~10ms majors on a 2M-object live
+set). `runtime.gc.stats()`, `--max-heap` limits with clean OOM errors,
+`tscore run --stats`, and `tscore top` — a live table of every running
+tscore process. See [GC spec](docs/specifications/gc-m4.md).
 
 ## Try it
 

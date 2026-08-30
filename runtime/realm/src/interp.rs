@@ -51,6 +51,7 @@ pub fn run_main(realm: &mut Realm, main: &Arc<FunctionProto>) -> Result<Value, R
     realm.pinned.insert(main_promise);
     let result = drive(realm, main_promise);
     realm.pinned.remove(&main_promise);
+    realm.publish_stats();
     result
 }
 
@@ -144,6 +145,7 @@ fn start_async(
                 dst,
                 promise,
             }));
+            realm.heap.barrier_foreign(awaited);
             realm.heap.promise_mut(awaited).reactions.push(co);
         }
     }
@@ -159,7 +161,7 @@ fn resume(realm: &mut Realm, co_ref: tsr_memory::Ref) {
     else {
         return; // already consumed
     };
-    realm.heap.free_foreigns.push(co_ref);
+    realm.heap.free_foreign(co_ref);
     // the coroutine left the arena: its promise is only reachable through
     // this Rust local until we settle/re-suspend — pin it across execution
     realm.pinned.insert(co.promise);
@@ -189,6 +191,7 @@ fn resume(realm: &mut Realm, co_ref: tsr_memory::Ref) {
             co.dst = dst;
             let promise = co.promise;
             let new_ref = realm.heap.alloc_foreign(Foreign::Coroutine(co));
+            realm.heap.barrier_foreign(awaited);
             realm.heap.promise_mut(awaited).reactions.push(new_ref);
             realm.pinned.remove(&promise);
             return;
@@ -203,6 +206,7 @@ pub fn settle(
     promise: tsr_memory::Ref,
     result: Result<Value, PromiseError>,
 ) {
+    realm.heap.barrier_foreign(promise);
     let reactions = {
         let p = realm.heap.promise_mut(promise);
         debug_assert!(matches!(p.state, PromiseState::Pending));
@@ -215,6 +219,7 @@ pub fn settle(
     for co_ref in reactions {
         match &result {
             Ok(v) => {
+                realm.heap.barrier_foreign(co_ref);
                 if let Foreign::Coroutine(co) = realm.heap.foreign_mut(co_ref) {
                     let dst = co.dst as usize;
                     co.regs[dst] = *v;
@@ -228,7 +233,7 @@ pub fn settle(
                     Foreign::Free,
                 ) {
                     Foreign::Coroutine(co) => {
-                        realm.heap.free_foreigns.push(co_ref);
+                        realm.heap.free_foreign(co_ref);
                         co.promise
                     }
                     other => {
@@ -621,7 +626,10 @@ fn run_frame(
                 None => return Err(err(proto, pc, "internal: LoadCell on non-cell".into())),
             },
             Op::StoreCell => match reg!(realm, a).as_cell() {
-                Some(r) => *realm.heap.cell_mut(r) = reg!(realm, base + ins.b as usize),
+                Some(r) => {
+                    realm.heap.barrier_cell(r);
+                    *realm.heap.cell_mut(r) = reg!(realm, base + ins.b as usize)
+                }
                 None => return Err(err(proto, pc, "internal: StoreCell on non-cell".into())),
             },
             Op::GetUpval => {
@@ -632,6 +640,7 @@ fn run_frame(
             Op::SetUpval => {
                 let c = closure.expect("SetUpval outside closure");
                 let cell = realm.heap.closure(c).upvals[ins.a as usize];
+                realm.heap.barrier_cell(cell);
                 *realm.heap.cell_mut(cell) = reg!(realm, base + ins.b as usize);
             }
 
@@ -653,7 +662,10 @@ fn run_frame(
                 let name = const_str_arc(proto, ins.b as usize);
                 let v = reg!(realm, base + ins.c as usize);
                 match reg!(realm, a).as_object() {
-                    Some(r) => realm.heap.obj_mut(r).set(name, v),
+                    Some(r) => {
+                        realm.heap.barrier_obj(r);
+                        realm.heap.obj_mut(r).set(name, v)
+                    }
                     None => return Err(err(proto, pc, format!(
                         "cannot set property on {}", reg!(realm, a).type_of()))),
                 }
@@ -688,12 +700,14 @@ fn run_frame(
                 if idx.is_number() {
                     match target.as_array() {
                         Some(r) => {
+                            realm.heap.barrier_arr(r);
                             let arr = realm.heap.arr_mut(r);
                             let i = idx.as_number() as usize;
                             if i < arr.len() {
                                 arr[i] = v;
                             } else if i == arr.len() {
                                 arr.push(v);
+                                realm.heap.allocs_since_gc += 1;
                             } else {
                                 return Err(err(proto, pc,
                                     "sparse arrays not supported in M1".into()));
@@ -704,6 +718,7 @@ fn run_frame(
                     }
                 } else if let (Some(r), Some(s)) = (target.as_object(), idx.as_str_ref()) {
                     let name = realm.heap.str_at(s).clone();
+                    realm.heap.barrier_obj(r);
                     realm.heap.obj_mut(r).set(name, v);
                 } else {
                     return Err(err(proto, pc, format!(
@@ -725,7 +740,12 @@ fn run_frame(
             Op::ArrayPush => {
                 let v = reg!(realm, base + ins.b as usize);
                 match reg!(realm, a).as_array() {
-                    Some(r) => realm.heap.arr_mut(r).push(v),
+                    Some(r) => {
+                        // element growth is allocation pressure too
+                        realm.heap.allocs_since_gc += 1;
+                        realm.heap.barrier_arr(r);
+                        realm.heap.arr_mut(r).push(v)
+                    }
                     None => return Err(err(proto, pc, format!(
                         "cannot push onto {}", reg!(realm, a).type_of()))),
                 }
