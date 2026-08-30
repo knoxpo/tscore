@@ -89,7 +89,7 @@ struct LazyPayload {
     env: Vec<String>,
 }
 
-fn lazy_enabled() -> bool {
+pub(crate) fn lazy_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("TSC_NO_LAZY").is_none())
 }

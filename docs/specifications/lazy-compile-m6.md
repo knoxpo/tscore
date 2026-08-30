@@ -1,15 +1,25 @@
 # M6: lazy function compilation
 
-> **Status: SHIPPED** (M6a–M6d). Parse row 21.7ms → ~12-13.5ms end-to-end
-> on 50k LOC — statistical tie with bun (13.5 ± 3.9 same session); emit
-> at startup 10ms → 0.2ms, resolve 4.4ms → 1.9ms. Remaining floor is oxc
-> parse (~6.4ms) + process startup (~1.5ms). Deviations from the plan
-> below: spans are preserved by left-padding the re-parsed snippet to its
-> original file offset (no `env`-relative remapping, no LazyFile capture
-> tables — the fill re-resolves the snippet with the stored upvalue names
-> pre-seeded); parameter-pattern errors stay eager via a header-time scan;
-> resolve fast-path used borrowed AST names + linear-scan scopes with a
-> side index past 32 entries rather than oxc Atom plumbing.
+> **Status: SHIPPED** (M6a–M6e). Parse row 21.7ms → **7.1ms** end-to-end
+> on 50k LOC — 1.62x faster than bun (11.5ms, same session); emit at
+> startup 10ms → 0.2ms, resolve 4.4ms → ~2ms serial. Deviations from the
+> plan below: spans are preserved by left-padding the re-parsed snippet to
+> its original file offset (no `env`-relative remapping — the fill
+> re-resolves the snippet with the stored upvalue names pre-seeded);
+> parameter-pattern errors stay eager via a header-time scan; resolve
+> fast-path used borrowed AST names + linear-scan scopes with a side index
+> past 32 entries rather than oxc Atom plumbing.
+>
+> **M6e (added): parallel frontend.** When the file is a flat bundle of
+> top-level functions (a raw-text splitter finds them by brace matching;
+> any top-level let/const/var/class, or any scanner doubt, falls back to
+> the serial pipeline), the main oxc parse runs over a length-preserving
+> *hollowed* copy — every function body blanked to spaces, so all spans
+> still match the original file — while worker threads parse + capture-
+> resolve the real bodies in parallel, seeded with the top-level function
+> name set. Worker capture lists patch the hollow resolve's captured set
+> and the fn_caps table; emission and lazy fills consume the original
+> source unchanged. `TSC_NO_PARALLEL_FRONTEND=1` disables.
 
 Target: win the parse+compile row (~50k LOC: tscore 21.7ms vs bun 11.8ms)
 and cut startup further, with zero regression on steady-state rows.
