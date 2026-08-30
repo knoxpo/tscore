@@ -163,6 +163,16 @@ impl JitState {
         ics[pc].load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Force-init and return the IC table base (for baking into JIT code).
+    pub fn ics_base(&self, code_len: usize) -> *const std::sync::atomic::AtomicU64 {
+        let ics = self.ics.get_or_init(|| {
+            (0..code_len)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect()
+        });
+        ics.as_ptr()
+    }
+
     #[inline(always)]
     pub fn ic_store(&self, code_len: usize, pc: usize, shape_id: u32, slot: usize) {
         let ics = self.ics.get_or_init(|| {

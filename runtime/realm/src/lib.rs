@@ -5,6 +5,7 @@
 
 pub mod interp;
 pub mod jit;
+pub mod layout;
 
 use rustc_hash::FxHashMap;
 use std::sync::Arc;

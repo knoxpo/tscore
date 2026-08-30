@@ -686,6 +686,17 @@ pub fn to_int32(x: f64) -> i32 {
     m as u32 as i32
 }
 
+/// JS array index semantics: valid only for non-negative integral
+/// numbers (arr[-1] and arr[1.5] are property lookups -> undefined).
+#[inline(always)]
+pub fn array_index(n: f64) -> Option<usize> {
+    if n >= 0.0 && n.fract() == 0.0 && n < 4294967296.0 {
+        Some(n as usize)
+    } else {
+        None
+    }
+}
+
 pub fn to_uint32(x: f64) -> u32 {
     to_int32(x) as u32
 }

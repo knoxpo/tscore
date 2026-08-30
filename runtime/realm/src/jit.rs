@@ -436,7 +436,11 @@ fn step(
                         realm.heap.allocs_since_gc += 1;
                         realm.heap.barrier_arr(r);
                         let arr = realm.heap.arr_mut(r);
-                        let i = idx.as_number() as usize;
+                        let Some(i) = tsr_memory::array_index(idx.as_number()) else {
+                            // non-index number key: array expando
+                            // properties unsupported — ignored
+                            return Ok(0);
+                        };
                         if i < arr.len() {
                             arr[i] = v;
                         } else if i == arr.len() {
@@ -629,11 +633,8 @@ extern "C" fn h_get_index(
     let idx = Value::from_bits(idx_bits);
     if idx.is_number() {
         if let Some(ar) = obj.as_array() {
-            let v = r
-                .heap
-                .arr(ar)
-                .get(idx.as_number() as usize)
-                .copied()
+            let v = tsr_memory::array_index(idx.as_number())
+                .and_then(|i| r.heap.arr(ar).get(i).copied())
                 .unwrap_or(Value::UNDEFINED);
             return JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 };
         }
@@ -680,7 +681,11 @@ extern "C" fn h_set_index(
             r.heap.allocs_since_gc += 1;
             r.heap.barrier_arr(ar);
             let arr = r.heap.arr_mut(ar);
-            let i = idx.as_number() as usize;
+            let Some(i) = tsr_memory::array_index(idx.as_number()) else {
+                // non-index number key: array expando properties
+                // unsupported — silently ignored
+                return ok(r, 0);
+            };
             if i < arr.len() {
                 arr[i] = v;
             } else if i == arr.len() {
@@ -793,6 +798,21 @@ extern "C" fn h_get_global(
     }
 }
 
+fn heap_offsets() -> Option<tsr_jit::tier1::HeapOffsets> {
+    crate::layout::layout().map(|l| tsr_jit::tier1::HeapOffsets {
+        realm_objs_ptr: l.realm_objs_ptr,
+        realm_arrs_ptr: l.realm_arrs_ptr,
+        obj_size: l.obj_size,
+        obj_shape_arc: l.obj_shape_arc,
+        shape_id_delta: l.shape_id_delta,
+        obj_vals_ptr: l.obj_vals_ptr,
+        obj_vals_len: l.obj_vals_len,
+        arr_size: l.arr_size,
+        vec_ptr: l.vec_ptr,
+        vec_len: l.vec_len,
+    })
+}
+
 fn helpers() -> Helpers {
     Helpers {
         stack_ptr: h_stack_ptr as *const () as usize,
@@ -891,7 +911,8 @@ pub fn osr_slow(proto: &Arc<FunctionProto>) -> Option<CompiledFn> {
         jit.backedges.store(u32::MAX, Relaxed);
         return None;
     }
-    match tsr_jit::tier1::compile(proto, helpers(), true) {
+    let ics = proto.jit.ics_base(proto.code.len()) as u64;
+    match tsr_jit::tier1::compile(proto, helpers(), true, heap_offsets(), ics) {
         Some(code) => {
             let ptr = tsr_jit::heap::publish(&code) as *mut u8;
             jit.osr_code.store(ptr, Release);
@@ -952,7 +973,8 @@ pub fn compile_now(proto: &Arc<FunctionProto>) {
 }
 
 fn compile_tier1(proto: &Arc<FunctionProto>) {
-    match tsr_jit::tier1::compile(proto, helpers(), false) {
+    let ics = proto.jit.ics_base(proto.code.len()) as u64;
+    match tsr_jit::tier1::compile(proto, helpers(), false, heap_offsets(), ics) {
         Some(code) => {
             let ptr = tsr_jit::heap::publish(&code) as *mut u8;
             proto.jit.code.store(ptr, Release);

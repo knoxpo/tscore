@@ -771,11 +771,8 @@ fn run_frame(
                 let idx = reg!(realm, base + ins.c as usize);
                 let v = if idx.is_number() {
                     match obj.as_array() {
-                        Some(r) => realm
-                            .heap
-                            .arr(r)
-                            .get(idx.as_number() as usize)
-                            .copied()
+                        Some(r) => tsr_memory::array_index(idx.as_number())
+                            .and_then(|i| realm.heap.arr(r).get(i).copied())
                             .unwrap_or(Value::UNDEFINED),
                         None => return Err(err(proto, pc, format!(
                             "cannot index {} with number", obj.type_of()))),
@@ -798,15 +795,18 @@ fn run_frame(
                         Some(r) => {
                             realm.heap.barrier_arr(r);
                             let arr = realm.heap.arr_mut(r);
-                            let i = idx.as_number() as usize;
-                            if i < arr.len() {
-                                arr[i] = v;
-                            } else if i == arr.len() {
-                                arr.push(v);
-                                realm.heap.allocs_since_gc += 1;
-                            } else {
-                                return Err(err(proto, pc,
-                                    "sparse arrays not supported in M1".into()));
+                            // non-index number keys (negative/fractional):
+                            // array expando properties unsupported — ignored
+                            if let Some(i) = tsr_memory::array_index(idx.as_number()) {
+                                if i < arr.len() {
+                                    arr[i] = v;
+                                } else if i == arr.len() {
+                                    arr.push(v);
+                                    realm.heap.allocs_since_gc += 1;
+                                } else {
+                                    return Err(err(proto, pc,
+                                        "sparse arrays not supported in M1".into()));
+                                }
                             }
                         }
                         None => return Err(err(proto, pc, format!(

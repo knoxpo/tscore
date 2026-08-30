@@ -217,6 +217,20 @@ impl Asm {
         self.push(0x9340_7C00 | rn << 5 | rd);
     }
 
+    /// ADD Xd, Xn, Xm, LSL #sh.
+    pub fn add_reg_lsl(&mut self, rd: Reg, rn: Reg, rm: Reg, sh: u32) {
+        self.push(0x8B00_0000 | rm << 16 | sh << 10 | rn << 5 | rd);
+    }
+    /// LDR Xt, [Xn, Xm, LSL #3].
+    pub fn ldr_reg_lsl3(&mut self, rt: Reg, rn: Reg, rm: Reg) {
+        self.push(0xF860_7800 | rm << 16 | rn << 5 | rt);
+    }
+    /// LDR Wt, [Xn, #imm] (imm multiple of 4).
+    pub fn ldr_w_imm(&mut self, rt: Reg, rn: Reg, imm: u32) {
+        debug_assert!(imm % 4 == 0 && imm / 4 < 4096);
+        self.push(0xB940_0000 | (imm / 4) << 10 | rn << 5 | rt);
+    }
+
     // ---- memory ----
 
     /// LDR Xt, [Xn, #imm] — imm must be a multiple of 8, < 32768.

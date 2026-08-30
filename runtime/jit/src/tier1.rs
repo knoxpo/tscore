@@ -43,6 +43,22 @@ pub struct Helpers {
     pub get_global: usize,
 }
 
+/// Probed heap layout offsets (tsr-realm::layout). None disables the
+/// inline read paths — helpers still handle everything.
+#[derive(Clone, Copy)]
+pub struct HeapOffsets {
+    pub realm_objs_ptr: u32,
+    pub realm_arrs_ptr: u32,
+    pub obj_size: u32,
+    pub obj_shape_arc: u32,
+    pub shape_id_delta: u32,
+    pub obj_vals_ptr: u32,
+    pub obj_vals_len: u32,
+    pub arr_size: u32,
+    pub vec_ptr: u32,
+    pub vec_len: u32,
+}
+
 #[repr(C)]
 pub struct JitRet {
     pub val: u64,
@@ -82,6 +98,8 @@ struct C {
     bail: Label,
     ret: Label,
     helpers: Helpers,
+    offsets: Option<HeapOffsets>,
+    ics_base: u64,
 }
 
 impl C {
@@ -103,6 +121,17 @@ impl C {
         self.a.lsr_imm(10, src, 48);
         self.a.cmp_reg(10, R_TAGLIM);
         self.a.b_cond(Cond::Hs, slow);
+    }
+
+    /// x{dst} = x{base} + w{idx} * size (size folded as shift when pow2).
+    fn index_addr(&mut self, dst: u32, base: u32, idx: u32, size: u32) {
+        if size.is_power_of_two() {
+            self.a.add_reg_lsl(dst, base, idx, size.trailing_zeros());
+        } else {
+            self.a.mov_imm64(11, size as u64);
+            self.a.mul(11, idx, 11);
+            self.a.add_reg(dst, base, 11);
+        }
     }
 
     /// blr a thin helper whose args are already staged; sentinel check +
@@ -135,7 +164,13 @@ impl C {
 /// Compile a proto to Tier-1 native code. Returns None when ineligible.
 /// `for_osr`: compiled as an OSR target — calls-in-loops allowed (the
 /// alternative there is staying interpreted, not a faster tier).
-pub fn compile(proto: &FunctionProto, helpers: Helpers, for_osr: bool) -> Option<Vec<u32>> {
+pub fn compile(
+    proto: &FunctionProto,
+    helpers: Helpers,
+    for_osr: bool,
+    offsets: Option<HeapOffsets>,
+    ics_base: u64,
+) -> Option<Vec<u32>> {
     if proto.is_async || proto.code.len() > MAX_CODE {
         return None;
     }
@@ -178,7 +213,7 @@ pub fn compile(proto: &FunctionProto, helpers: Helpers, for_osr: bool) -> Option
         let bail = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..proto.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, ret, helpers }
+        C { a, pc_labels, bail, ret, helpers, offsets, ics_base }
     };
 
     // prologue
@@ -509,6 +544,34 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
         }
 
         Op::GetField => {
+            let slow = c.a.new_label();
+            let done = c.a.new_label();
+            if let Some(o) = c.offsets {
+                // inline IC'd property load: tag check, shape-id compare
+                // against the per-pc cache, direct slot load. Reads only —
+                // no allocation, so arena pointers are stable throughout.
+                c.load_slot(8, ins.b);
+                c.a.lsr_imm(10, 8, 48);
+                c.a.movz(11, 0xFFFB, 0); // TAG_OBJ
+                c.a.cmp_reg(10, 11);
+                c.a.b_cond(Cond::Ne, slow);
+                c.a.orr_reg32(9, 31, 8); // w9 = payload ref
+                c.a.ldr_imm(10, R_REALM, o.realm_objs_ptr);
+                c.index_addr(10, 10, 9, o.obj_size);
+                c.a.ldr_imm(11, 10, o.obj_shape_arc);
+                c.a.ldr_w_imm(12, 11, o.shape_id_delta);
+                c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
+                c.a.ldr_imm(14, 13, 0);
+                c.a.lsr_imm(15, 14, 32);
+                c.a.cmp_reg(15, 12);
+                c.a.b_cond(Cond::Ne, slow); // empty IC or shape miss
+                c.a.sub_imm32(16, 14, 1); // slot (+1 encoding)
+                c.a.ldr_imm(17, 10, o.obj_vals_ptr);
+                c.a.ldr_reg_lsl3(8, 17, 16);
+                c.store_slot(8, ins.a);
+                c.a.b(done);
+            }
+            c.a.bind(slow);
             c.a.mov(0, R_REALM);
             c.a.mov(1, R_PROTO);
             c.a.mov_imm64(2, pc as u64);
@@ -517,6 +580,7 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             c.thin(c.helpers.get_field);
             c.a.mov(8, 0);
             c.store_slot(8, ins.a);
+            c.a.bind(done);
         }
         Op::SetField => {
             c.a.mov(0, R_REALM);
@@ -528,6 +592,34 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             c.thin(c.helpers.set_field);
         }
         Op::GetIndex => {
+            let slow = c.a.new_label();
+            let done = c.a.new_label();
+            if let Some(o) = c.offsets {
+                c.load_slot(8, ins.b);
+                c.a.lsr_imm(10, 8, 48);
+                c.a.movz(11, 0xFFFC, 0); // TAG_ARR
+                c.a.cmp_reg(10, 11);
+                c.a.b_cond(Cond::Ne, slow);
+                c.load_slot(9, ins.c);
+                c.guard_number(9, slow);
+                c.a.orr_reg32(12, 31, 8); // ref
+                c.a.ldr_imm(10, R_REALM, o.realm_arrs_ptr);
+                c.index_addr(10, 10, 12, o.arr_size);
+                // exact-integer index: fcvtzs/scvtf round trip
+                c.a.fmov_dx(0, 9);
+                c.a.fcvtzs(13, 0);
+                c.a.scvtf(1, 13);
+                c.a.fcmp(1, 0);
+                c.a.b_cond(Cond::Ne, slow); // fractional / NaN / huge
+                c.a.ldr_imm(14, 10, o.vec_len);
+                c.a.cmp_reg(13, 14);
+                c.a.b_cond(Cond::Hs, slow); // OOB or negative (unsigned)
+                c.a.ldr_imm(15, 10, o.vec_ptr);
+                c.a.ldr_reg_lsl3(8, 15, 13);
+                c.store_slot(8, ins.a);
+                c.a.b(done);
+            }
+            c.a.bind(slow);
             c.a.mov(0, R_REALM);
             c.a.mov(1, R_PROTO);
             c.a.mov_imm64(2, pc as u64);
@@ -536,6 +628,7 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             c.thin(c.helpers.get_index);
             c.a.mov(8, 0);
             c.store_slot(8, ins.a);
+            c.a.bind(done);
         }
         Op::SetIndex => {
             c.a.mov(0, R_REALM);
@@ -547,6 +640,24 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             c.thin(c.helpers.set_index);
         }
         Op::Len => {
+            let slow = c.a.new_label();
+            let done = c.a.new_label();
+            if let Some(o) = c.offsets {
+                c.load_slot(8, ins.b);
+                c.a.lsr_imm(10, 8, 48);
+                c.a.movz(11, 0xFFFC, 0);
+                c.a.cmp_reg(10, 11);
+                c.a.b_cond(Cond::Ne, slow); // strings etc -> helper
+                c.a.orr_reg32(12, 31, 8);
+                c.a.ldr_imm(10, R_REALM, o.realm_arrs_ptr);
+                c.index_addr(10, 10, 12, o.arr_size);
+                c.a.ldr_imm(14, 10, o.vec_len);
+                c.a.scvtf(0, 14);
+                c.a.fmov_xd(8, 0);
+                c.store_slot(8, ins.a);
+                c.a.b(done);
+            }
+            c.a.bind(slow);
             c.a.mov(0, R_REALM);
             c.a.mov(1, R_PROTO);
             c.a.mov_imm64(2, pc as u64);
@@ -554,6 +665,7 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             c.thin(c.helpers.len);
             c.a.mov(8, 0);
             c.store_slot(8, ins.a);
+            c.a.bind(done);
         }
         Op::ArrayPush => {
             c.a.mov(0, R_REALM);

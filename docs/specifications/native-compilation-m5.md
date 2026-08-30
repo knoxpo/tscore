@@ -60,3 +60,30 @@ so every worker realm shares one compilation).
   native→native calls + liveness spilling are the next tier of work.
 - bun/JSC remains ahead on peak single-core (int32 specialization,
   bounds-check elimination, inlining — out of M5 scope).
+
+## Inline heap reads (post-M5 push)
+
+Tier-1 templates inline the read hit paths — no helper call:
+
+- `GetField`: tag check → shape-id load → per-pc IC compare → direct
+  values-slot load (~19 instructions; helper only on IC miss, which
+  also fills the cache).
+- `GetIndex`: tag + exact-integer index check (fcvtzs round-trip) +
+  unsigned bounds → direct element load.
+- `Len` on arrays: direct length load.
+
+Writes stay in helpers (write barriers + shape transitions belong in
+Rust). Reads cannot allocate, so arena data pointers are stable within
+an inline sequence and are re-loaded per op — no caching discipline.
+
+**Runtime layout probing** instead of `#[repr(C)]`: at startup, struct
+offsets (Realm→objs/arrs data pointers, Obj internals, Vec internals,
+Arc/ShapeData deltas) are discovered by scanning sentinel-filled
+structures, then self-verified by reading known values back through the
+discovered offsets. Probe failure or ambiguity disables the inline
+paths — a std/compiler layout change degrades speed, never correctness.
+
+Also fixed here: JS array-index semantics (`arr[-1]`, `arr[1.5]` are
+undefined, not element 0/1 — f64→usize saturation bug); OSR (on-stack
+replacement) at interpreter back-edges — Tier-1's slot-resident
+registers make any loop header a valid entry point.
