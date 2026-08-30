@@ -38,9 +38,21 @@ check_agree() { # name r_tscore r_node r_bun
 
 ratio() { awk -v a="$1" -v b="$2" 'BEGIN {printf "%.2f", a/b}'; }
 
-row() { # name tscore_ms node_ms bun_ms -> markdown row with ratios vs node
-    printf "| %s | %.1f (%sx) | %.1f (1.00x) | %.1f (%sx) |\n" \
-        "$1" "$2" "$(ratio "$2" "$3")" "$3" "$4" "$(ratio "$4" "$3")" >>"$OUT"
+WINS_TSCORE=0; WINS_NODE=0; WINS_BUN=0
+winner() { # tscore node bun [max] -> engine name with min (or max) value
+    awk -v t="$1" -v n="$2" -v b="$3" -v m="${4:-min}" 'BEGIN {
+        if (m == "max") { t = -t; n = -n; b = -b }
+        if (t <= n && t <= b) print "tscore";
+        else if (n <= b) print "node";
+        else print "bun";
+    }'
+}
+tally() { case $1 in tscore) WINS_TSCORE=$((WINS_TSCORE+1));; node) WINS_NODE=$((WINS_NODE+1));; bun) WINS_BUN=$((WINS_BUN+1));; esac; }
+
+row() { # name tscore_ms node_ms bun_ms -> markdown row with ratios vs node + winner
+    local w; w=$(winner "$2" "$3" "$4"); tally "$w"
+    printf "| %s | %.1f (%sx) | %.1f (1.00x) | %.1f (%sx) | **%s** |\n" \
+        "$1" "$2" "$(ratio "$2" "$3")" "$3" "$4" "$(ratio "$4" "$3")" "$w" >>"$OUT"
 }
 
 {
@@ -70,8 +82,8 @@ hf_medians() { node -p 'JSON.parse(require("fs").readFileSync(process.argv[1])).
 {
     echo "## Startup + parse/compile (end-to-end, hyperfine)"
     echo
-    echo "| benchmark | tscore | node | bun |"
-    echo "|---|---|---|---|"
+    echo "| benchmark | tscore | node | bun | winner |"
+    echo "|---|---|---|---|---|"
 } >>"$OUT"
 read -r h_ts h_node h_bun <<<"$(hf_medians "$GEN/hf_hello.json")"
 row "startup (hello.ts)" "$h_ts" "$h_node" "$h_bun"
@@ -83,8 +95,8 @@ row "parse+compile (~50k LOC)" "$p_ts" "$p_node" "$p_bun"
     echo
     echo "## Steady-state (shared sources, in-program TIME_MS)"
     echo
-    echo "| benchmark | tscore | node | bun |"
-    echo "|---|---|---|---|"
+    echo "| benchmark | tscore | node | bun | winner |"
+    echo "|---|---|---|---|---|"
 } >>"$OUT"
 for b in objects closures alloc gc_churn promises; do
     echo "== $b ==" >&2
@@ -98,8 +110,8 @@ done
     echo
     echo "## Async (per-engine variants, same algorithm)"
     echo
-    echo "| benchmark | tscore | node | bun |"
-    echo "|---|---|---|---|"
+    echo "| benchmark | tscore | node | bun | winner |"
+    echo "|---|---|---|---|---|"
 } >>"$OUT"
 echo "== async_sleep ==" >&2
 ts_f=$DIR/bench/async_sleep_tscore.ts; js_f=$DIR/bench/async_sleep_node.mjs
@@ -120,14 +132,15 @@ f=$DIR/bench/longrun.ts
 read -r lr_ts_ops lr_ts_st <<<"$(longrun "$TSCORE" run "$f")"
 read -r lr_n_ops lr_n_st <<<"$(longrun node "$f")"
 read -r lr_b_ops lr_b_st <<<"$(longrun bun "$f")"
+lr_w=$(winner "$lr_ts_ops" "$lr_n_ops" "$lr_b_ops" max); tally "$lr_w"
 {
     echo
     echo "## Long-running (30s sustained mixed compute+alloc, single run)"
     echo
-    echo "| metric | tscore | node | bun |"
-    echo "|---|---|---|---|"
-    echo "| throughput (ops/sec) | $lr_ts_ops ($(ratio "$lr_ts_ops" "$lr_n_ops")x) | $lr_n_ops (1.00x) | $lr_b_ops ($(ratio "$lr_b_ops" "$lr_n_ops")x) |"
-    echo "| stability (last/first decile) | $lr_ts_st | $lr_n_st | $lr_b_st |"
+    echo "| metric | tscore | node | bun | winner |"
+    echo "|---|---|---|---|---|"
+    echo "| throughput (ops/sec) | $lr_ts_ops ($(ratio "$lr_ts_ops" "$lr_n_ops")x) | $lr_n_ops (1.00x) | $lr_b_ops ($(ratio "$lr_b_ops" "$lr_n_ops")x) | **$lr_w** |"
+    echo "| stability (last/first decile) | $lr_ts_st | $lr_n_st | $lr_b_st | |"
 } >>"$OUT"
 
 # ---- multicore scaling ----
@@ -141,8 +154,8 @@ mc() { # label tscore_prog workers_mjs
     {
         echo "### $label"
         echo
-        echo "| workers | tscore | node | bun |"
-        echo "|---|---|---|---|"
+        echo "| workers | tscore | node | bun | winner |"
+        echo "|---|---|---|---|---|"
     } >>"$OUT"
     for w in 1 2 4 8; do
         echo "== $label x$w ==" >&2
@@ -156,6 +169,20 @@ mc() { # label tscore_prog workers_mjs
 }
 mc "primes" benchmarks/programs/primes.ts benchmarks/programs/node/primes_workers.mjs
 mc "mandelbrot" benchmarks/programs/mandelbrot.ts "$DIR/bench/mc/mandel_workers.mjs"
+
+# ---- scoreboard ----
+{
+    echo "## Scoreboard"
+    echo
+    echo "| engine | wins |"
+    echo "|---|---|"
+    echo "| tscore | $WINS_TSCORE |"
+    echo "| node | $WINS_NODE |"
+    echo "| bun | $WINS_BUN |"
+    echo
+    echo "Win = fastest median (highest throughput for long-running) on that row."
+    echo
+} >>"$OUT"
 
 # ---- not benchmarkable yet ----
 {

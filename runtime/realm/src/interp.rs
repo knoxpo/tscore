@@ -27,11 +27,7 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
                 realm.stack.truncate(base);
                 return Ok(Value::foreign(p));
             }
-            let result = match run_frame(realm, Some(c), &proto, base, 0, 0) {
-                Ok(FrameResult::Return(v)) => Ok(v),
-                Ok(FrameResult::Await { .. }) => unreachable!("await in sync frame"),
-                Err(e) => Err(e),
-            };
+            let result = run_one(realm, Some(c), &proto, base, 0);
             realm.stack.truncate(base);
             result
         }
@@ -118,7 +114,7 @@ fn process_wake(realm: &mut Realm, wake: crate::Wake) {
 /// `base`. Runs the body synchronously to its first await; returns the
 /// promise (foreign ref) it will settle.
 #[cold]
-fn start_async(
+pub fn start_async(
     realm: &mut Realm,
     closure: Option<tsr_memory::Ref>,
     proto: Arc<FunctionProto>,
@@ -365,7 +361,27 @@ fn const_str_arc(proto: &FunctionProto, idx: usize) -> Arc<str> {
 
 /// Matches Node's ~10k default; also keeps Rust stack use bounded on
 /// worker/actor threads (which get 16MB stacks).
-const MAX_CALL_DEPTH: u32 = 10_000;
+pub const MAX_CALL_DEPTH: u32 = 10_000;
+
+/// Run a non-async closure frame to completion (JIT if hot, else
+/// interpreter). Arguments already placed at `base`.
+pub fn run_one(
+    realm: &mut Realm,
+    closure: Option<tsr_memory::Ref>,
+    proto: &Arc<FunctionProto>,
+    base: usize,
+    depth: u32,
+) -> Result<Value, RtError> {
+    if realm.jit_enabled {
+        if let Some(f) = crate::jit::tier_up(proto) {
+            return crate::jit::enter_jit(realm, f, proto, base, closure, depth);
+        }
+    }
+    match run_frame(realm, closure, proto, base, depth, 0)? {
+        FrameResult::Return(v) => Ok(v),
+        FrameResult::Await { .. } => unreachable!("await in sync frame"),
+    }
+}
 
 /// Outcome of one frame execution: normal return, or suspension at an
 /// `await` on a pending promise (async frames only).
@@ -533,12 +549,8 @@ fn run_frame(
                     let result = if callee.is_async {
                         Value::foreign(start_async(realm, Some(c), callee, new_base))
                     } else {
-                        match run_frame(realm, Some(c), &callee, new_base, depth + 1, 0)? {
-                            FrameResult::Return(v) => v,
-                            FrameResult::Await { .. } => {
-                                unreachable!("await in sync frame")
-                            }
-                        }
+                        // run_one tiers up to JIT when the callee is hot
+                        run_one(realm, Some(c), &callee, new_base, depth + 1)?
                     };
                     set_reg!(realm, a, result);
                 } else if let Kind::Native(i) = f.kind() {
@@ -774,6 +786,10 @@ fn run_frame(
         }
         pc += 1;
     }
+}
+
+pub fn get_field_pub(realm: &mut Realm, obj: Value, name: &str) -> Result<Value, RtError> {
+    get_field(realm, obj, name)
 }
 
 fn get_field(realm: &mut Realm, obj: Value, name: &str) -> Result<Value, RtError> {

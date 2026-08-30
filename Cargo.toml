@@ -14,6 +14,7 @@ members = [
     "runtime/memory",
     "runtime/gc",
     "runtime/io",
+    "runtime/jit",
     "platform/arm64",
     "platform/riscv64",
     "platform/linux",
@@ -48,6 +49,7 @@ tsr-realm = { path = "runtime/realm" }
 tsr-memory = { path = "runtime/memory" }
 tsr-gc = { path = "runtime/gc" }
 tsr-io = { path = "runtime/io" }
+tsr-jit = { path = "runtime/jit" }
 # platform
 tsp-arm64 = { path = "platform/arm64" }
 tsp-riscv64 = { path = "platform/riscv64" }

@@ -4,6 +4,7 @@
 //! `Chunk`, disassembler. The only crate both sides depend on.
 
 use std::fmt;
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8};
 use std::sync::Arc;
 
 /// Fixed-width instruction. ABC form uses a/b/c; ABx form packs b/c as u16
@@ -113,6 +114,33 @@ pub enum Op {
     Await,
 }
 
+/// Static type facts (flat lattice: anything joins to Top).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeHint {
+    Num,
+    Bool,
+    Str,
+    Other,
+    Top,
+}
+
+pub const TIER_COLD: u8 = 0;
+pub const TIER_COMPILING: u8 = 2;
+pub const TIER_BASELINE: u8 = 3;
+pub const TIER_OPT: u8 = 4;
+pub const TIER_REJECTED: u8 = 5;
+
+/// Per-function JIT state. Lives on the Arc-shared proto: counters and the
+/// published code pointer are cross-thread.
+#[derive(Debug, Default)]
+pub struct JitState {
+    pub counter: AtomicU32,
+    pub tier: AtomicU8,
+    pub code: AtomicPtr<u8>,
+    /// Arg-tag bitmasks observed during profiling (NUM=1 BOOL=2 STR=4 OTHER=8).
+    pub arg_seen: Vec<AtomicU8>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Const {
     Number(f64),
@@ -142,6 +170,9 @@ pub struct FunctionProto {
     pub protos: Vec<Arc<FunctionProto>>,
     /// Source byte offset per instruction, for error spans.
     pub spans: Vec<u32>,
+    /// TS parameter annotations (Top when unannotated).
+    pub arg_types: Vec<TypeHint>,
+    pub jit: JitState,
 }
 
 /// A compiled program: the top-level function.

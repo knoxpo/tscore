@@ -29,9 +29,13 @@ const TAG_CLOSURE: u64 = 0xFFFD;
 const TAG_CELL: u64 = 0xFFFE;
 const TAG_NATIVE: u64 = 0xFFFF;
 const CANON_NAN: u64 = 0x7FF8_0000_0000_0000;
-/// TAG_SPECIAL payloads: 0 null, 1 undefined, 2 false, 3 true, 4..8 reserved,
+/// TAG_SPECIAL payloads: 0 null, 1 undefined, 2 false, 3 true,
+/// 4 = JIT error sentinel (never a live value), 5..8 reserved,
 /// >= FOREIGN_BASE = foreign arena ref + FOREIGN_BASE.
 const FOREIGN_BASE: u32 = 8;
+
+/// Returned by JIT helpers to signal "error stored in realm.jit_error".
+pub const JIT_ERR_SENTINEL: u64 = (TAG_SPECIAL << TAG_SHIFT) | 4;
 
 /// Decoded view of a [`Value`] for match sites off the hot path.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -56,6 +60,15 @@ impl Value {
     pub const UNDEFINED: Value = Value((TAG_SPECIAL << TAG_SHIFT) | 1);
     pub const FALSE: Value = Value((TAG_SPECIAL << TAG_SHIFT) | 2);
     pub const TRUE: Value = Value((TAG_SPECIAL << TAG_SHIFT) | 3);
+
+    #[inline(always)]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+    #[inline(always)]
+    pub const fn from_bits(b: u64) -> Value {
+        Value(b)
+    }
 
     #[inline(always)]
     pub fn number(n: f64) -> Value {

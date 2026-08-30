@@ -12,3 +12,4 @@ tsr-gc.workspace = true
 rustc-hash = "2.1.3"
 tsr-task.workspace = true
 crossbeam-channel.workspace = true
+tsr-jit.workspace = true

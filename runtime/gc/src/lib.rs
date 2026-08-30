@@ -438,6 +438,8 @@ mod tests {
             upvals: vec![],
             protos: vec![],
             spans: vec![],
+            arg_types: vec![],
+            jit: Default::default(),
         });
         let clo = heap.alloc_closure(tsr_memory::Closure { proto, upvals: vec![cell] });
         *heap.cell_mut(cell) = Value::closure(clo);

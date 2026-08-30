@@ -1,0 +1,14 @@
+[package]
+name = "tsr-jit"
+description = "Hand-rolled ARM64 baseline + typed-opt JIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tsc-ir.workspace = true
+tsr-memory.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tsp-macos.workspace = true

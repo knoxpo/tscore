@@ -42,6 +42,7 @@ struct FuncState {
     name: String,
     arity: u8,
     is_async: bool,
+    arg_types: Vec<tsc_ir::TypeHint>,
     code: Vec<Instr>,
     spans: Vec<u32>,
     consts: Vec<Const>,
@@ -693,6 +694,16 @@ impl Emitter {
             let BindingPattern::BindingIdentifier(b) = &p.pattern else {
                 return self.unsupported("destructuring parameters", p.span.start);
             };
+            let hint = match &p.type_annotation {
+                Some(ann) => match &ann.type_annotation {
+                    TSType::TSNumberKeyword(_) => tsc_ir::TypeHint::Num,
+                    TSType::TSBooleanKeyword(_) => tsc_ir::TypeHint::Bool,
+                    TSType::TSStringKeyword(_) => tsc_ir::TypeHint::Str,
+                    _ => tsc_ir::TypeHint::Top,
+                },
+                None => tsc_ir::TypeHint::Top,
+            };
+            self.f().arg_types.push(hint);
             let local = self.declare_local(&b.name, b.span.start)?;
             if local.captured {
                 self.emit(Op::NewCell, local.reg, 0, 0);
@@ -1223,6 +1234,8 @@ fn finish(fs: FuncState) -> FunctionProto {
         upvals: fs.upvals.into_iter().map(|(_, s)| s).collect(),
         protos: fs.protos,
         spans: fs.spans,
+        arg_types: fs.arg_types,
+        jit: Default::default(),
     }
 }
 

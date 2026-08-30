@@ -4,6 +4,7 @@
 //! executes bytecode on the register-machine interpreter in [`interp`].
 
 pub mod interp;
+pub mod jit;
 
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -102,6 +103,9 @@ pub struct Realm {
     pub stack: Vec<Value>,
     /// Scratch realms (parallel chunks) set this false: they drop wholesale.
     pub gc_enabled: bool,
+    /// Scratch realms disable JIT: per-chunk compile never amortizes and
+    /// contends on the shared code-heap lock.
+    pub jit_enabled: bool,
     pub gc_stats: tsr_gc::GcStats,
     /// Per-realm memory ceiling (approximate live bytes at major GC).
     pub max_heap_bytes: Option<usize>,
@@ -109,6 +113,8 @@ pub struct Realm {
     oom: Option<String>,
     /// Observability hub, published to after each collection.
     pub stats_hub: Option<Arc<StatsHub>>,
+    /// Error slot for JIT helper failures (out-of-band from the ABI return).
+    pub jit_error: Option<RtError>,
     /// Cooperative cancellation flag, checked at interpreter safepoints.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Coroutines (foreign refs) ready to resume.
@@ -137,10 +143,12 @@ impl Realm {
             // shared cache lines / size-class neighborhoods
             stack: Vec::with_capacity(4096),
             gc_enabled: true,
+            jit_enabled: true,
             gc_stats: tsr_gc::GcStats::default(),
             max_heap_bytes: None,
             oom: None,
             stats_hub: None,
+            jit_error: None,
             cancel: None,
             microtasks: std::collections::VecDeque::new(),
             pinned: rustc_hash::FxHashSet::default(),

@@ -208,7 +208,8 @@ fn spawn_child(
 /// Run one child task in a scratch realm wired to its cancel flag.
 fn run_child(pv_fn: &PortableValue, cancel: &Arc<AtomicBool>) -> Result<PortableValue, Failure> {
     let mut realm = Realm::new();
-    realm.gc_enabled = false; // scratch realm: drops wholesale
+    realm.gc_enabled = false;
+    realm.jit_enabled = false; // scratch realm: drops wholesale
     realm.cancel = Some(cancel.clone());
     tsr_io::install(&mut realm);
     tsr_channel::install(&mut realm);

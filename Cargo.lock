@@ -725,6 +725,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tsr-jit"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "tsc-ir",
+ "tsp-macos",
+ "tsr-memory",
+]
+
+[[package]]
 name = "tsr-memory"
 version = "0.1.0"
 dependencies = [
@@ -739,6 +749,7 @@ dependencies = [
  "rustc-hash",
  "tsc-ir",
  "tsr-gc",
+ "tsr-jit",
  "tsr-memory",
  "tsr-task",
 ]
