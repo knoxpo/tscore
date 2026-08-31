@@ -38,6 +38,10 @@ const FOREIGN_BASE: u32 = 8;
 pub const JIT_ERR_SENTINEL: u64 = (TAG_SPECIAL << TAG_SHIFT) | 4;
 /// Returned by h_await to signal "pending — suspend info in realm.jit_await".
 pub const JIT_AWAIT_SENTINEL: u64 = (TAG_SPECIAL << TAG_SHIFT) | 5;
+/// Module-namespace field placeholder before the exporter initializes it
+/// (TDZ): reads through GetField report a clean error instead of
+/// undefined. Never a live user value.
+pub const TDZ_SENTINEL: u64 = (TAG_SPECIAL << TAG_SHIFT) | 6;
 
 /// Decoded view of a [`Value`] for match sites off the hot path.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -211,6 +215,8 @@ pub struct PromiseError {
     pub cancelled: bool,
     /// Source byte offset where the error originated, when known.
     pub span: Option<u32>,
+    /// Originating file for `span` (module graphs).
+    pub source: Option<Arc<str>>,
 }
 
 #[derive(Debug)]
@@ -1003,7 +1009,7 @@ impl Heap {
             Some(r) => {
                 let old = std::mem::replace(&mut self.objs[r as usize], o);
                 // the freed slot kept its overflow buffer — recycle it
-                if old.overflow.capacity() > 0 && self.pool_arr_bufs.len() < 4096 {
+                if old.overflow.capacity() > 0 && self.pool_arr_bufs.len() < 131072 {
                     let mut b = old.overflow;
                     b.clear();
                     self.pool_arr_bufs.push(b);
@@ -1027,7 +1033,7 @@ impl Heap {
         let r = match self.free_arrs.pop() {
             Some(r) => {
                 let old = std::mem::replace(&mut self.arrs[r as usize], v);
-                if old.capacity() > 0 && self.pool_arr_bufs.len() < 4096 {
+                if old.capacity() > 0 && self.pool_arr_bufs.len() < 131072 {
                     let mut b = old;
                     b.clear();
                     self.pool_arr_bufs.push(b);
@@ -1051,7 +1057,7 @@ impl Heap {
             Some(r) => {
                 let old = std::mem::replace(&mut self.strs[r as usize], s);
                 if let HStr::Buf(mut b) = old {
-                    if b.capacity() > 0 && self.pool_str_bufs.len() < 4096 {
+                    if b.capacity() > 0 && self.pool_str_bufs.len() < 131072 {
                         b.clear();
                         self.pool_str_bufs.push(b);
                     }

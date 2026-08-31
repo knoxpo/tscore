@@ -65,54 +65,287 @@ struct ListenerState {
     closed: bool,
 }
 
-/// One long-lived I/O thread per connection, draining a job queue —
-/// per-connection ops serialize naturally, no spawn per read.
+/// Reactor-backed connection: nonblocking fd, per-conn op queues drained
+/// by the single kqueue reactor thread (see `reactor` module).
 struct ConnCore {
-    tx: mpsc::Sender<ConnJob>,
-}
-
-enum ConnJob {
-    Read(usize, Completer),
-    Write(String, Completer),
-    Close,
+    id: u64,
 }
 
 fn spawn_conn(stream: TcpStream) -> Arc<ConnCore> {
-    let (tx, rx) = mpsc::channel::<ConnJob>();
-    std::thread::Builder::new()
-        .name("tscore-net-conn".into())
-        .spawn(move || {
-            let mut stream = stream;
-            for job in rx {
-                match job {
-                    ConnJob::Read(max, c) => {
-                        let mut buf = vec![0u8; max.clamp(1, 1 << 20)];
-                        match stream.read(&mut buf) {
-                            Ok(0) => c.settle(Ok(PortableValue::Undefined)), // EOF
-                            Ok(n) => c.settle(Ok(PortableValue::Str(Arc::from(
-                                String::from_utf8_lossy(&buf[..n]).as_ref(),
-                            )))),
-                            Err(e) => c.settle(Err(PromiseError {
-                                msg: format!("net.read: {e}"),
-                                cancelled: false,
-                                span: None,
-                            })),
+    let id = reactor::register_conn(stream);
+    Arc::new(ConnCore { id })
+}
+
+mod reactor {
+    //! One kqueue reactor thread for every runtime.net connection:
+    //! nonblocking sockets, readiness-driven read/write queues, results
+    //! through the Completer/Wake contract. Commands arrive on an mpsc
+    //! and the thread is woken with an EVFILT_USER event.
+
+    use super::*;
+    use std::collections::HashMap;
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub enum Cmd {
+        Register(u64, TcpStream),
+        Read(u64, usize, Completer),
+        Write(u64, Vec<u8>, Completer),
+        Connect(u64, TcpStream, Completer),
+        Close(u64),
+    }
+
+    struct Conn {
+        stream: TcpStream,
+        reads: VecDeque<(usize, Completer)>,
+        writes: VecDeque<(Vec<u8>, usize, Completer)>,
+        connecting: Option<Completer>,
+    }
+
+    struct Shared {
+        tx: mpsc::Sender<Cmd>,
+        kq: RawFd,
+    }
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    static SHARED: OnceLock<Shared> = OnceLock::new();
+    const WAKE_IDENT: usize = 0x7ac0;
+
+    fn shared() -> &'static Shared {
+        SHARED.get_or_init(|| {
+            let kq = unsafe { libc::kqueue() };
+            assert!(kq >= 0, "kqueue() failed");
+            // user event used to wake the reactor when commands arrive
+            let ev = libc::kevent {
+                ident: WAKE_IDENT,
+                filter: libc::EVFILT_USER,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            unsafe {
+                libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+            };
+            let (tx, rx) = mpsc::channel::<Cmd>();
+            std::thread::Builder::new()
+                .name("tscore-net-reactor".into())
+                .spawn(move || run(kq, rx))
+                .expect("spawn reactor");
+            Shared { tx, kq }
+        })
+    }
+
+    fn wake() {
+        let s = shared();
+        let ev = libc::kevent {
+            ident: WAKE_IDENT,
+            filter: libc::EVFILT_USER,
+            flags: 0,
+            fflags: libc::NOTE_TRIGGER,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        unsafe {
+            libc::kevent(s.kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+        };
+    }
+
+    fn send(cmd: Cmd) {
+        let _ = shared().tx.send(cmd);
+        wake();
+    }
+
+    pub fn register_conn(stream: TcpStream) -> u64 {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        stream.set_nonblocking(true).ok();
+        send(Cmd::Register(id, stream));
+        id
+    }
+
+    pub fn read(id: u64, max: usize, c: Completer) {
+        send(Cmd::Read(id, max, c));
+    }
+
+    pub fn write(id: u64, buf: Vec<u8>, c: Completer) {
+        send(Cmd::Write(id, buf, c));
+    }
+
+    pub fn close(id: u64) {
+        send(Cmd::Close(id));
+    }
+
+    fn arm(kq: RawFd, fd: RawFd, filter: i16, id: u64) {
+        let ev = libc::kevent {
+            ident: fd as usize,
+            filter,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: 0,
+            data: 0,
+            udata: id as *mut libc::c_void,
+        };
+        unsafe {
+            libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+        };
+    }
+
+    fn fail(c: Completer, msg: String) {
+        c.settle(Err(PromiseError { msg, cancelled: false, span: None, source: None }));
+    }
+
+    fn run(kq: RawFd, rx: mpsc::Receiver<Cmd>) {
+        let mut conns: HashMap<u64, Conn> = HashMap::new();
+        let mut events = vec![
+            libc::kevent {
+                ident: 0,
+                filter: 0,
+                flags: 0,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            64
+        ];
+        loop {
+            // drain commands
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    Cmd::Register(id, stream) => {
+                        conns.insert(id, Conn {
+                            stream,
+                            reads: VecDeque::new(),
+                            writes: VecDeque::new(),
+                            connecting: None,
+                        });
+                    }
+                    Cmd::Read(id, max, c) => {
+                        if let Some(conn) = conns.get_mut(&id) {
+                            conn.reads.push_back((max, c));
+                            pump_read(kq, id, conn);
+                        } else {
+                            fail(c, "net.read: connection closed".into());
                         }
                     }
-                    ConnJob::Write(s, c) => match stream.write_all(s.as_bytes()) {
-                        Ok(()) => c.settle(Ok(PortableValue::Undefined)),
-                        Err(e) => c.settle(Err(PromiseError {
-                            msg: format!("net.write: {e}"),
-                            cancelled: false,
-                            span: None,
-                        })),
-                    },
-                    ConnJob::Close => return,
+                    Cmd::Write(id, buf, c) => {
+                        if let Some(conn) = conns.get_mut(&id) {
+                            conn.writes.push_back((buf, 0, c));
+                            pump_write(kq, id, conn);
+                        } else {
+                            fail(c, "net.write: connection closed".into());
+                        }
+                    }
+                    Cmd::Connect(id, stream, c) => {
+                        let fd = stream.as_raw_fd();
+                        conns.insert(id, Conn {
+                            stream,
+                            reads: VecDeque::new(),
+                            writes: VecDeque::new(),
+                            connecting: Some(c),
+                        });
+                        arm(kq, fd, libc::EVFILT_WRITE, id);
+                    }
+                    Cmd::Close(id) => {
+                        conns.remove(&id); // drop closes the fd
+                    }
                 }
             }
-        })
-        .expect("spawn conn thread");
-    Arc::new(ConnCore { tx })
+            // wait for readiness
+            let n = unsafe {
+                libc::kevent(
+                    kq,
+                    std::ptr::null(),
+                    0,
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    std::ptr::null(),
+                )
+            };
+            for ev in events.iter().take(n.max(0) as usize) {
+                if ev.filter == libc::EVFILT_USER {
+                    continue; // command wakeup: handled at loop top
+                }
+                let id = ev.udata as u64;
+                let Some(conn) = conns.get_mut(&id) else { continue };
+                if ev.filter == libc::EVFILT_READ {
+                    pump_read(kq, id, conn);
+                } else if ev.filter == libc::EVFILT_WRITE {
+                    if let Some(c) = conn.connecting.take() {
+                        // connect completion: check SO_ERROR
+                        let fd = conn.stream.as_raw_fd();
+                        let mut err: libc::c_int = 0;
+                        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                        unsafe {
+                            libc::getsockopt(
+                                fd,
+                                libc::SOL_SOCKET,
+                                libc::SO_ERROR,
+                                &mut err as *mut _ as *mut libc::c_void,
+                                &mut len,
+                            );
+                        }
+                        if err == 0 {
+                            c.settle(Ok(PortableValue::Number(id as f64)));
+                        } else {
+                            fail(c, format!("net.connect: errno {err}"));
+                            conns.remove(&id);
+                            continue;
+                        }
+                    }
+                    pump_write(kq, id, conn);
+                }
+            }
+        }
+    }
+
+    /// Serve queued reads while the socket has data; re-arm on WouldBlock.
+    fn pump_read(kq: RawFd, id: u64, conn: &mut Conn) {
+        while let Some((max, _)) = conn.reads.front() {
+            let mut buf = vec![0u8; (*max).clamp(1, 1 << 20)];
+            match conn.stream.read(&mut buf) {
+                Ok(0) => {
+                    let (_, c) = conn.reads.pop_front().unwrap();
+                    c.settle(Ok(PortableValue::Undefined)); // EOF
+                }
+                Ok(n) => {
+                    let (_, c) = conn.reads.pop_front().unwrap();
+                    c.settle(Ok(PortableValue::Str(Arc::from(
+                        String::from_utf8_lossy(&buf[..n]).as_ref(),
+                    ))));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    arm(kq, conn.stream.as_raw_fd(), libc::EVFILT_READ, id);
+                    return;
+                }
+                Err(e) => {
+                    let (_, c) = conn.reads.pop_front().unwrap();
+                    fail(c, format!("net.read: {e}"));
+                }
+            }
+        }
+    }
+
+    fn pump_write(kq: RawFd, id: u64, conn: &mut Conn) {
+        while let Some((buf, off, _)) = conn.writes.front_mut() {
+            match conn.stream.write(&buf[*off..]) {
+                Ok(n) => {
+                    *off += n;
+                    if *off >= buf.len() {
+                        let (_, _, c) = conn.writes.pop_front().unwrap();
+                        c.settle(Ok(PortableValue::Undefined));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    arm(kq, conn.stream.as_raw_fd(), libc::EVFILT_WRITE, id);
+                    return;
+                }
+                Err(e) => {
+                    let (_, _, c) = conn.writes.pop_front().unwrap();
+                    fail(c, format!("net.write: {e}"));
+                }
+            }
+        }
+    }
 }
 
 pub fn install(realm: &mut Realm) {
@@ -187,7 +420,7 @@ pub fn install(realm: &mut Realm) {
             _ => 64 * 1024,
         };
         let (promise, completer) = realm.promise_pair();
-        let _ = core.tx.send(ConnJob::Read(max, completer));
+        reactor::read(core.id, max, completer);
         Ok(promise)
     });
 
@@ -198,14 +431,42 @@ pub fn install(realm: &mut Realm) {
             None => return Err(RtError::new("net.write: expected a string")),
         };
         let (promise, completer) = realm.promise_pair();
-        let _ = core.tx.send(ConnJob::Write(s, completer));
+        reactor::write(core.id, s.into_bytes(), completer);
+        Ok(promise)
+    });
+
+    let connect = realm.add_native(|realm, args| {
+        let host = match args.get(realm, 0).as_str_ref() {
+            Some(r) => realm.heap.str_at(r).to_string(),
+            None => return Err(RtError::new("net.connect(host, port)")),
+        };
+        let port = match args.get(realm, 1).kind() {
+            tsr_memory::Kind::Number(n) => n as u16,
+            _ => return Err(RtError::new("net.connect(host, port)")),
+        };
+        let (promise, completer) = realm.promise_pair();
+        std::thread::Builder::new()
+            .name("tscore-net-connect".into())
+            .spawn(move || match TcpStream::connect((host.as_str(), port)) {
+                Ok(stream) => {
+                    let conn = spawn_conn(stream);
+                    completer.settle(Ok(PortableValue::Handle(CONN_KIND, conn)));
+                }
+                Err(e) => completer.settle(Err(PromiseError {
+                    msg: format!("net.connect {host}:{port}: {e}"),
+                    cancelled: false,
+                    span: None,
+                    source: None,
+                })),
+            })
+            .expect("spawn connect thread");
         Ok(promise)
     });
 
     let close = realm.add_native(|realm, args| {
         let v = args.get(realm, 0);
         if let Ok(core) = core_of::<ConnCore>(realm, v, CONN_KIND, "net.close") {
-            let _ = core.tx.send(ConnJob::Close);
+            reactor::close(core.id);
             return Ok(Value::UNDEFINED);
         }
         if let Ok(core) = core_of::<ListenerCore>(realm, v, LISTENER_KIND, "net.close") {
@@ -221,6 +482,7 @@ pub fn install(realm: &mut Realm) {
         ("accept", accept),
         ("read", read),
         ("write", write),
+        ("connect", connect),
         ("close", close),
     ] {
         net.set(Arc::from(k), v);
@@ -272,6 +534,13 @@ fn http_serve(realm: &mut Realm, args: NativeArgs) -> Result<Value, RtError> {
     if handler.as_closure().is_none() {
         return Err(RtError::new("http.serve: handler must be a function"));
     }
+    let workers = args
+        .get(realm, 2)
+        .as_object()
+        .and_then(|o| realm.heap.obj(o).get("workers"))
+        .filter(|v| v.is_number())
+        .map(|v| (v.as_number() as usize).max(1))
+        .unwrap_or(1);
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| RtError::new(format!("http.serve: {e}")))?;
     let (req_tx, req_rx) = mpsc::channel::<HttpRequest>();
@@ -290,33 +559,78 @@ fn http_serve(realm: &mut Realm, args: NativeArgs) -> Result<Value, RtError> {
         })
         .expect("spawn http acceptor");
 
-    eprintln!("tscore http: listening on 127.0.0.1:{port}");
+    eprintln!("tscore http: listening on 127.0.0.1:{port} ({workers} worker(s))");
+    if workers > 1 {
+        // parallel dispatch: N handler realms, each with a rehydrated copy
+        // of the handler, pulling from the shared queue. Handler realms
+        // are isolated (parallel.map rule: only captured state travels).
+        let pv = tsr_task::portable::clone_out(&realm.heap, handler)
+            .map_err(|e| RtError::new(format!("http.serve: handler not portable: {e}")))?;
+        let shared_rx = Arc::new(Mutex::new(req_rx));
+        for i in 0..workers {
+            let pv = pv.clone();
+            let rx = shared_rx.clone();
+            std::thread::Builder::new()
+                .name(format!("tscore-http-worker-{i}"))
+                .spawn(move || {
+                    let mut wr = Realm::new();
+                    tsr_io_install_min(&mut wr);
+                    let h = tsr_task::portable::rehydrate(&pv, &mut wr.heap);
+                    loop {
+                        let req = {
+                            let guard = rx.lock().unwrap();
+                            guard.recv()
+                        };
+                        let Ok(req) = req else { return };
+                        dispatch_one(&mut wr, h, req);
+                    }
+                })
+                .expect("spawn http worker");
+        }
+        // park the calling realm forever (a server IS the program)
+        loop {
+            std::thread::park();
+        }
+    }
     // dispatch loop: build the request object, run the handler (driving
     // any awaits), ship the reply back to the connection thread
     loop {
         let Ok(req) = req_rx.recv() else {
             return Ok(Value::UNDEFINED);
         };
-        let mut headers = Obj::default();
-        for (k, v) in &req.headers {
-            headers.set(Arc::from(k.as_str()), realm.alloc_string(v));
-        }
-        let headers_v = Value::object(realm.heap.alloc_obj(headers));
-        let mut ro = Obj::default();
-        ro.set(Arc::from("method"), realm.alloc_string(&req.method));
-        ro.set(Arc::from("path"), realm.alloc_string(&req.path));
-        ro.set(Arc::from("headers"), headers_v);
-        ro.set(Arc::from("body"), realm.alloc_string(&req.body));
-        let req_v = Value::object(realm.heap.alloc_obj(ro));
-
-        let outcome = tsr_realm::interp::call_value(realm, handler, &[req_v])
-            .and_then(|r| tss_parallel::settle_if_promise(realm, r));
-        let (status, hdrs, body) = match outcome {
-            Ok(v) => response_parts(realm, v),
-            Err(e) => (500, Vec::new(), format!("handler error: {}\n", e.msg)),
-        };
-        let _ = req.reply.send((status, hdrs, body));
+        dispatch_one(realm, handler, req);
     }
+}
+
+/// Minimal realm setup for http worker realms (console/Math/timers; the
+/// handler must not rely on module namespaces or main-realm globals).
+fn tsr_io_install_min(realm: &mut Realm) {
+    // io installs console/Math/Date/performance/sleep; channel lets
+    // handlers talk to the rest of the app
+    tsr_io::install(realm);
+    tsr_channel::install(realm);
+}
+
+fn dispatch_one(realm: &mut Realm, handler: Value, req: HttpRequest) {
+    let mut headers = Obj::default();
+    for (k, v) in &req.headers {
+        headers.set(Arc::from(k.as_str()), realm.alloc_string(v));
+    }
+    let headers_v = Value::object(realm.heap.alloc_obj(headers));
+    let mut ro = Obj::default();
+    ro.set(Arc::from("method"), realm.alloc_string(&req.method));
+    ro.set(Arc::from("path"), realm.alloc_string(&req.path));
+    ro.set(Arc::from("headers"), headers_v);
+    ro.set(Arc::from("body"), realm.alloc_string(&req.body));
+    let req_v = Value::object(realm.heap.alloc_obj(ro));
+
+    let outcome = tsr_realm::interp::call_value(realm, handler, &[req_v])
+        .and_then(|r| tss_parallel::settle_if_promise(realm, r));
+    let (status, hdrs, body) = match outcome {
+        Ok(v) => response_parts(realm, v),
+        Err(e) => (500, Vec::new(), format!("handler error: {}\n", e.msg)),
+    };
+    let _ = req.reply.send((status, hdrs, body));
 }
 
 fn response_parts(realm: &Realm, v: Value) -> (u16, Vec<(String, String)>, String) {
@@ -387,9 +701,36 @@ fn http_conn(stream: TcpStream, tx: mpsc::Sender<HttpRequest>) {
                 headers.push((k, v));
             }
         }
-        // body
+        // body: content-length or chunked transfer-encoding
         let mut body = String::new();
-        if content_len > 0 {
+        let chunked = headers
+            .iter()
+            .any(|(k, v)| k == "transfer-encoding" && v.eq_ignore_ascii_case("chunked"));
+        if chunked {
+            loop {
+                let mut szline = String::new();
+                if reader.read_line(&mut szline).map(|n| n == 0).unwrap_or(true) {
+                    return;
+                }
+                let sz = usize::from_str_radix(
+                    szline.trim().split(';').next().unwrap_or("").trim(),
+                    16,
+                )
+                .unwrap_or(0);
+                if sz == 0 {
+                    let mut trail = String::new();
+                    let _ = reader.read_line(&mut trail); // trailing CRLF
+                    break;
+                }
+                let mut buf = vec![0u8; sz];
+                if reader.read_exact(&mut buf).is_err() {
+                    return;
+                }
+                body.push_str(&String::from_utf8_lossy(&buf));
+                let mut crlf = String::new();
+                let _ = reader.read_line(&mut crlf);
+            }
+        } else if content_len > 0 {
             let mut buf = vec![0u8; content_len];
             if reader.read_exact(&mut buf).is_err() {
                 return;

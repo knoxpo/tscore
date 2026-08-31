@@ -143,6 +143,7 @@ pub fn install(realm: &mut Realm) {
                 msg: "Channel.send: channel closed while waiting".into(),
                 cancelled: false,
                 span: None,
+                source: None,
             }));
         }
         Ok(Value::UNDEFINED)

@@ -92,7 +92,7 @@ fn drive_inner(
                     msg: e.msg.clone(),
                     span: e.span,
                     cancelled: e.cancelled,
-                    source: None,
+                    source: e.source.clone(),
                 })
             }
             PromiseState::Pending => {
@@ -155,6 +155,7 @@ pub fn start_async(
                 msg: e.msg,
                 cancelled: e.cancelled,
                 span: e.span,
+                source: e.source,
             }),
             reactions: Vec::new(),
         })),
@@ -273,7 +274,12 @@ fn resume(realm: &mut Realm, co_ref: tsr_memory::Ref) {
             settle(
                 realm,
                 co.promise,
-                Err(PromiseError { msg: e.msg, cancelled: e.cancelled, span: e.span }),
+                Err(PromiseError {
+                    msg: e.msg,
+                    cancelled: e.cancelled,
+                    span: e.span,
+                    source: e.source,
+                }),
             );
             realm.unpin(co.promise);
         }
@@ -761,7 +767,7 @@ fn run_frame(
                                     msg: e.msg.clone(),
                                     span: e.span.or_else(|| pbody.spans.get(pc).copied()),
                                     cancelled: e.cancelled,
-                                    source: proto.source_name_arc(),
+                                    source: e.source.clone().or_else(|| proto.source_name_arc()),
                                 })
                             }
                             PromiseState::Pending => {
@@ -901,6 +907,10 @@ fn run_frame(
                         Some(c) => *realm.heap.cell(c),
                         None => v,
                     };
+                    if v.bits() == tsr_memory::TDZ_SENTINEL {
+                        return Err(err(proto, pc,
+                            "cannot access module binding before initialization".into()));
+                    }
                     set_reg!(realm, a, v);
                 } else {
                     let name = const_str(proto, ins.c as usize);
@@ -1064,10 +1074,16 @@ fn get_field(realm: &mut Realm, obj: Value, name: &str) -> Result<Value, RtError
         Kind::Object(r) => {
             let v = realm.heap.obj(r).get(name).unwrap_or(Value::UNDEFINED);
             // ns fields hold cells (live module bindings): deref
-            Ok(match v.as_cell() {
+            let v = match v.as_cell() {
                 Some(c) => *realm.heap.cell(c),
                 None => v,
-            })
+            };
+            if v.bits() == tsr_memory::TDZ_SENTINEL {
+                return Err(RtError::new(format!(
+                    "cannot access module binding '{name}' before initialization"
+                )));
+            }
+            Ok(v)
         }
         Kind::Array(r) if name == "length" => {
             Ok(Value::number(realm.heap.arr(r).len() as f64))

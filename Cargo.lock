@@ -784,6 +784,9 @@ dependencies = [
 name = "tsr-net"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "tsr-channel",
+ "tsr-io",
  "tsr-memory",
  "tsr-realm",
  "tsr-task",

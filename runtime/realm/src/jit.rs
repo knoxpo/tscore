@@ -764,6 +764,10 @@ extern "C" fn h_get_field(
             Some(c) => *r.heap.cell(c),
             None => v,
         };
+        if v.bits() == tsr_memory::TDZ_SENTINEL {
+            return fail(r, err_at(pr, pc as usize,
+                "cannot access module binding before initialization".into()));
+        }
         return JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 };
     }
     let name = name_const(pr, cidx as usize).to_string();
@@ -1213,7 +1217,7 @@ extern "C" fn h_await(
                         msg: e.msg.clone(),
                         span: e.span,
                         cancelled: e.cancelled,
-                        source: None,
+                        source: e.source.clone(),
                     };
                     return fail(r, err);
                 }
@@ -1465,6 +1469,7 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
         num: &typed.num_facts,
         jumpif: &jumpif,
         arg_guard: &typed.arg_guard,
+        loop_spec: &typed.loop_spec,
     };
     let ics = proto.jit.ics_base(proto.body().code.len()) as u64;
     let tics = proto.jit.tics_base(proto.body().code.len()) as u64;
@@ -1624,6 +1629,9 @@ pub fn enter_jit(
             // deopt: state fully materialized in slots; resume in the
             // interpreter. Repeated deopts demote the proto to Tier-1.
             let deopts = proto.jit.deopts.fetch_add(1, Relaxed) + 1;
+            if std::env::var_os("TSC_DEOPT_DEBUG").is_some() {
+                eprintln!("[deopt] '{}' resume={} count={}", proto.name, ret.stack, deopts);
+            }
             if deopts >= 10 && proto.jit.tier.load(Relaxed) == TIER_OPT {
                 compile_tier1(proto);
             }

@@ -279,6 +279,7 @@ fn run_parallel(
                         msg: "task cancelled".into(),
                         cancelled: true,
                         span: None,
+                        source: None,
                     });
                 }
             }
@@ -333,12 +334,14 @@ fn run_chunk(
                 msg: e.msg,
                 cancelled: e.cancelled,
                 span: e.span,
+                source: e.source,
             })?;
         if collect {
             out.push((*i, clone_out(&realm.heap, r).map_err(|msg| PromiseError {
                 msg,
                 cancelled: false,
                 span: None,
+                source: None,
             })?));
         }
     }

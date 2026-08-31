@@ -26,6 +26,11 @@ pub struct TypedProto {
     /// Per-arg: entry guard proves this param numeric (annotation or
     /// uniform runtime feedback).
     pub arg_guard: Vec<bool>,
+    /// Loop-header speculation: (header pc, vregs to number-guard on the
+    /// preheader edge). Inside the loop these flow as proven Num; the
+    /// compiler must guard the fall-in path (and OSR entries) and deopt
+    /// to the header on a miss.
+    pub loop_spec: Vec<(usize, Vec<u8>)>,
 }
 
 // internal lattice: Num / Bool / Top (strings, objects, etc. all Top —
@@ -52,6 +57,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         num_facts: Vec::new(),
         jumpif: Vec::new(),
         arg_guard: Vec::new(),
+        loop_spec: Vec::new(),
     };
     if proto.arity > 8 {
         return reject("arity > 8 (unprofiled)");
@@ -76,21 +82,41 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
             entry[i] = T::Num;
         }
     }
-    states[0] = Some(entry);
+    states[0] = Some(entry.clone());
     let mut work = vec![0usize];
     let mut num_facts = vec![[false; 3]; n];
     let mut jumpif = vec![CondFact::Other; n];
+    // loop-header speculation state (filled between the two passes):
+    // pinned[H] = set of vregs forced Num at header H's merge
+    let mut pinned: std::collections::HashMap<usize, Vec<u8>> =
+        std::collections::HashMap::new();
 
-    let merge = |states: &mut Vec<Option<Vec<T>>>, work: &mut Vec<usize>, t: usize, s: &[T]| {
+    let merge = |states: &mut Vec<Option<Vec<T>>>,
+                 work: &mut Vec<usize>,
+                 pinned: &std::collections::HashMap<usize, Vec<u8>>,
+                 t: usize,
+                 s: &[T]| {
+        let pins = pinned.get(&t);
+        let pin = |r: usize, v: T| -> T {
+            if pins.is_some_and(|p| p.contains(&(r as u8))) {
+                T::Num // speculated: the preheader guard enforces this
+            } else {
+                v
+            }
+        };
         match &mut states[t] {
             None => {
-                states[t] = Some(s.to_vec());
+                let mut v = s.to_vec();
+                for (r, slot) in v.iter_mut().enumerate() {
+                    *slot = pin(r, *slot);
+                }
+                states[t] = Some(v);
                 work.push(t);
             }
             Some(old) => {
                 let mut changed = false;
-                for (o, &v) in old.iter_mut().zip(s.iter()) {
-                    let j = join(*o, v);
+                for (r, (o, &v)) in old.iter_mut().zip(s.iter()).enumerate() {
+                    let j = pin(r, join(*o, v));
                     if j != *o {
                         *o = j;
                         changed = true;
@@ -103,6 +129,131 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         }
     };
 
+    // ---- two passes: discover speculation candidates, then re-run with
+    // headers pinned Num for them ----
+    for pass in 0..2 {
+        if pass == 1 {
+            // candidates: back-edge target H where states[H][v] joined to
+            // Top but every back-edge source carries Num for v
+            let mut spec: std::collections::HashMap<usize, Vec<u8>> =
+                std::collections::HashMap::new();
+            for (pc, ins) in body.code.iter().enumerate() {
+                if ins.op != Op::Jump || ins.sbx() >= 0 {
+                    continue;
+                }
+                let h = (pc as i64 + ins.sbx() as i64 + 1) as usize;
+                let (Some(hs), Some(es)) = (&states[h], &states[pc]) else {
+                    continue;
+                };
+                for r in 0..nregs {
+                    if hs[r] == T::Top && es[r] == T::Num {
+                        let e = spec.entry(h).or_default();
+                        if !e.contains(&(r as u8)) {
+                            e.push(r as u8);
+                        }
+                    }
+                }
+            }
+            // multiple back-edges to one header: require Num on ALL of them
+            for (pc, ins) in body.code.iter().enumerate() {
+                if ins.op != Op::Jump || ins.sbx() >= 0 {
+                    continue;
+                }
+                let h = (pc as i64 + ins.sbx() as i64 + 1) as usize;
+                if let (Some(vs), Some(es)) = (spec.get_mut(&h), &states[pc]) {
+                    vs.retain(|&r| es[r as usize] == T::Num);
+                }
+            }
+            // only speculate vregs LIVE-IN at the header: a dead loop
+            // temp is garbage on first entry — its guard would deopt
+            // every call (measured: 2.4x regression on primes)
+            for (h, vs) in spec.iter_mut() {
+                // find this header's furthest back-edge (loop end)
+                let end = body
+                    .code
+                    .iter()
+                    .enumerate()
+                    .filter(|(pc, i)| {
+                        i.op == Op::Jump
+                            && i.sbx() < 0
+                            && (*pc as i64 + i.sbx() as i64 + 1) as usize == *h
+                    })
+                    .map(|(pc, _)| pc)
+                    .max()
+                    .unwrap_or(*h);
+                vs.retain(|&r| {
+                    for pc in *h..=end {
+                        let i = body.code[pc];
+                        let reads_a = matches!(
+                            i.op,
+                            Op::SetField
+                                | Op::SetIndex
+                                | Op::ArrayPush
+                                | Op::StoreCell
+                                | Op::SetUpval
+                                | Op::Return
+                                | Op::JumpIfFalse
+                                | Op::JumpIfTrue
+                                | Op::NewCell
+                                | Op::Await
+                                | Op::Call
+                        );
+                        let bx_form = matches!(
+                            i.op,
+                            Op::LoadConst
+                                | Op::LoadInt
+                                | Op::Jump
+                                | Op::JumpIfFalse
+                                | Op::JumpIfTrue
+                                | Op::Closure
+                                | Op::GetGlobal
+                        );
+                        let reads_bc = !bx_form;
+                        if reads_a && i.a == r {
+                            return true; // read before any write
+                        }
+                        if reads_bc && (i.b == r || i.c == r) {
+                            return true;
+                        }
+                        // writes: most ops write a
+                        let writes_a = !matches!(
+                            i.op,
+                            Op::SetField
+                                | Op::SetIndex
+                                | Op::ArrayPush
+                                | Op::StoreCell
+                                | Op::SetUpval
+                                | Op::Jump
+                                | Op::JumpIfFalse
+                                | Op::JumpIfTrue
+                                | Op::Return
+                                | Op::Halt
+                                | Op::EqSkip
+                                | Op::NeSkip
+                                | Op::LtSkip
+                                | Op::LeSkip
+                                | Op::GtSkip
+                                | Op::GeSkip
+                        );
+                        if writes_a && i.a == r {
+                            return false; // defined before use
+                        }
+                    }
+                    false // never used in the loop
+                });
+            }
+            spec.retain(|_, vs| !vs.is_empty());
+            if spec.is_empty() {
+                break; // nothing to speculate: pass-1 results stand
+            }
+            pinned = spec;
+            // reset and re-run the fixpoint with pinning
+            states = vec![None; n + 1];
+            states[0] = Some(entry.clone());
+            work = vec![0usize];
+            num_facts = vec![[false; 3]; n];
+            jumpif = vec![CondFact::Other; n];
+        }
     while let Some(pc) = work.pop() {
         if pc >= n {
             continue;
@@ -181,9 +332,16 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
             }
         }
         for t in next {
-            merge(&mut states, &mut work, t, &s);
+            merge(&mut states, &mut work, &pinned, t, &s);
         }
     }
+    } // pass loop
+
+    let loop_spec: Vec<(usize, Vec<u8>)> = {
+        let mut v: Vec<_> = pinned.into_iter().collect();
+        v.sort_by_key(|(h, _)| *h);
+        v
+    };
 
     TypedProto {
         tier2_ok: true,
@@ -191,6 +349,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         num_facts,
         jumpif,
         arg_guard,
+        loop_spec,
     }
 }
 

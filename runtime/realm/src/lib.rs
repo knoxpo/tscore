@@ -49,6 +49,7 @@ impl Completer {
             msg: msg.into(),
             cancelled: false,
             span: None,
+            source: None,
         }));
     }
 }
@@ -62,6 +63,7 @@ impl Drop for Completer {
                     msg: "internal: completer dropped without settling".into(),
                     cancelled: false,
                     span: None,
+                    source: None,
                 }),
             });
         }
@@ -135,8 +137,9 @@ pub struct Realm {
     pub stack: Vec<Value>,
     /// Scratch realms (parallel chunks) set this false: they drop wholesale.
     pub gc_enabled: bool,
-    /// Scratch realms disable JIT: per-chunk compile never amortizes and
-    /// contends on the shared code-heap lock.
+    /// Per-realm JIT gate (unused today: every realm runs with it on —
+    /// compiled code, ICs and shapes are process-global and cross-realm
+    /// safe; workers reuse code compiled anywhere).
     pub jit_enabled: bool,
     pub gc_stats: tsr_gc::GcStats,
     /// Per-realm memory ceiling (approximate live bytes at major GC).

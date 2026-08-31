@@ -71,9 +71,38 @@ fn async_op(
             msg,
             cancelled: false,
             span: None,
+            source: None,
         })),
     }));
     promise
+}
+
+const BYTES_KIND: &str = "bytes";
+
+fn make_bytes(realm: &mut Realm, data: Arc<Vec<u8>>) -> Value {
+    let f = realm
+        .heap
+        .alloc_foreign(tsr_memory::Foreign::Handle(BYTES_KIND, data));
+    let mut obj = tsr_memory::Obj::default();
+    obj.set(Arc::from("__bytes"), Value::foreign(f));
+    Value::object(realm.heap.alloc_obj(obj))
+}
+
+fn bytes_of(realm: &Realm, v: Value, who: &str) -> Result<Arc<Vec<u8>>, RtError> {
+    let err = || RtError::new(format!("{who}: expected a Bytes handle"));
+    let obj = v.as_object().ok_or_else(err)?;
+    let f = realm
+        .heap
+        .obj(obj)
+        .get("__bytes")
+        .and_then(|v| v.as_foreign())
+        .ok_or_else(err)?;
+    match realm.heap.foreign(f) {
+        tsr_memory::Foreign::Handle(BYTES_KIND, any) => {
+            any.clone().downcast::<Vec<u8>>().map_err(|_| err())
+        }
+        _ => Err(err()),
+    }
 }
 
 pub fn install(realm: &mut Realm) {
@@ -179,6 +208,24 @@ pub fn install(realm: &mut Realm) {
         }))
     });
 
+    let read_bytes = realm.add_native(|realm, args| {
+        let p = path_arg(realm, args, 0, "fs.readBytes")?;
+        Ok(async_op(realm, move || {
+            std::fs::read(&p)
+                .map(|b| PortableValue::Handle(BYTES_KIND, Arc::new(b)))
+                .map_err(|e| format!("fs.readBytes {}: {e}", p.display()))
+        }))
+    });
+    let write_bytes = realm.add_native(|realm, args| {
+        let p = path_arg(realm, args, 0, "fs.writeBytes")?;
+        let b = bytes_of(realm, args.get(realm, 1), "fs.writeBytes")?;
+        Ok(async_op(realm, move || {
+            std::fs::write(&p, b.as_slice())
+                .map(|_| PortableValue::Undefined)
+                .map_err(|e| format!("fs.writeBytes {}: {e}", p.display()))
+        }))
+    });
+
     let mut fs = tsr_memory::Obj::default();
     for (k, v) in [
         ("readFile", read_file),
@@ -189,15 +236,62 @@ pub fn install(realm: &mut Realm) {
         ("mkdir", mkdir),
         ("remove", remove),
         ("exists", exists),
+        ("readBytes", read_bytes),
+        ("writeBytes", write_bytes),
     ] {
         fs.set(Arc::from(k), v);
     }
     let fs_ref = realm.heap.alloc_obj(fs);
+
+    // runtime.bytes — immutable byte-buffer helpers (v1)
+    let b_len = realm.add_native(|realm, args| {
+        let b = bytes_of(realm, args.get(realm, 0), "bytes.size")?;
+        Ok(Value::number(b.len() as f64))
+    });
+    let b_slice = realm.add_native(|realm, args| {
+        let b = bytes_of(realm, args.get(realm, 0), "bytes.slice")?;
+        let from = args.get(realm, 1);
+        let to = args.get(realm, 2);
+        let from = if from.is_number() { from.as_number().max(0.0) as usize } else { 0 };
+        let to = if to.is_number() {
+            (to.as_number().max(0.0) as usize).min(b.len())
+        } else {
+            b.len()
+        };
+        let out: Vec<u8> = b.get(from..to.max(from)).unwrap_or(&[]).to_vec();
+        Ok(make_bytes(realm, Arc::new(out)))
+    });
+    let b_to_string = realm.add_native(|realm, args| {
+        let b = bytes_of(realm, args.get(realm, 0), "bytes.toString")?;
+        let s = String::from_utf8_lossy(&b).into_owned();
+        Ok(realm.alloc_string(&s))
+    });
+    let b_from_string = realm.add_native(|realm, args| {
+        let s = str_arg(realm, args, 0, "bytes.fromString")?;
+        Ok(make_bytes(realm, Arc::new(s.into_bytes())))
+    });
+    let mut bytes_ns = tsr_memory::Obj::default();
+    for (k, v) in [
+        ("size", b_len),
+        ("slice", b_slice),
+        ("toString", b_to_string),
+        ("fromString", b_from_string),
+    ] {
+        bytes_ns.set(Arc::from(k), v);
+    }
+    let bytes_ref = realm.heap.alloc_obj(bytes_ns);
     // merge into the existing `runtime` global ({cpu, gc, stats})
     if let Some(rt) = realm.globals.get("runtime").copied().and_then(|v| v.as_object()) {
         realm.heap.barrier_obj(rt);
         realm.heap.obj_mut(rt).set(Arc::from("fs"), Value::object(fs_ref));
+        realm.heap.obj_mut(rt).set(Arc::from("bytes"), Value::object(bytes_ref));
     } else {
-        realm.set_global_obj("runtime", vec![("fs", Value::object(fs_ref))]);
+        realm.set_global_obj(
+            "runtime",
+            vec![
+                ("fs", Value::object(fs_ref)),
+                ("bytes", Value::object(bytes_ref)),
+            ],
+        );
     }
 }

@@ -58,6 +58,9 @@ pub struct Facts<'a> {
     pub jumpif: &'a [JCond],
     /// per-arg: entry guard proves numeric
     pub arg_guard: &'a [bool],
+    /// loop-header speculation: (header pc, vregs) — number-guard on the
+    /// fall-in edge and at OSR entry; deopt resumes at the header
+    pub loop_spec: &'a [(usize, Vec<u8>)],
 }
 
 struct C {
@@ -65,6 +68,8 @@ struct C {
     pc_labels: Vec<Label>,
     bail: Label,
     await_exit: Label,
+    /// mid-body deopt: x0=2, x1=resume pc set by the deopting site
+    deopt_exit: Label,
     ret: Label,
     helpers: Helpers,
     offsets: Option<HeapOffsets>,
@@ -271,9 +276,10 @@ pub fn compile(
         let mut a = Asm::new();
         let bail = a.new_label();
         let await_exit = a.new_label();
+        let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, ret, helpers, offsets, ics_base, tics_base, n_low }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, ics_base, tics_base, n_low }
     };
     let out = c.a.new_label();
 
@@ -353,8 +359,30 @@ pub fn compile(
         for h in headers {
             c.a.mov_imm64(8, h as u64);
             c.a.cmp_reg(R_STARTPC, 8);
-            let l = c.pc_labels[h];
-            c.a.b_cond(Cond::Eq, l);
+            if let Some((_, vs)) = facts.loop_spec.iter().find(|(hh, _)| *hh == h) {
+                // speculated header: entering mid-loop must re-establish
+                // the guards (slots are current; d-homes just reloaded)
+                let next = c.a.new_label();
+                let fail = c.a.new_label();
+                c.a.b_cond(Cond::Ne, next);
+                for &v in vs {
+                    c.fetch_x(v, 8);
+                    c.a.lsr_imm(10, 8, 48);
+                    c.a.cmp_reg(10, R_TAGLIM);
+                    c.a.b_cond(Cond::Hs, fail);
+                }
+                let l = c.pc_labels[h];
+                c.a.b(l);
+                c.a.bind(fail);
+                c.spill_low();
+                c.a.movz(0, 2, 0);
+                c.a.mov_imm64(1, h as u64);
+                c.a.b(c.deopt_exit);
+                c.a.bind(next);
+            } else {
+                let l = c.pc_labels[h];
+                c.a.b_cond(Cond::Eq, l);
+            }
         }
         c.a.bind(normal);
     }
@@ -377,6 +405,25 @@ pub fn compile(
     for (pc, ins) in pbody.code.iter().enumerate() {
         if jump_targets[pc] {
             fcache = None;
+        }
+        // loop-header speculation: guard the fall-in path (back-edges jump
+        // to the label BELOW these guards and are already proven)
+        if let Some((_, vs)) = facts.loop_spec.iter().find(|(h, _)| *h == pc) {
+            let fail = c.a.new_label();
+            let pass = c.a.new_label();
+            for &v in vs {
+                c.fetch_x(v, 8);
+                c.a.lsr_imm(10, 8, 48);
+                c.a.cmp_reg(10, R_TAGLIM);
+                c.a.b_cond(Cond::Hs, fail);
+            }
+            c.a.b(pass);
+            c.a.bind(fail);
+            c.spill_low();
+            c.a.movz(0, 2, 0);
+            c.a.mov_imm64(1, pc as u64);
+            c.a.b(c.deopt_exit);
+            c.a.bind(pass);
         }
         let l = c.pc_labels[pc];
         c.a.bind(l);
@@ -422,6 +469,9 @@ pub fn compile(
     c.a.movz(0, 2, 0);
     c.a.mov(1, R_STARTPC);
     c.a.b(out);
+    let deopt_exit = c.deopt_exit;
+    c.a.bind(deopt_exit);
+    c.a.b(out); // x0=2, x1=resume pc set at the deopting site
 
     let ret = c.ret;
     c.a.bind(ret);

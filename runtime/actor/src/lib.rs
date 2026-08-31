@@ -173,6 +173,7 @@ fn actor_main(
                         msg: format!("actor '{name}': {e}"),
                         cancelled: false,
                         span: None,
+                        source: None,
                     })),
                     (None, Err(e)) => {
                         eprintln!("actor '{name}': posted message failed: {e}");

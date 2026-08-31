@@ -19,11 +19,13 @@ Bytes handle is the upgrade path).
 
 ## runtime.net (TCP)
 
-One OS thread per connection with a per-connection job queue (reads and
-writes serialize naturally). kqueue/io_uring reactor is the upgrade path.
+A single kqueue reactor thread drives every connection: nonblocking
+sockets, readiness-queued reads/writes, results through the
+Completer/Wake contract.
 
 - `listen(port | {port}) -> Listener` (synchronous bind; acceptor thread)
 - `accept(listener) -> Promise<Conn>`
+- `connect(host, port) -> Promise<Conn>`
 - `read(conn, maxBytes?) -> Promise<string | undefined>` (undefined = EOF)
 - `write(conn, s) -> Promise<void>` / `close(conn | listener)`
 
@@ -33,8 +35,16 @@ channels.
 
 ## runtime.http
 
-`serve(port, handler)` — minimal HTTP/1.1 with keep-alive. Connection
-threads parse requests; the handler (sync or async) runs on the realm's
-event loop; `serve` never returns (a server is the program). Handler
-returns a string (200 text) or `{status?, headers?, body?}`. Sequential
-dispatch v1 — parallel handler realms are the upgrade path.
+`serve(port, handler, {workers?})` — HTTP/1.1 with keep-alive and
+chunked request bodies. Connection threads parse; handlers (sync or
+async) run on the realm event loop — or, with `workers: N`, on N
+isolated handler realms fed from a shared queue (the handler is
+structured-cloned once per worker; main-realm globals/modules are not
+visible inside it, same rule as parallel.map). Returns a string (200
+text) or `{status?, headers?, body?}`; `serve` never returns.
+Measured: 125k req/s at workers:8 (0.74x node cluster, wrk -c64).
+
+## runtime.bytes + fs binary
+
+Immutable byte buffers as handles: `fs.readBytes`/`fs.writeBytes`,
+`bytes.size/slice/toString/fromString`.

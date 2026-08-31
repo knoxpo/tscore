@@ -26,6 +26,8 @@ pub struct ModuleError {
 pub struct ResolveConfig {
     pub root: PathBuf,
     pub module_dirs: Vec<String>,
+    /// Prefix mappings tried before moduleDirs: "@app/" -> "./src/".
+    pub paths: Vec<(String, String)>,
 }
 
 impl ResolveConfig {
@@ -37,17 +39,21 @@ impl ResolveConfig {
         while let Some(d) = dir {
             let cfg = d.join("tscore.json");
             if cfg.exists() {
-                let dirs = std::fs::read_to_string(&cfg)
-                    .ok()
-                    .and_then(|s| parse_module_dirs(&s))
-                    .unwrap_or_else(|| vec!["modules".into()]);
-                return ResolveConfig { root: d.to_path_buf(), module_dirs: dirs };
+                let text = std::fs::read_to_string(&cfg).unwrap_or_default();
+                let dirs =
+                    parse_module_dirs(&text).unwrap_or_else(|| vec!["modules".into()]);
+                return ResolveConfig {
+                    root: d.to_path_buf(),
+                    module_dirs: dirs,
+                    paths: parse_paths(&text),
+                };
             }
             dir = d.parent();
         }
         ResolveConfig {
             root: start.to_path_buf(),
             module_dirs: vec!["modules".into()],
+            paths: Vec::new(),
         }
     }
 }
@@ -55,6 +61,22 @@ impl ResolveConfig {
 /// Minimal JSON field extraction: {"moduleDirs": ["a", "b"]}. Not a JSON
 /// parser — the config has exactly one recognized key.
 /// ponytail: swap for serde_json the day the config grows a second field.
+/// {"paths": {"@app/": "./src/"}} — same minimal extraction.
+fn parse_paths(s: &str) -> Vec<(String, String)> {
+    let Some(key) = s.find("\"paths\"") else { return Vec::new() };
+    let Some(open) = s[key..].find('{').map(|i| i + key) else { return Vec::new() };
+    let Some(close) = s[open..].find('}').map(|i| i + open) else { return Vec::new() };
+    s[open + 1..close]
+        .split(',')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once(':')?;
+            let k = k.trim().trim_matches('"');
+            let v = v.trim().trim_matches('"');
+            (!k.is_empty() && !v.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
 fn parse_module_dirs(s: &str) -> Option<Vec<String>> {
     let key = s.find("\"moduleDirs\"")?;
     let open = s[key..].find('[')? + key;
@@ -91,6 +113,14 @@ pub fn resolve_specifier(
         try_forms(importer_dir.join(spec))
             .ok_or_else(|| format!("cannot resolve '{spec}' from {}", importer_dir.display()))
     } else {
+        // paths prefix mappings first: "@app/x" -> "<root>/./src/x"
+        for (prefix, target) in &cfg.paths {
+            if let Some(rest) = spec.strip_prefix(prefix.as_str()) {
+                if let Some(p) = try_forms(cfg.root.join(target).join(rest)) {
+                    return Ok(p);
+                }
+            }
+        }
         for dir in &cfg.module_dirs {
             if let Some(p) = try_forms(cfg.root.join(dir).join(spec)) {
                 return Ok(p);
@@ -227,15 +257,38 @@ pub fn compile_graph(entry: &Path) -> Result<Program, ModuleError> {
         }
     }
 
-    // ---- Phase B: per-file emission (serial v1; file-parallel later) ----
-    let mut modules = Vec::with_capacity(order.len());
-    let mut entry_idx = 0;
+    // ---- Phase B: per-file emission, parallel across files (each
+    // compile_module is independent; shapes/ids are process-global
+    // behind their own locks) ----
     let entry_id: Arc<str> = Arc::from(entry_canon.display().to_string());
-    for (i, id) in order.iter().enumerate() {
-        let d = &found[id];
-        if *id == entry_id {
-            entry_idx = i;
-        }
+    let entry_idx = order.iter().position(|id| *id == entry_id).unwrap_or(0);
+    let jobs: Vec<(usize, Arc<str>)> =
+        order.iter().cloned().enumerate().collect();
+    let results: Vec<Result<Module, ModuleError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|(_, id)| {
+                let d = &found[id];
+                let mutability = &mutability;
+                let id = id.clone();
+                scope.spawn(move || compile_one(&id, d, mutability))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("compile thread")).collect()
+    });
+    let mut modules = Vec::with_capacity(order.len());
+    for r in results {
+        modules.push(r?);
+    }
+    return Ok(Program { modules, entry: entry_idx });
+}
+
+fn compile_one(
+    id: &Arc<str>,
+    d: &Discovered,
+    mutability: &HashMap<Arc<str>, HashMap<Arc<str>, bool>>,
+) -> Result<Module, ModuleError> {
+    {
         let mut imports = HashMap::new();
         for (local, dep_id, imported) in &d.imports {
             let kind = match imported {
@@ -276,15 +329,14 @@ pub fn compile_graph(entry: &Path) -> Result<Program, ModuleError> {
             msg: e.msg,
             span_start: e.span_start,
         })?;
-        modules.push(Module {
+        Ok(Module {
             id: id.clone(),
             source_name: id.to_string(),
             main: chunk.main,
             deps: d.deps.iter().map(|(_, i)| i.clone()).collect(),
             exports: d.exports.clone(),
-        });
+        })
     }
-    Ok(Program { modules, entry: entry_idx })
 }
 
 fn discover_one(path: &Path, cfg: &ResolveConfig) -> Result<Discovered, ModuleError> {
