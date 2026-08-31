@@ -129,6 +129,10 @@ impl NativeArgs {
 pub type NativeFn =
     Arc<dyn Fn(&mut Realm, NativeArgs) -> Result<Value, RtError> + Send + Sync>;
 
+/// Entries in the string-constant intern cache. Fixed size keeps the
+/// probe a single indexed load; collisions just re-intern.
+const CONST_CACHE: usize = 512;
+
 pub struct Realm {
     pub heap: Heap,
     pub globals: FxHashMap<Arc<str>, Value>,
@@ -163,6 +167,15 @@ pub struct Realm {
     /// Refcounted GC pins: multiple holders (drive loop, resume, external
     /// completers) can pin the same promise independently.
     pub pinned: rustc_hash::FxHashMap<tsr_memory::Ref, u32>,
+    /// Direct-mapped intern cache for string constants, keyed by the
+    /// constant's `Arc` address. A literal load used to allocate a fresh
+    /// slot every time it was evaluated, so a loop body containing `"x"`
+    /// allocated once per iteration.
+    pub const_cache: Vec<(usize, Value)>,
+    /// Every slot the cache has handed out, as a compact root list.
+    /// A collision drops the cache entry but the slot stays rooted, so a
+    /// stale entry can never be resurrected onto a reused ref.
+    pub const_roots: Vec<Value>,
     /// Promises with an outstanding cross-thread Completer.
     pub external_pending: usize,
     /// While waiting for wakes, help execute pool work (set by
@@ -199,6 +212,8 @@ impl Realm {
             cancel: None,
             microtasks: std::collections::VecDeque::new(),
             pinned: rustc_hash::FxHashMap::default(),
+            const_cache: vec![(0, Value::UNDEFINED); CONST_CACHE],
+            const_roots: Vec::new(),
             external_pending: 0,
             idle_helper: None,
             pool_busy: None,
@@ -267,6 +282,7 @@ impl Realm {
                 .iter()
                 .chain(self.pinned.keys())
                 .map(|&r| Value::foreign(r))
+                .chain(self.const_roots.iter().copied())
                 .collect();
             // major when the old generation grew ~50% since the last major
             // or the remembered set degenerated; minor otherwise
@@ -397,6 +413,34 @@ impl Realm {
         }
         let v = self.alloc_string(&s);
         self.concat_buf = s;
+        v
+    }
+
+    /// The heap slot for a string constant, allocated once and reused.
+    ///
+    /// Takes the constant by reference on purpose: cloning the `Arc` to
+    /// sidestep the borrow costs an atomic increment and decrement per
+    /// load, which measured at more than twice what the interning saves.
+    ///
+    /// Interned slots live in the old generation — a young ref would be
+    /// rewritten by evacuation and the cached entry would dangle.
+    #[inline]
+    pub fn const_str(&mut self, s: &std::sync::Arc<str>) -> Value {
+        let key = std::sync::Arc::as_ptr(s) as *const u8 as usize;
+        // constants are pointer-aligned; the low bits carry no entropy
+        let i = (key >> 3) & (CONST_CACHE - 1);
+        let slot = unsafe { self.const_cache.get_unchecked(i) };
+        if slot.0 == key {
+            return slot.1;
+        }
+        self.intern_const_str(i, key, s)
+    }
+
+    #[cold]
+    fn intern_const_str(&mut self, i: usize, key: usize, s: &std::sync::Arc<str>) -> Value {
+        let v = Value::str_ref(self.heap.promote_str(tsr_memory::HStr::Shared(s.clone())));
+        self.const_cache[i] = (key, v);
+        self.const_roots.push(v);
         v
     }
 

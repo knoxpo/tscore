@@ -347,10 +347,7 @@ fn step(
         Op::LoadConst => {
             let v = match &pbody.consts[ins.bx() as usize] {
                 Const::Number(n) => Value::number(*n),
-                Const::Str(s) => {
-                    let s = s.clone();
-                    Value::str_ref(realm.heap.alloc_str(s))
-                }
+                Const::Str(s) => realm.const_str(s),
                 Const::Keys(_) => Value::UNDEFINED,
             };
             realm.stack[a] = v;
@@ -1185,7 +1182,7 @@ extern "C" fn h_load_const(
     let pr = proto(pp);
     let v = match &pr.body().consts[bx as usize] {
         Const::Number(n) => Value::number(*n),
-        Const::Str(s) => Value::str_ref(r.heap.alloc_str(s.clone())),
+        Const::Str(s) => r.const_str(s),
         Const::Keys(_) => Value::UNDEFINED,
     };
     JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 }

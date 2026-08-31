@@ -545,10 +545,7 @@ fn run_frame(
             Op::LoadConst => {
                 let v = match &pbody.consts[ins.bx() as usize] {
                     Const::Number(n) => Value::number(*n),
-                    Const::Str(s) => {
-                        let s = s.clone();
-                        Value::str_ref(realm.heap.alloc_str(s))
-                    }
+                    Const::Str(s) => realm.const_str(s),
                     Const::Keys(_) => Value::UNDEFINED,
                 };
                 set_reg!(realm, a, v);
