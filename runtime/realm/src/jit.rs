@@ -461,7 +461,7 @@ fn step(
         }
 
         Op::Closure => {
-            let child = pbody.protos[ins.bx() as usize].clone();
+            let child = &pbody.protos[ins.bx() as usize];
             let mut upvals_buf = [Value::UNDEFINED; 8];
             let mut upvals_vec;
             let n_up = child.upvals.len();
@@ -1116,7 +1116,7 @@ extern "C" fn h_new_closure(
     let pc = pc as usize;
     let base = (base_bytes / 8) as usize;
     let ins = pr.body().code[pc];
-    let child = pr.body().protos[ins.bx() as usize].clone();
+    let child = &pr.body().protos[ins.bx() as usize];
     let mut upvals_buf = [Value::UNDEFINED; 8];
     let mut upvals_vec;
     let n_up = child.upvals.len();

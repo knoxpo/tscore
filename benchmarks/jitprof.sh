@@ -17,7 +17,7 @@ MAP="$TMP/jit.map"
 
 TSC_JIT_MAP="$MAP" "$BIN" run "$PROG" --no-stats-export "$@" >/dev/null 2>&1 &
 PID=$!
-sample "$PID" 2 -mayDie > "$TMP/sample.txt" 2>/dev/null
+sample "$PID" 3 -mayDie -f "$TMP/sample.txt" >/dev/null 2>&1 || sample "$PID" 3 -mayDie > "$TMP/sample.txt" 2>/dev/null
 wait $PID 2>/dev/null
 
 python3 - "$MAP" "$TMP/sample.txt" <<'PY'

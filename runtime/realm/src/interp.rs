@@ -785,7 +785,7 @@ fn run_frame(
             }
 
             Op::Closure => {
-                let child = pbody.protos[ins.bx() as usize].clone();
+                let child = &pbody.protos[ins.bx() as usize];
                 let mut upvals_buf = [Value::UNDEFINED; 8];
                 let mut upvals_vec;
                 let n_up = child.upvals.len();

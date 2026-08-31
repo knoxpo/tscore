@@ -712,21 +712,28 @@ impl Heap {
     }
 
     /// Closure allocation reusing a freed slot's upvals buffer.
+    /// Allocate a closure, reusing a freed slot. `proto` is borrowed: a
+    /// recycled slot usually already holds the same proto (closures of
+    /// one function churning), and skipping the swap avoids an Arc
+    /// increment + decrement per creation — measurable when a hot loop
+    /// builds thousands of closures.
     pub fn alloc_closure_reuse(
         &mut self,
-        proto: Arc<FunctionProto>,
+        proto: &Arc<FunctionProto>,
         upvals: &[Value],
     ) -> Ref {
         self.allocs_since_gc += 1;
         if let Some(r) = self.free_closures.pop() {
             let c = &mut self.closures[r as usize];
-            c.proto = proto;
+            if !Arc::ptr_eq(&c.proto, proto) {
+                c.proto = proto.clone();
+            }
             debug_assert!(c.upvals.is_empty()); // sweep pre-clears
             c.upvals.extend_from_slice(upvals);
             self.gen_closures.on_alloc(r);
             return r;
         }
-        self.closures.push(Closure { proto, upvals: upvals.to_vec() });
+        self.closures.push(Closure { proto: proto.clone(), upvals: upvals.to_vec() });
         let r = (self.closures.len() - 1) as Ref;
         self.gen_closures.on_alloc(r);
         r
