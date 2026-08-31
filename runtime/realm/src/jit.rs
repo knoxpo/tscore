@@ -363,15 +363,8 @@ fn step(
                 realm.stack[a] = Value::number(b.as_number() + c.as_number());
                 Ok(0)
             } else if b.as_str_ref().is_some() || c.as_str_ref().is_some() {
-                let mut s = String::with_capacity(16);
-                if !tsr_memory::display_into(&mut s, b, &realm.heap)
-                    || !tsr_memory::display_into(&mut s, c, &realm.heap)
-                {
-                    s.clear();
-                    s.push_str(&b.display(&realm.heap));
-                    s.push_str(&c.display(&realm.heap));
-                }
-                let v = realm.alloc_string(&s);
+                // string `+`: lazy concatenation (see concat_values)
+                let v = realm.concat_values(b, c);
                 realm.stack[a] = v;
                 Ok(0)
             } else {
@@ -1146,6 +1139,31 @@ extern "C" fn h_new_closure(
     JitRet { val: Value::closure(cr).bits(), stack: r.stack.as_mut_ptr() as u64 }
 }
 
+/// Slow-path `+` (string concatenation, or a type error) as a thin
+/// helper: args by value, no spill/reload. Falling into h_step here
+/// cost ~340 cycles per concat — the register spill dominated the work.
+extern "C" fn h_add_slow(
+    p: *mut core::ffi::c_void,
+    pp: *const FunctionProto,
+    pc: u64,
+    b_bits: u64,
+    c_bits: u64,
+) -> JitRet {
+    let r = realm(p);
+    let b = Value::from_bits(b_bits);
+    let c = Value::from_bits(c_bits);
+    if b.as_str_ref().is_some() || c.as_str_ref().is_some() {
+        let v = r.concat_values(b, c);
+        return JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 };
+    }
+    if b.is_number() && c.is_number() {
+        let v = Value::number(b.as_number() + c.as_number());
+        return JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 };
+    }
+    let msg = format!("cannot add {} and {}", b.type_of(), c.type_of());
+    fail(r, err_at(proto(pp), pc as usize, msg))
+}
+
 extern "C" fn h_concat(
     p: *mut core::ffi::c_void,
     b_bits: u64,
@@ -1154,17 +1172,7 @@ extern "C" fn h_concat(
     let r = realm(p);
     let b = Value::from_bits(b_bits);
     let c = Value::from_bits(c_bits);
-    let mut s = std::mem::take(&mut r.concat_buf);
-    s.clear();
-    if !tsr_memory::display_into(&mut s, b, &r.heap)
-        || !tsr_memory::display_into(&mut s, c, &r.heap)
-    {
-        s.clear();
-        s.push_str(&b.display(&r.heap));
-        s.push_str(&c.display(&r.heap));
-    }
-    let v = r.alloc_string(&s);
-    r.concat_buf = s;
+    let v = r.concat_values(b, c);
     JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 }
 }
 
@@ -1298,6 +1306,7 @@ fn helpers() -> Helpers {
         new_array_lit: h_new_array_lit as *const () as usize,
         new_closure: h_new_closure as *const () as usize,
         concat: h_concat as *const () as usize,
+        add_slow: h_add_slow as *const () as usize,
         load_const: h_load_const as *const () as usize,
         new_object_lit2: h_new_object_lit2 as *const () as usize,
         await_: h_await as *const () as usize,

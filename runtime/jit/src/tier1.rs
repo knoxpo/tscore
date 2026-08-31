@@ -66,6 +66,9 @@ pub struct Helpers {
     pub new_closure: usize,
     /// fn(realm, b_bits, c_bits) -> JitRet{str_bits, stack}
     pub concat: usize,
+    /// fn(realm, proto, pc, b_bits, c_bits) -> JitRet{val, stack}
+    /// Slow-path `+`: string concatenation or a type error.
+    pub add_slow: usize,
     /// fn(realm, proto, bx) -> JitRet{val_bits, stack} — string constants.
     pub load_const: usize,
     /// fn(realm, base_bytes, first, n, shape_ptr) -> JitRet{obj_bits, stack}

@@ -142,9 +142,10 @@ pub fn collect<'a>(
         }};
     }
     fused_sweep!(m.strs, free_strs, gen_strs,
-        |h: &Heap, r: Ref| 24 + h.strs[r as usize].as_str().len(),
+        |h: &Heap, r: Ref| 24 + h.strs[r as usize].byte_len(),
         |h: &mut Heap, r: Ref| {
-            if let tsr_memory::HStr::Shared(_) = h.strs[r as usize] {
+            if !matches!(h.strs[r as usize], tsr_memory::HStr::Buf(_)) {
+                // Shared arcs and rope trees are dropped here
                 h.strs[r as usize] = tsr_memory::HStr::Buf(String::new());
             } else if let tsr_memory::HStr::Buf(b) = &mut h.strs[r as usize] {
                 b.clear();
@@ -470,7 +471,7 @@ pub fn collect_minor<'a>(
         }};
     }
     sweep_young!(gen_strs, m.ystrs, free_strs, |h: &mut Heap, r| {
-        if let tsr_memory::HStr::Shared(_) = h.strs[r as usize] {
+        if !matches!(h.strs[r as usize], tsr_memory::HStr::Buf(_)) {
             h.strs[r as usize] = tsr_memory::HStr::Buf(String::new());
         } else if let tsr_memory::HStr::Buf(b) = &mut h.strs[r as usize] {
             b.clear();
@@ -607,7 +608,7 @@ pub fn collect_minor<'a>(
 fn slot_bytes(heap: &Heap, arena: &str, r: tsr_memory::Ref) -> usize {
     let i = r as usize;
     match arena {
-        "gen_strs" => 24 + heap.strs[i].as_str().len(),
+        "gen_strs" => 24 + heap.strs[i].byte_len(),
         "gen_objs" => 72 + heap.objs[i].overflow.len() * 8,
         "gen_arrs" => 32 + heap.arrs[i].len() * 8,
         "gen_closures" => 32 + heap.closures[i].upvals.len() * 8,

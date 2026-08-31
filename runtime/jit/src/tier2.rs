@@ -967,7 +967,19 @@ fn emit_op(
                 c.put(ins.a, 0);
                 c.a.b(done);
                 c.a.bind(slow);
-                c.step_full(pc);
+                if ins.op == Op::Add {
+                    // string `+` is common enough that spilling every
+                    // d-register into h_step for it dominated the cost
+                    c.a.mov(0, R_REALM);
+                    c.a.mov(1, R_PROTO);
+                    c.a.mov_imm64(2, pc as u64);
+                    c.fetch_x(ins.b, 3);
+                    c.fetch_x(ins.c, 4);
+                    c.thin(c.helpers.add_slow);
+                    c.put_x(ins.a, 0);
+                } else {
+                    c.step_full(pc);
+                }
                 c.a.bind(done);
             }
         }

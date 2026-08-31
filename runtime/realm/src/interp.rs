@@ -565,8 +565,8 @@ fn run_frame(
                 if b.is_number() && c.is_number() {
                     set_reg!(realm, a, Value::number(b.as_number() + c.as_number()));
                 } else if b.as_str_ref().is_some() || c.as_str_ref().is_some() {
-                    let s = format!("{}{}", b.display(&realm.heap), c.display(&realm.heap));
-                    let v = realm.alloc_string(&s);
+                    // string `+`: lazy concatenation (see concat_values)
+                    let v = realm.concat_values(b, c);
                     set_reg!(realm, a, v);
                 } else {
                     return Err(err(proto, pc, format!(
@@ -1042,17 +1042,7 @@ fn run_frame(
             Op::Concat => {
                 let b = reg!(realm, base + ins.b as usize);
                 let c = reg!(realm, base + ins.c as usize);
-                let mut s = std::mem::take(&mut realm.concat_buf);
-                s.clear();
-                if !tsr_memory::display_into(&mut s, b, &realm.heap)
-                    || !tsr_memory::display_into(&mut s, c, &realm.heap)
-                {
-                    s.clear();
-                    s.push_str(&b.display(&realm.heap));
-                    s.push_str(&c.display(&realm.heap));
-                }
-                let v = realm.alloc_string(&s);
-                realm.concat_buf = s;
+                let v = realm.concat_values(b, c);
                 set_reg!(realm, a, v);
             }
             Op::TypeOf => {

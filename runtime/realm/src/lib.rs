@@ -366,6 +366,40 @@ impl Realm {
         self.set_global(name, Value::object(r));
     }
 
+    /// `b + c` with lazy concatenation. When the left side is already a
+    /// heap string, the result is a rope node instead of a fresh copy of
+    /// both sides — that turns `out = out + piece` loops from O(n^2)
+    /// copying into O(total bytes).
+    pub fn concat_values(&mut self, b: Value, c: Value) -> Value {
+        if let Some(lb) = b.as_str_ref() {
+            // right side: reuse its heap string, else render it once
+            if let Some(rc) = c.as_str_ref() {
+                return Value::str_ref(self.heap.alloc_concat(lb, rc));
+            }
+            let mut s = std::mem::take(&mut self.concat_buf);
+            s.clear();
+            if tsr_memory::display_into(&mut s, c, &self.heap) {
+                let r = self.heap.alloc_concat_str(lb, &s);
+                self.concat_buf = s;
+                return Value::str_ref(r);
+            }
+            self.concat_buf = s;
+        }
+        // general case: render both sides into the scratch buffer
+        let mut s = std::mem::take(&mut self.concat_buf);
+        s.clear();
+        if !tsr_memory::display_into(&mut s, b, &self.heap)
+            || !tsr_memory::display_into(&mut s, c, &self.heap)
+        {
+            s.clear();
+            s.push_str(&b.display(&self.heap));
+            s.push_str(&c.display(&self.heap));
+        }
+        let v = self.alloc_string(&s);
+        self.concat_buf = s;
+        v
+    }
+
     pub fn alloc_string(&mut self, s: &str) -> Value {
         // buffer-reusing arena slot: steady-state string churn stops
         // touching malloc

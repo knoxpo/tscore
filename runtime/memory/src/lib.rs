@@ -12,6 +12,18 @@ use tsc_ir::FunctionProto;
 /// Index into one of the realm heap's arenas.
 pub type Ref = u32;
 
+/// Concatenations at or below this many bytes are copied flat; larger
+/// ones build a rope node. Read once — an env lookup per concat costs
+/// more than the copy it decides about.
+#[inline(always)]
+#[allow(non_snake_case)]
+fn rope_limit() -> usize {
+    static L: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("TSC_ROPE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
+    })
+}
+
 /// NaN-boxed value: 8 bytes. Real doubles occupy every bit pattern whose
 /// top 16 bits are ≤ 0xFFF8 (hardware NaNs are 0x7FF8/0xFFF8-prefixed and
 /// user code cannot craft payload NaNs — `Value::number` canonicalizes any
@@ -508,6 +520,76 @@ impl GenState {
 pub enum HStr {
     Shared(Arc<str>),
     Buf(String),
+    /// Lazily concatenated string: a cons tree that is flattened the
+    /// first time the bytes are actually read. `out = out + piece` in a
+    /// loop is then O(total bytes) instead of O(n^2) copying, which is
+    /// what every production JS engine does (V8 ConsString, JSC ropes).
+    ///
+    /// The tree holds `Arc`s, not heap refs, so the collector needs to
+    /// know nothing about it and `as_str` stays `&self`.
+    Rope(Arc<RopeNode>, usize),
+}
+
+/// One node of a lazy concatenation tree. `flat` caches the flattened
+/// bytes on first read (interior mutability: reading a string must not
+/// require `&mut Heap`).
+#[derive(Debug)]
+pub struct RopeNode {
+    kind: RopeKind,
+    flat: std::sync::OnceLock<Arc<str>>,
+}
+
+#[derive(Debug)]
+enum RopeKind {
+    Leaf(Arc<str>),
+    Cat(Arc<RopeNode>, Arc<RopeNode>),
+}
+
+impl RopeNode {
+    pub fn leaf(s: Arc<str>) -> Arc<RopeNode> {
+        Arc::new(RopeNode { kind: RopeKind::Leaf(s), flat: std::sync::OnceLock::new() })
+    }
+
+    pub fn cat(l: Arc<RopeNode>, r: Arc<RopeNode>) -> Arc<RopeNode> {
+        Arc::new(RopeNode { kind: RopeKind::Cat(l, r), flat: std::sync::OnceLock::new() })
+    }
+
+    /// Flatten once; later reads hit the cache.
+    pub fn as_str(&self) -> &str {
+        if let RopeKind::Leaf(s) = &self.kind {
+            return s; // leaves need no flattening
+        }
+        self.flat.get_or_init(|| {
+            let mut out = String::with_capacity(self.byte_len());
+            // iterative walk: deep left-leaning trees must not blow the
+            // Rust stack (a 100k-iteration append loop is 100k deep)
+            let mut stack: Vec<&RopeNode> = vec![self];
+            while let Some(n) = stack.pop() {
+                match &n.kind {
+                    RopeKind::Leaf(s) => out.push_str(s),
+                    RopeKind::Cat(l, r) => {
+                        if let Some(f) = n.flat.get() {
+                            out.push_str(f); // already-flattened subtree
+                        } else {
+                            stack.push(r);
+                            stack.push(l);
+                        }
+                    }
+                }
+            }
+            Arc::from(out.as_str())
+        })
+    }
+
+    pub fn byte_len(&self) -> usize {
+        if let Some(f) = self.flat.get() {
+            return f.len();
+        }
+        match &self.kind {
+            RopeKind::Leaf(s) => s.len(),
+            RopeKind::Cat(l, r) => l.byte_len() + r.byte_len(),
+        }
+    }
 }
 
 impl HStr {
@@ -516,6 +598,29 @@ impl HStr {
         match self {
             HStr::Shared(a) => a,
             HStr::Buf(b) => b,
+            HStr::Rope(n, _) => n.as_str(),
+        }
+    }
+
+    /// Byte length without forcing a rope to flatten (the collector and
+    /// size accounting must not materialize lazy strings).
+    #[inline(always)]
+    pub fn byte_len(&self) -> usize {
+        match self {
+            HStr::Shared(a) => a.len(),
+            HStr::Buf(b) => b.len(),
+            HStr::Rope(_, n) => *n,
+        }
+    }
+
+    /// The rope node for this string, cloning cheaply where possible.
+    /// A `Buf` must be materialized once; after that concatenation is
+    /// O(1) per operation.
+    pub fn to_rope(&self) -> Arc<RopeNode> {
+        match self {
+            HStr::Shared(a) => RopeNode::leaf(a.clone()),
+            HStr::Buf(b) => RopeNode::leaf(Arc::from(b.as_str())),
+            HStr::Rope(n, _) => n.clone(),
         }
     }
 }
@@ -755,7 +860,7 @@ impl Heap {
                     debug_assert!(b.is_empty());
                     b.push_str(s);
                 }
-                HStr::Shared(_) => *slot = HStr::Buf(String::from(s)),
+                _ => *slot = HStr::Buf(String::from(s)),
             }
             self.gen_strs.on_alloc(r);
             return r;
@@ -771,12 +876,70 @@ impl Heap {
         self.str_raw(r).as_str()
     }
 
-    /// Arc for cross-realm/portable use (copies Buf strings).
+    /// Arc for cross-realm/portable use (copies Buf strings; ropes
+    /// flatten first).
     pub fn str_arc(&self, r: Ref) -> Arc<str> {
         match self.str_raw(r) {
             HStr::Shared(a) => a.clone(),
-            HStr::Buf(b) => Arc::from(b.as_str()),
+            other => Arc::from(other.as_str()),
         }
+    }
+
+    /// Lazy concatenation: build a rope node instead of copying both
+    /// sides. Short results are still copied — a flat small string beats
+    /// a tree node, and this keeps `a + b` for tiny pieces cheap.
+    pub fn alloc_concat(&mut self, a: Ref, b: Ref) -> Ref {
+        let FLAT_LIMIT = rope_limit();
+        let (la, lb) = (self.str_raw(a).byte_len(), self.str_raw(b).byte_len());
+        if la + lb <= FLAT_LIMIT {
+            let mut s = String::with_capacity(la + lb);
+            s.push_str(self.str_at(a));
+            s.push_str(self.str_at(b));
+            return self.alloc_str_owned(s);
+        }
+        let node = RopeNode::cat(self.str_raw(a).to_rope(), self.str_raw(b).to_rope());
+        self.alloc_str_slot_pub(HStr::Rope(node, la + lb))
+    }
+
+    /// Concatenate a heap string with a plain `&str` (the common
+    /// `s + literal` / `s + number` shape) without materializing an
+    /// intermediate heap slot for the right-hand side.
+    pub fn alloc_concat_str(&mut self, a: Ref, b: &str) -> Ref {
+        let FLAT_LIMIT = rope_limit();
+        let la = self.str_raw(a).byte_len();
+        if la + b.len() <= FLAT_LIMIT {
+            let mut s = String::with_capacity(la + b.len());
+            s.push_str(self.str_at(a));
+            s.push_str(b);
+            return self.alloc_str_owned(s);
+        }
+        let node = RopeNode::cat(self.str_raw(a).to_rope(), RopeNode::leaf(Arc::from(b)));
+        self.alloc_str_slot_pub(HStr::Rope(node, la + b.len()))
+    }
+
+    /// Store an already-built String (reuses a freed slot's allocation
+    /// when the sweep left one).
+    pub fn alloc_str_owned(&mut self, s: String) -> Ref {
+        if self.nursery_on {
+            return self.young_str(HStr::Buf(s));
+        }
+        self.alloc_str_slot_pub(HStr::Buf(s))
+    }
+
+    fn alloc_str_slot_pub(&mut self, h: HStr) -> Ref {
+        if self.nursery_on {
+            return self.young_str(h);
+        }
+        self.allocs_since_gc += 1;
+        if let Some(r) = self.free_strs.pop() {
+            self.strs[r as usize] = h;
+            self.gen_strs.on_alloc(r);
+            return r;
+        }
+        self.strs.push(h);
+        let r = (self.strs.len() - 1) as Ref;
+        self.gen_strs.on_alloc(r);
+        r
     }
     alloc_moving!(alloc_obj, obj, obj_mut, objs, free_objs, gen_objs, Obj);
     alloc_moving!(alloc_arr, arr, arr_mut, arrs, free_arrs, gen_arrs, Vec<Value>);
@@ -989,7 +1152,7 @@ impl Heap {
     fn young_str(&mut self, s: HStr) -> Ref {
         let i = self.nursery.strs.len();
         assert!(i < YOUNG_BIT as usize, "nursery overflow");
-        self.nursery.bytes += 24 + s.as_str().len();
+        self.nursery.bytes += 24 + s.byte_len();
         self.nursery.strs.push(s);
         i as Ref | YOUNG_BIT
     }
@@ -1059,7 +1222,7 @@ impl Heap {
     }
 
     pub fn promote_str(&mut self, s: HStr) -> Ref {
-        self.promoted_bytes_since_major += 24 + s.as_str().len();
+        self.promoted_bytes_since_major += 24 + s.byte_len();
         let r = match self.free_strs.pop() {
             Some(r) => {
                 let old = std::mem::replace(&mut self.strs[r as usize], s);
