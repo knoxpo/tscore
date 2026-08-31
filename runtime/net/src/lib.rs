@@ -511,126 +511,182 @@ pub fn install(realm: &mut Realm) {
 }
 
 // ---------------- HTTP/1.1 server ----------------
+//
+// Each worker owns its connections end to end: one kqueue per worker,
+// all workers watching the same listening socket, and parse → handler →
+// response all on the same thread. There is no per-request channel and
+// no cross-thread handoff — those cost more than the work itself
+// (measured: the previous hand-off design capped out around half this
+// throughput).
 
-struct HttpRequest {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: String,
-    reply: mpsc::Sender<(u16, Vec<(String, String)>, String)>,
+use std::os::fd::{AsRawFd, RawFd};
+
+/// Per-connection state: an input buffer that keeps whatever a partial
+/// read left behind, and an output buffer for a partially-written
+/// response. Both are reused for the connection's lifetime.
+struct HttpConn {
+    stream: TcpStream,
+    inbuf: Vec<u8>,
+    outbuf: Vec<u8>,
+    out_off: usize,
+    keep_alive: bool,
 }
 
-/// `runtime.http.serve(port, handler)`: connection threads parse
-/// requests; the handler runs on the realm's event loop (async handlers
-/// are driven to completion). Never returns — a server IS the program.
-/// ponytail: sequential dispatch on the realm; parallel handler realms
-/// are the upgrade path if a benchmark demands it.
-fn http_serve(realm: &mut Realm, args: NativeArgs) -> Result<Value, RtError> {
-    let port = match args.get(realm, 0).kind() {
-        tsr_memory::Kind::Number(n) => n as u16,
-        _ => return Err(RtError::new("http.serve(port, handler)")),
-    };
-    let handler = args.get(realm, 1);
-    if handler.as_closure().is_none() {
-        return Err(RtError::new("http.serve: handler must be a function"));
-    }
-    let workers = args
-        .get(realm, 2)
-        .as_object()
-        .and_then(|o| realm.heap.obj(o).get("workers"))
-        .filter(|v| v.is_number())
-        .map(|v| (v.as_number() as usize).max(1))
-        .unwrap_or(1);
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| RtError::new(format!("http.serve: {e}")))?;
-    let (req_tx, req_rx) = mpsc::channel::<HttpRequest>();
+/// A parsed request as ranges into the connection's input buffer — the
+/// hot path allocates nothing here; realm strings are built directly
+/// from the slices when the request object is constructed.
+struct ParsedRequest {
+    method: Range,
+    path: Range,
+    headers: Vec<(Range, Range)>,
+    /// Owned only when the body arrived chunked (it must be reassembled).
+    body: BodyRef,
+    keep_alive: bool,
+    /// Bytes of `inbuf` this request consumed.
+    consumed: usize,
+}
 
-    std::thread::Builder::new()
-        .name("tscore-http-accept".into())
-        .spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
-                let tx = req_tx.clone();
-                std::thread::Builder::new()
-                    .name("tscore-http-conn".into())
-                    .spawn(move || http_conn(stream, tx))
-                    .ok();
+type Range = (usize, usize);
+
+enum BodyRef {
+    Slice(Range),
+    Owned(String),
+}
+
+impl BodyRef {
+    fn as_str<'a>(&'a self, buf: &'a [u8]) -> &'a str {
+        match self {
+            BodyRef::Slice((s, e)) => {
+                std::str::from_utf8(&buf[*s..*e]).unwrap_or("")
             }
-        })
-        .expect("spawn http acceptor");
-
-    eprintln!("tscore http: listening on 127.0.0.1:{port} ({workers} worker(s))");
-    if workers > 1 {
-        // parallel dispatch: N handler realms, each with a rehydrated copy
-        // of the handler, pulling from the shared queue. Handler realms
-        // are isolated (parallel.map rule: only captured state travels).
-        let pv = tsr_task::portable::clone_out(&realm.heap, handler)
-            .map_err(|e| RtError::new(format!("http.serve: handler not portable: {e}")))?;
-        let shared_rx = Arc::new(Mutex::new(req_rx));
-        for i in 0..workers {
-            let pv = pv.clone();
-            let rx = shared_rx.clone();
-            std::thread::Builder::new()
-                .name(format!("tscore-http-worker-{i}"))
-                .spawn(move || {
-                    let mut wr = Realm::new();
-                    tsr_io_install_min(&mut wr);
-                    let h = tsr_task::portable::rehydrate(&pv, &mut wr.heap);
-                    loop {
-                        let req = {
-                            let guard = rx.lock().unwrap();
-                            guard.recv()
-                        };
-                        let Ok(req) = req else { return };
-                        dispatch_one(&mut wr, h, req);
-                    }
-                })
-                .expect("spawn http worker");
-        }
-        // park the calling realm forever (a server IS the program)
-        loop {
-            std::thread::park();
+            BodyRef::Owned(s) => s,
         }
     }
-    // dispatch loop: build the request object, run the handler (driving
-    // any awaits), ship the reply back to the connection thread
+    fn len(&self, _buf: &[u8]) -> usize {
+        match self {
+            BodyRef::Slice((s, e)) => e - s,
+            BodyRef::Owned(s) => s.len(),
+        }
+    }
+}
+
+fn slice_str<'a>(buf: &'a [u8], r: Range) -> &'a str {
+    std::str::from_utf8(&buf[r.0..r.1]).unwrap_or("")
+}
+
+/// Parse one request out of `buf`. None = need more bytes.
+fn parse_request(buf: &[u8]) -> Option<ParsedRequest> {
+    let head_end = find_headers_end(buf)?;
+    // request line
+    let line_end = buf.windows(2).position(|w| w == b"\r\n")?;
+    let line = &buf[..line_end];
+    let sp1 = line.iter().position(|&b| b == b' ')?;
+    let rest = &line[sp1 + 1..];
+    let sp2 = rest.iter().position(|&b| b == b' ')?;
+    let method = (0, sp1);
+    let path = (sp1 + 1, sp1 + 1 + sp2);
+
+    let mut headers = Vec::with_capacity(8);
+    let mut content_len = 0usize;
+    let mut chunked = false;
+    let mut keep_alive = true;
+    let mut pos = line_end + 2;
+    while pos + 1 < head_end {
+        let rel = buf[pos..head_end].windows(2).position(|w| w == b"\r\n")?;
+        if rel == 0 {
+            break; // blank line: end of headers
+        }
+        let end = pos + rel;
+        if let Some(c) = buf[pos..end].iter().position(|&b| b == b':') {
+            let k = (pos, pos + c);
+            let mut vs = pos + c + 1;
+            while vs < end && buf[vs] == b' ' {
+                vs += 1;
+            }
+            let kb = &buf[k.0..k.1];
+            // only the three headers that steer framing are inspected;
+            // everything else is passed through untouched
+            if kb.eq_ignore_ascii_case(b"content-length") {
+                content_len = slice_str(buf, (vs, end)).trim().parse().unwrap_or(0);
+            } else if kb.eq_ignore_ascii_case(b"transfer-encoding")
+                && slice_str(buf, (vs, end)).trim().eq_ignore_ascii_case("chunked")
+            {
+                chunked = true;
+            } else if kb.eq_ignore_ascii_case(b"connection")
+                && slice_str(buf, (vs, end)).trim().eq_ignore_ascii_case("close")
+            {
+                keep_alive = false;
+            }
+            headers.push((k, (vs, end)));
+        }
+        pos = end + 2;
+    }
+    if chunked {
+        let (body, used) = parse_chunked(&buf[head_end..])?;
+        return Some(ParsedRequest {
+            method,
+            path,
+            headers,
+            body: BodyRef::Owned(body),
+            keep_alive,
+            consumed: head_end + used,
+        });
+    }
+    if buf.len() < head_end + content_len {
+        return None; // body still arriving
+    }
+    Some(ParsedRequest {
+        method,
+        path,
+        headers,
+        body: BodyRef::Slice((head_end, head_end + content_len)),
+        keep_alive,
+        consumed: head_end + content_len,
+    })
+}
+
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// Decode a chunked body; returns (body, bytes consumed). None = partial.
+fn parse_chunked(buf: &[u8]) -> Option<(String, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
     loop {
-        let Ok(req) = req_rx.recv() else {
-            return Ok(Value::UNDEFINED);
-        };
-        dispatch_one(realm, handler, req);
+        let nl = buf[i..].windows(2).position(|w| w == b"\r\n")? + i;
+        let size_txt = std::str::from_utf8(&buf[i..nl]).ok()?;
+        let size = usize::from_str_radix(
+            size_txt.split(';').next().unwrap_or("").trim(),
+            16,
+        )
+        .ok()?;
+        i = nl + 2;
+        if size == 0 {
+            // trailing CRLF after the terminator
+            if buf.len() < i + 2 {
+                return None;
+            }
+            return Some((String::from_utf8_lossy(&out).into_owned(), i + 2));
+        }
+        if buf.len() < i + size + 2 {
+            return None;
+        }
+        out.extend_from_slice(&buf[i..i + size]);
+        i += size + 2;
     }
 }
 
-/// Minimal realm setup for http worker realms (console/Math/timers; the
-/// handler must not rely on module namespaces or main-realm globals).
-fn tsr_io_install_min(realm: &mut Realm) {
-    // io installs console/Math/Date/performance/sleep; channel lets
-    // handlers talk to the rest of the app
-    tsr_io::install(realm);
-    tsr_channel::install(realm);
-}
-
-fn dispatch_one(realm: &mut Realm, handler: Value, req: HttpRequest) {
-    let mut headers = Obj::default();
-    for (k, v) in &req.headers {
-        headers.set(Arc::from(k.as_str()), realm.alloc_string(v));
+fn status_text(s: u16) -> &'static str {
+    match s {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "",
     }
-    let headers_v = Value::object(realm.heap.alloc_obj(headers));
-    let mut ro = Obj::default();
-    ro.set(Arc::from("method"), realm.alloc_string(&req.method));
-    ro.set(Arc::from("path"), realm.alloc_string(&req.path));
-    ro.set(Arc::from("headers"), headers_v);
-    ro.set(Arc::from("body"), realm.alloc_string(&req.body));
-    let req_v = Value::object(realm.heap.alloc_obj(ro));
-
-    let outcome = tsr_realm::interp::call_value(realm, handler, &[req_v])
-        .and_then(|r| tss_parallel::settle_if_promise(realm, r));
-    let (status, hdrs, body) = match outcome {
-        Ok(v) => response_parts(realm, v),
-        Err(e) => (500, Vec::new(), format!("handler error: {}\n", e.msg)),
-    };
-    let _ = req.reply.send((status, hdrs, body));
 }
 
 fn response_parts(realm: &Realm, v: Value) -> (u16, Vec<(String, String)>, String) {
@@ -663,116 +719,332 @@ fn response_parts(realm: &Realm, v: Value) -> (u16, Vec<(String, String)>, Strin
     (200, Vec::new(), String::new())
 }
 
-fn http_conn(stream: TcpStream, tx: mpsc::Sender<HttpRequest>) {
-    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-    let mut stream = stream;
+/// Run the handler for one parsed request and append the wire response
+/// to `out`. Everything happens on the worker's own thread and realm.
+fn handle_request(
+    realm: &mut Realm,
+    handler: Value,
+    req: &ParsedRequest,
+    buf: &[u8],
+    out: &mut Vec<u8>,
+) {
+    // request shape is fixed: build it once per process and allocate the
+    // object in one shot (per-field `set` would walk shape transitions
+    // on every request)
+    static REQ_SHAPE: std::sync::OnceLock<&'static tsr_memory::ShapeData> =
+        std::sync::OnceLock::new();
+    let shape = *REQ_SHAPE.get_or_init(|| {
+        let mut s = tsr_memory::empty_shape();
+        for k in ["method", "path", "headers", "body"] {
+            s = s.with_field(Arc::from(k));
+        }
+        s
+    });
+    let mut headers = Obj::default();
+    let mut lower = [0u8; 64];
+    for (k, v) in &req.headers {
+        // header names are exposed lowercased (what handlers expect);
+        // normal names fit the stack buffer, so this allocates nothing
+        let raw = &buf[k.0..k.1];
+        let name: &str = if raw.len() <= lower.len() {
+            for (i, b) in raw.iter().enumerate() {
+                lower[i] = b.to_ascii_lowercase();
+            }
+            std::str::from_utf8(&lower[..raw.len()]).unwrap_or("")
+        } else {
+            slice_str(buf, *k)
+        };
+        let val = realm.alloc_string(slice_str(buf, *v));
+        headers.set(Arc::from(name), val);
+    }
+    let headers_v = Value::object(realm.heap.alloc_obj(headers));
+    let vals = [
+        realm.alloc_string(slice_str(buf, req.method)),
+        realm.alloc_string(slice_str(buf, req.path)),
+        headers_v,
+        realm.alloc_string(req.body.as_str(buf)),
+    ];
+    let req_v = Value::object(realm.heap.alloc_obj_lit(shape, &vals));
+
+    let outcome = tsr_realm::interp::call_value(realm, handler, &[req_v])
+        .and_then(|r| tss_parallel::settle_if_promise(realm, r));
+    let (status, hdrs, body) = match outcome {
+        Ok(v) => response_parts(realm, v),
+        Err(e) => (500, Vec::new(), format!("handler error: {}\n", e.msg)),
+    };
+
+    // status line + headers, written straight into the output buffer
+    out.extend_from_slice(b"HTTP/1.1 ");
+    let mut num = [0u8; 8];
+    let n = fmt_u16(status, &mut num);
+    out.extend_from_slice(&num[..n]);
+    out.push(b' ');
+    out.extend_from_slice(status_text(status).as_bytes());
+    out.extend_from_slice(b"\r\ncontent-length: ");
+    let n = fmt_usize(body.len(), &mut num);
+    out.extend_from_slice(&num[..n]);
+    out.extend_from_slice(b"\r\n");
+    if !req.keep_alive {
+        out.extend_from_slice(b"connection: close\r\n");
+    }
+    for (k, v) in &hdrs {
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(body.as_bytes());
+}
+
+fn fmt_u16(v: u16, buf: &mut [u8; 8]) -> usize {
+    fmt_usize(v as usize, buf)
+}
+
+fn fmt_usize(mut v: usize, buf: &mut [u8; 8]) -> usize {
+    if v == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = 0;
+    while v > 0 {
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i += 1;
+    }
+    let n = i.min(8);
+    for j in 0..n {
+        buf[j] = tmp[i - 1 - j];
+    }
+    n
+}
+
+/// `runtime.http.serve(port, handler, {workers?})`.
+///
+/// workers = 1 (default): the calling thread becomes the event loop and
+/// the handler runs in the caller's realm, so it can close over program
+/// state. workers > 1: N threads, each with its own realm and a
+/// structured clone of the handler (same isolation rule as parallel.map);
+/// the caller parks. Never returns.
+fn http_serve(realm: &mut Realm, args: NativeArgs) -> Result<Value, RtError> {
+    let port = match args.get(realm, 0).kind() {
+        tsr_memory::Kind::Number(n) => n as u16,
+        _ => return Err(RtError::new("http.serve(port, handler)")),
+    };
+    let handler = args.get(realm, 1);
+    if handler.as_closure().is_none() {
+        return Err(RtError::new("http.serve: handler must be a function"));
+    }
+    let workers = args
+        .get(realm, 2)
+        .as_object()
+        .and_then(|o| realm.heap.obj(o).get("workers"))
+        .filter(|v| v.is_number())
+        .map(|v| (v.as_number() as usize).max(1))
+        .unwrap_or(1);
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| RtError::new(format!("http.serve: {e}")))?;
+    listener.set_nonblocking(true).ok();
+    eprintln!("tscore http: listening on 127.0.0.1:{port} ({workers} worker(s))");
+
+    if workers == 1 {
+        worker_loop(realm, handler, &listener);
+        return Ok(Value::UNDEFINED);
+    }
+
+    let pv = tsr_task::portable::clone_out(&realm.heap, handler)
+        .map_err(|e| RtError::new(format!("http.serve: handler not portable: {e}")))?;
+    let listener = Arc::new(listener);
+    for i in 0..workers {
+        let pv = pv.clone();
+        let listener = listener.clone();
+        std::thread::Builder::new()
+            .name(format!("tscore-http-{i}"))
+            .stack_size(16 << 20)
+            .spawn(move || {
+                let mut wr = Realm::new();
+                tsr_io::install(&mut wr);
+                tsr_channel::install(&mut wr);
+                let h = tsr_task::portable::rehydrate(&pv, &mut wr.heap);
+                worker_loop(&mut wr, h, &listener);
+            })
+            .expect("spawn http worker");
+    }
     loop {
-        // request line
-        let mut line = String::new();
-        if reader.read_line(&mut line).map(|n| n == 0).unwrap_or(true) {
-            return;
+        std::thread::park();
+    }
+}
+
+/// One worker: a kqueue watching the shared listener plus every
+/// connection this worker accepted. All parsing, handler execution and
+/// writing happen here — no channels, no handoff.
+fn worker_loop(realm: &mut Realm, handler: Value, listener: &TcpListener) {
+    use std::collections::HashMap;
+    let kq = unsafe { libc::kqueue() };
+    assert!(kq >= 0, "kqueue() failed");
+    let lfd = listener.as_raw_fd();
+    arm_read(kq, lfd, u64::MAX);
+
+    let mut conns: HashMap<RawFd, HttpConn> = HashMap::new();
+    let mut events = vec![
+        libc::kevent {
+            ident: 0,
+            filter: 0,
+            flags: 0,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        256
+    ];
+    let mut scratch = vec![0u8; 64 * 1024];
+
+    loop {
+        let n = unsafe {
+            libc::kevent(
+                kq,
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                events.len() as i32,
+                std::ptr::null(),
+            )
+        };
+        if n < 0 {
+            continue;
         }
-        let mut parts = line.split_whitespace();
-        let (Some(method), Some(path)) = (parts.next(), parts.next()) else { return };
-        let method = method.to_string();
-        let path = path.to_string();
-        // headers
-        let mut headers = Vec::new();
-        let mut content_len = 0usize;
-        let mut keep_alive = true;
-        loop {
-            let mut h = String::new();
-            if reader.read_line(&mut h).map(|n| n == 0).unwrap_or(true) {
-                return;
-            }
-            let t = h.trim_end();
-            if t.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = t.split_once(':') {
-                let k = k.trim().to_ascii_lowercase();
-                let v = v.trim().to_string();
-                if k == "content-length" {
-                    content_len = v.parse().unwrap_or(0);
+        for ev in events.iter().take(n as usize) {
+            let fd = ev.ident as RawFd;
+            if fd == lfd {
+                // drain the accept queue; other workers race us and lose
+                // harmlessly with EWOULDBLOCK
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nodelay(true).ok();
+                            stream.set_nonblocking(true).ok();
+                            let cfd = stream.as_raw_fd();
+                            conns.insert(cfd, HttpConn {
+                                stream,
+                                inbuf: Vec::with_capacity(2048),
+                                outbuf: Vec::with_capacity(2048),
+                                out_off: 0,
+                                keep_alive: true,
+                            });
+                            arm_read(kq, cfd, cfd as u64);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
                 }
-                if k == "connection" && v.eq_ignore_ascii_case("close") {
-                    keep_alive = false;
-                }
-                headers.push((k, v));
+                continue; // level-triggered: still registered
             }
-        }
-        // body: content-length or chunked transfer-encoding
-        let mut body = String::new();
-        let chunked = headers
-            .iter()
-            .any(|(k, v)| k == "transfer-encoding" && v.eq_ignore_ascii_case("chunked"));
-        if chunked {
-            loop {
-                let mut szline = String::new();
-                if reader.read_line(&mut szline).map(|n| n == 0).unwrap_or(true) {
-                    return;
+            if ev.filter == libc::EVFILT_WRITE {
+                if !flush_out(kq, fd, conns.get_mut(&fd)) {
+                    conns.remove(&fd);
                 }
-                let sz = usize::from_str_radix(
-                    szline.trim().split(';').next().unwrap_or("").trim(),
-                    16,
-                )
-                .unwrap_or(0);
-                if sz == 0 {
-                    let mut trail = String::new();
-                    let _ = reader.read_line(&mut trail); // trailing CRLF
+                continue;
+            }
+            if !conns.contains_key(&fd) {
+                continue;
+            }
+            // read everything available, serving each complete request
+            let mut alive = true;
+            {
+                let conn = conns.get_mut(&fd).unwrap();
+                loop {
+                    match conn.stream.read(&mut scratch) {
+                        Ok(0) => {
+                            alive = false;
+                            break;
+                        }
+                        Ok(k) => conn.inbuf.extend_from_slice(&scratch[..k]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            alive = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            while alive {
+                // take the buffers out so the handler can borrow the realm
+                let (mut inbuf, mut out) = {
+                    let conn = conns.get_mut(&fd).unwrap();
+                    (std::mem::take(&mut conn.inbuf), std::mem::take(&mut conn.outbuf))
+                };
+                let parsed = parse_request(&inbuf);
+                let Some(req) = parsed else {
+                    let conn = conns.get_mut(&fd).unwrap();
+                    conn.inbuf = inbuf;
+                    conn.outbuf = out;
                     break;
+                };
+                handle_request(realm, handler, &req, &inbuf, &mut out);
+                let (consumed, keep) = (req.consumed, req.keep_alive);
+                drop(req);
+                inbuf.drain(..consumed);
+                let conn = conns.get_mut(&fd).unwrap();
+                conn.inbuf = inbuf;
+                conn.outbuf = out;
+                conn.keep_alive = keep;
+                if !keep {
+                    alive = false;
                 }
-                let mut buf = vec![0u8; sz];
-                if reader.read_exact(&mut buf).is_err() {
-                    return;
-                }
-                body.push_str(&String::from_utf8_lossy(&buf));
-                let mut crlf = String::new();
-                let _ = reader.read_line(&mut crlf);
             }
-        } else if content_len > 0 {
-            let mut buf = vec![0u8; content_len];
-            if reader.read_exact(&mut buf).is_err() {
-                return;
+            let closed = !alive;
+            if !flush_out(kq, fd, conns.get_mut(&fd)) || closed {
+                conns.remove(&fd); // drop closes the fd, removing it from kq
             }
-            body = String::from_utf8_lossy(&buf).into_owned();
-        }
-        // dispatch + reply
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if tx
-            .send(HttpRequest { method, path, headers, body, reply: reply_tx })
-            .is_err()
-        {
-            return;
-        }
-        let Ok((status, hdrs, body)) = reply_rx.recv() else { return };
-        let mut out = format!(
-            "HTTP/1.1 {status} {}\r\ncontent-length: {}\r\n",
-            status_text(status),
-            body.len()
-        );
-        for (k, v) in &hdrs {
-            out.push_str(&format!("{k}: {v}\r\n"));
-        }
-        out.push_str("\r\n");
-        out.push_str(&body);
-        if stream.write_all(out.as_bytes()).is_err() {
-            return;
-        }
-        if !keep_alive {
-            return;
         }
     }
 }
 
-fn status_text(s: u16) -> &'static str {
-    match s {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        400 => "Bad Request",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "",
+/// Register a fd for readability once, level-triggered: the loop drains
+/// to WouldBlock each time, so re-arming per request (EV_ONESHOT) would
+/// just be an extra syscall on the hot path.
+fn arm_read(kq: RawFd, fd: RawFd, udata: u64) {
+    let ev = libc::kevent {
+        ident: fd as usize,
+        filter: libc::EVFILT_READ,
+        flags: libc::EV_ADD,
+        fflags: 0,
+        data: 0,
+        udata: udata as *mut libc::c_void,
+    };
+    unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+}
+
+fn arm_write(kq: RawFd, fd: RawFd) {
+    let ev = libc::kevent {
+        ident: fd as usize,
+        filter: libc::EVFILT_WRITE,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: 0,
+        data: 0,
+        udata: fd as *mut libc::c_void,
+    };
+    unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+}
+
+/// Write as much of the pending response as the socket accepts. Returns
+/// false when the connection is finished (error, or a completed
+/// non-keep-alive response).
+fn flush_out(kq: RawFd, fd: RawFd, conn: Option<&mut HttpConn>) -> bool {
+    let Some(conn) = conn else { return false };
+    while conn.out_off < conn.outbuf.len() {
+        match conn.stream.write(&conn.outbuf[conn.out_off..]) {
+            Ok(0) => return false,
+            Ok(n) => conn.out_off += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                arm_write(kq, fd);
+                return true;
+            }
+            Err(_) => return false,
+        }
     }
+    conn.outbuf.clear();
+    conn.out_off = 0;
+    conn.keep_alive
 }

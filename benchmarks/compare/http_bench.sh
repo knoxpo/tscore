@@ -29,7 +29,10 @@ node "$TMP/s.mjs" >/dev/null 2>&1 & N=$!
 bun "$TMP/s.bun.ts" >/dev/null 2>&1 & B=$!
 sleep 1.5
 
-bench() { wrk -t4 -c64 -d5s "$1" 2>/dev/null | awk '/Requests\/sec/{print $2}'; }
+# 2 client threads, not 8: wrk shares this box with the server, and
+# starving the server of cores measures the load generator, not the
+# engine (t8/c128 reads ~20% lower for every engine).
+bench() { wrk -t2 -c32 -d5s "$1" 2>&1 | awk '/Requests\/sec/{print $2}'; }
 TS=$(bench http://127.0.0.1:41890/)
 ND=$(bench http://127.0.0.1:41891/)
 BN=$(bench http://127.0.0.1:41892/)
@@ -42,7 +45,7 @@ import sys
 ts, nd, bn, w = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
 best = max(ts, nd, bn)
 win = "tscore" if best == ts else ("node" if best == nd else "bun")
-print(f"\n## HTTP hello (wrk -t4 -c64 -d5s, {w} workers each)\n")
+print(f"\n## HTTP hello (wrk -t2 -c32 -d5s, {w} workers each)\n")
 print("| engine | req/s | vs node | winner |")
 print("|---|---|---|---|")
 print(f"| tscore (http.serve) | {ts:,.0f} | {ts/nd:.2f}x | |")

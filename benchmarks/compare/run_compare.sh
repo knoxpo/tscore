@@ -195,13 +195,14 @@ mc "mandelbrot" benchmarks/programs/mandelbrot.ts "$DIR/bench/mc/mandel_workers.
 
 # ---- not benchmarkable yet ----
 {
-    echo "## Not benchmarkable yet"
+    echo "## Runtime surface"
     echo
     echo "| category | status |"
     echo "|---|---|"
-    echo "| modules | N/A — tscore is single-file entry only (import/export rejected) |"
-    echo "| networking | N/A — no sockets in runtime (planned post-M4) |"
-    echo "| async file I/O | N/A — no TS-visible fs API |"
+    echo "| modules | SHIPPED — full ESM (static + dynamic import, cycles, bare specifiers, TLA) |"
+    echo "| networking | SHIPPED — runtime.net TCP (kqueue reactor, connect) + runtime.http |"
+    echo "| async file I/O | SHIPPED — runtime.fs (promise-native, dedicated I/O pool) + bytes |"
+    echo "| http throughput | see the HTTP row above (benchmarks/compare/http_bench.sh) |"
     echo "| async I/O | proxied by timer-storm + channel benchmarks above |"
 } >>"$OUT"
 

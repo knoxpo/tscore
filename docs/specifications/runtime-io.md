@@ -36,13 +36,28 @@ channels.
 ## runtime.http
 
 `serve(port, handler, {workers?})` — HTTP/1.1 with keep-alive and
-chunked request bodies. Connection threads parse; handlers (sync or
-async) run on the realm event loop — or, with `workers: N`, on N
-isolated handler realms fed from a shared queue (the handler is
-structured-cloned once per worker; main-realm globals/modules are not
-visible inside it, same rule as parallel.map). Returns a string (200
-text) or `{status?, headers?, body?}`; `serve` never returns.
-Measured: 125k req/s at workers:8 (0.74x node cluster, wrk -c64).
+chunked request bodies.
+
+Each worker owns its connections end to end: one kqueue per worker, all
+workers watching the same listening socket, and parse → handler →
+response on the same thread. There is no per-request channel and no
+cross-thread handoff — an earlier design that shipped requests to a
+dispatch loop capped out at roughly half this throughput. Connection
+fds are registered level-triggered once (re-arming per request costs a
+syscall), request parsing is zero-copy into the connection buffer, and
+the request object is built from a cached shape.
+
+`workers: 1` (default) turns the calling thread into the event loop, so
+the handler keeps running in the caller's realm and can close over
+program state. `workers: N` gives each thread its own realm and a
+structured clone of the handler — main-realm globals and modules are
+not visible inside it, the same rule as parallel.map. Handlers return a
+string (200 text) or `{status?, headers?, body?}`; `serve` never
+returns.
+
+Measured: 233k req/s at workers:8 — 1.23x node cluster, 1.20x
+Bun.serve (wrk -t2 -c32; see benchmarks/compare/http_bench.sh for why
+the client thread count matters).
 
 ## runtime.bytes + fs binary
 
