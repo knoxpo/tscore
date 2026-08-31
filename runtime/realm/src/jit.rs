@@ -1393,6 +1393,7 @@ pub fn osr_slow(proto: &FunctionProto) -> Option<CompiledFn> {
     match code {
         Some(code) => {
             let ptr = tsr_jit::heap::publish(&code) as *mut u8;
+            tsr_jit::heap::note_symbol(ptr, code.len() * 4, &format!("osr:{}", proto.name));
             jit.osr_code.store(ptr, Release);
             Some(unsafe { std::mem::transmute::<*mut u8, CompiledFn>(ptr) })
         }
@@ -1465,10 +1466,29 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
             tsc_types::CondFact::Other => tsr_jit::tier2::JCond::Other,
         })
         .collect();
+    // warmed ICs baked as immediates (shape id, slot) — the site still
+    // guards on shape, so a later polymorphic object just takes the
+    // generic path
+    let n_code = proto.body().code.len();
+    let ic_baked: Vec<Option<(u32, u32)>> = proto
+        .body()
+        .code
+        .iter()
+        .enumerate()
+        .map(|(pc, i)| {
+            if !matches!(i.op, Op::GetField | Op::SetField) {
+                return None;
+            }
+            let ic = proto.jit.ic_load(n_code, pc);
+            (ic != 0).then(|| ((ic >> 32) as u32, (ic & 0xFFFF_FFFF) as u32 - 1))
+        })
+        .collect();
     let facts = tsr_jit::tier2::Facts {
         num: &typed.num_facts,
         jumpif: &jumpif,
         arg_guard: &typed.arg_guard,
+        const_ops: &typed.const_ops,
+        ic_baked: &ic_baked,
         loop_spec: &typed.loop_spec,
     };
     let ics = proto.jit.ics_base(proto.body().code.len()) as u64;
@@ -1544,6 +1564,7 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
 pub fn compile_now(proto: &FunctionProto) {
     if let Some(code) = compile_unified(proto, false) {
         let ptr = tsr_jit::heap::publish(&code) as *mut u8;
+        tsr_jit::heap::note_symbol(ptr, code.len() * 4, &format!("tier2:{}", proto.name));
         proto.jit.code.store(ptr, Release);
         proto.jit.tier.store(TIER_OPT, Release);
         return;
@@ -1556,6 +1577,7 @@ fn compile_tier1(proto: &FunctionProto) {
     match tsr_jit::tier1::compile(proto, helpers(), false, heap_offsets(), ics) {
         Some(code) => {
             let ptr = tsr_jit::heap::publish(&code) as *mut u8;
+            tsr_jit::heap::note_symbol(ptr, code.len() * 4, &format!("tier1:{}", proto.name));
             proto.jit.code.store(ptr, Release);
             proto.jit.tier.store(TIER_BASELINE, Release);
         }

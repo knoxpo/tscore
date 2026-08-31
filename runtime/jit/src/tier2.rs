@@ -58,6 +58,11 @@ pub struct Facts<'a> {
     pub jumpif: &'a [JCond],
     /// per-arg: entry guard proves numeric
     pub arg_guard: &'a [bool],
+    /// per-pc (b, c): operand is a known integer constant
+    pub const_ops: &'a [[Option<i64>; 2]],
+    /// per-pc: warmed GetField/SetField IC contents (shape id, slot) —
+    /// baked into the code as immediates, guarded by a shape compare
+    pub ic_baked: &'a [Option<(u32, u32)>],
     /// loop-header speculation: (header pc, vregs) — number-guard on the
     /// fall-in edge and at OSR entry; deopt resumes at the header
     pub loop_spec: &'a [(usize, Vec<u8>)],
@@ -501,6 +506,112 @@ pub fn compile(
     Some(c.a.finish())
 }
 
+/// Magic-number constants for signed division by a fixed divisor:
+/// (multiplier, shift) such that n/d == (smulh(n, m) >> s) + sign_fix.
+/// Standard Granlund-Montgomery derivation.
+fn magic_div(d: i64) -> Option<(i64, u32)> {
+    if d.abs() < 2 || d == i64::MIN {
+        return None;
+    }
+    let ad = d.unsigned_abs();
+    let t = (1u128 << 63) + (if d > 0 { 0 } else { 1 });
+    let anc = t - 1 - (t % ad as u128);
+    let mut p: u32 = 63;
+    let (mut q1, mut r1) = ((1u128 << p) / anc, (1u128 << p) % anc);
+    let (mut q2, mut r2) = ((1u128 << p) / ad as u128, (1u128 << p) % ad as u128);
+    loop {
+        p += 1;
+        if p > 127 {
+            return None;
+        }
+        q1 <<= 1;
+        r1 <<= 1;
+        if r1 >= anc {
+            q1 += 1;
+            r1 -= anc;
+        }
+        q2 <<= 1;
+        r2 <<= 1;
+        if r2 >= ad as u128 {
+            q2 += 1;
+            r2 -= ad as u128;
+        }
+        let delta = ad as u128 - r2;
+        if !(q1 < delta || (q1 == delta && r1 == 0)) {
+            break;
+        }
+    }
+    let mut m = (q2 + 1) as i128;
+    if d < 0 {
+        m = -m;
+    }
+    if m > i64::MAX as i128 || m < i64::MIN as i128 {
+        return None;
+    }
+    Some((m as i64, p - 64))
+}
+
+/// Mod with a known integer divisor: the divisor needs no runtime
+/// integer check, and n/d becomes smulh+shift instead of sdiv (~10-cycle
+/// latency on Apple cores, and this sits in the loop-carried chain).
+fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize) {
+    let Some((m, sh)) = magic_div(d) else {
+        // |d| < 2 or unrepresentable: fall back to the generic path
+        c.a.mov_imm64(9, d as u64);
+        c.a.scvtf(1, 9);
+        emit_mod_num(c, a_reg, db, 1, fmod_addr);
+        return;
+    };
+    let slow = c.a.new_label();
+    let done = c.a.new_label();
+    // dividend must be an exact integer (divisor is one by construction)
+    c.a.fcvtzs(10, db);
+    c.a.scvtf(2, 10);
+    c.a.fcmp(2, db);
+    c.a.b_cond(Cond::Ne, slow);
+    // q = (smulh(n, m) >> sh) + (sign bit)
+    c.a.mov_imm64(11, m as u64);
+    c.a.smulh(12, 10, 11);
+    if d > 0 && m < 0 {
+        c.a.add_reg(12, 12, 10);
+    } else if d < 0 && m > 0 {
+        c.a.sub_reg(12, 12, 10);
+    }
+    if sh > 0 {
+        c.a.asr_imm(12, 12, sh);
+    }
+    c.a.add_reg_lsr(12, 12, 12, 63);
+    // r = n - q*d
+    c.a.mov_imm64(11, d as u64);
+    c.a.msub(13, 12, 11, 10);
+    let nonzero = c.a.new_label();
+    c.a.cbnz(13, nonzero);
+    // remainder 0: ±0 carrying the dividend's sign
+    c.a.fmov_xd(14, db);
+    c.a.mov_imm64(12, 0x8000_0000_0000_0000);
+    c.a.and_reg(14, 14, 12);
+    c.put_x(a_reg, 14);
+    c.a.b(done);
+    c.a.bind(nonzero);
+    let dst = if a_reg < LOW { (8 + a_reg) as u32 } else { 2 };
+    c.a.scvtf(dst, 13);
+    if a_reg >= LOW {
+        c.a.str_d_imm(dst, R_SLOTS, C::slot(a_reg));
+    }
+    c.a.b(done);
+    c.a.bind(slow);
+    if db != 0 {
+        c.a.fmov_dd(0, db);
+    }
+    c.a.mov_imm64(9, d as u64);
+    c.a.scvtf(1, 9);
+    c.a.mov_imm64(8, fmod_addr as u64);
+    c.a.blr(8);
+    c.zero_cache();
+    c.put(a_reg, 0);
+    c.a.bind(done);
+}
+
 /// Integer-fast-path Mod on numeric inputs in d{db}/d{dc}; falls back to
 /// libm fmod. Result lands in vreg a's home.
 fn emit_mod_num(c: &mut C, a_reg: u8, db: u32, dc: u32, fmod_addr: usize) {
@@ -861,20 +972,31 @@ fn emit_op(
             }
         }
         Op::Mod => {
+            let const_div = facts.const_ops.get(pc).and_then(|o| o[1]);
             if num_bc {
                 let db = c.fetch(ins.b, 0);
+                if let Some(d) = const_div {
+                    emit_mod_const(c, ins.a, db, d, fmod_addr);
+                    return;
+                }
                 let dc = c.fetch(ins.c, 1);
                 emit_mod_num(c, ins.a, db, dc, fmod_addr);
             } else {
                 let slow = c.a.new_label();
                 let done = c.a.new_label();
                 c.fetch_x(ins.b, 8);
-                c.fetch_x(ins.c, 9);
                 c.guard_number(8, slow);
-                c.guard_number(9, slow);
                 c.a.fmov_dx(0, 8);
-                c.a.fmov_dx(1, 9);
-                emit_mod_num(c, ins.a, 0, 1, fmod_addr);
+                if let Some(d) = const_div {
+                    // divisor is a compile-time integer: no fetch, no
+                    // guard, no runtime integer round-trip for it
+                    emit_mod_const(c, ins.a, 0, d, fmod_addr);
+                } else {
+                    c.fetch_x(ins.c, 9);
+                    c.guard_number(9, slow);
+                    c.a.fmov_dx(1, 9);
+                    emit_mod_num(c, ins.a, 0, 1, fmod_addr);
+                }
                 c.a.b(done);
                 c.a.bind(slow);
                 c.step_full(pc);
@@ -1288,6 +1410,39 @@ fn emit_op(
                     c.a.b(done);
                 }
                 c.a.bind(full);
+                // baked monomorphic stub: the site's warmed IC gives the
+                // shape id and slot as compile-time immediates, so the
+                // access is tag + shape compare + one load — no IC-table
+                // read, no slot arithmetic. A miss falls into the generic
+                // inline path below (which refreshes the IC).
+                if let Some((sid, slot)) = facts
+                    .ic_baked
+                    .get(pc)
+                    .copied()
+                    .flatten()
+                    .filter(|&(_, slot)| (slot as usize) < o.obj_inline_n as usize)
+                {
+                    let generic = c.a.new_label();
+                    c.fetch_x(ins.b, 8);
+                    c.a.lsr_imm(10, 8, 48);
+                    c.a.movz(11, 0xFFFB, 0); // TAG_OBJ
+                    c.a.cmp_reg(10, 11);
+                    c.a.b_cond(Cond::Ne, generic);
+                    c.a.orr_reg32(9, 31, 8);
+                    c.arena_base(10, 9, o.obj_bases_off);
+                    c.index_addr(10, 10, 9, o.obj_size);
+                    c.a.ldr_imm(11, 10, o.obj_shape_arc);
+                    c.a.ldr_w_imm(12, 11, o.shape_id_delta);
+                    c.a.mov_imm64(13, sid as u64);
+                    c.a.cmp_reg(12, 13);
+                    c.a.b_cond(Cond::Ne, generic);
+                    c.a.mov(15, 10); // CSE cache: validated address
+                    c.a.mov(16, 12); //            + shape id
+                    c.a.ldr_imm(8, 10, o.obj_inline + slot * 8);
+                    c.put_x(ins.a, 8);
+                    c.a.b(done);
+                    c.a.bind(generic);
+                }
                 // inline IC'd property load (reads only, no GC)
                 c.fetch_x(ins.b, 8);
                 c.a.lsr_imm(10, 8, 48);
@@ -1364,6 +1519,35 @@ fn emit_op(
                     c.a.b(done);
                 }
                 c.a.bind(full);
+                if let Some((sid, slot)) = facts
+                    .ic_baked
+                    .get(pc)
+                    .copied()
+                    .flatten()
+                    .filter(|&(_, slot)| (slot as usize) < o.obj_inline_n as usize)
+                {
+                    let generic = c.a.new_label();
+                    c.fetch_x(ins.a, 8);
+                    c.a.lsr_imm(10, 8, 48);
+                    c.a.movz(11, 0xFFFB, 0);
+                    c.a.cmp_reg(10, 11);
+                    c.a.b_cond(Cond::Ne, generic);
+                    c.fetch_x(ins.c, 9);
+                    c.guard_number(9, generic); // heap values -> helper
+                    c.a.orr_reg32(12, 31, 8);
+                    c.arena_base(10, 12, o.obj_bases_off);
+                    c.index_addr(10, 10, 12, o.obj_size);
+                    c.a.ldr_imm(11, 10, o.obj_shape_arc);
+                    c.a.ldr_w_imm(12, 11, o.shape_id_delta);
+                    c.a.mov_imm64(13, sid as u64);
+                    c.a.cmp_reg(12, 13);
+                    c.a.b_cond(Cond::Ne, generic);
+                    c.a.mov(15, 10);
+                    c.a.mov(16, 12);
+                    c.a.str_imm(9, 10, o.obj_inline + slot * 8);
+                    c.a.b(done);
+                    c.a.bind(generic);
+                }
                 // inline IC'd property store, number values only: a number
                 // stored into any object never needs a write barrier, and
                 // existing-slot stores never transition shapes

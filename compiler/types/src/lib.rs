@@ -23,6 +23,8 @@ pub struct TypedProto {
     pub num_facts: Vec<[bool; 3]>,
     /// Per-pc: JumpIfFalse/True condition fact.
     pub jumpif: Vec<CondFact>,
+    /// Per-pc (b, c): operand is a known integer constant.
+    pub const_ops: Vec<[Option<i64>; 2]>,
     /// Per-arg: entry guard proves this param numeric (annotation or
     /// uniform runtime feedback).
     pub arg_guard: Vec<bool>,
@@ -37,17 +39,28 @@ pub struct TypedProto {
 // codegen only cares about the two primitive fast lanes)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum T {
+    /// A known integer constant (refines Num; enables constant-divisor
+    /// codegen for Mod/Div).
+    Int(i64),
     Num,
     Bool,
     Top,
 }
 
+impl T {
+    fn is_num(self) -> bool {
+        matches!(self, T::Num | T::Int(_))
+    }
+}
+
 fn join(a: T, b: T) -> T {
     if a == b {
-        a
-    } else {
-        T::Top
+        return a;
     }
+    if a.is_num() && b.is_num() {
+        return T::Num; // two different constants: still numeric
+    }
+    T::Top
 }
 
 pub fn analyze(proto: &FunctionProto) -> TypedProto {
@@ -56,6 +69,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         reason,
         num_facts: Vec::new(),
         jumpif: Vec::new(),
+        const_ops: Vec::new(),
         arg_guard: Vec::new(),
         loop_spec: Vec::new(),
     };
@@ -86,6 +100,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
     let mut work = vec![0usize];
     let mut num_facts = vec![[false; 3]; n];
     let mut jumpif = vec![CondFact::Other; n];
+    let mut const_ops: Vec<[Option<i64>; 2]> = vec![[None; 2]; n];
     // loop-header speculation state (filled between the two passes):
     // pinned[H] = set of vregs forced Num at header H's merge
     let mut pinned: std::collections::HashMap<usize, Vec<u8>> =
@@ -146,7 +161,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
                     continue;
                 };
                 for r in 0..nregs {
-                    if hs[r] == T::Top && es[r] == T::Num {
+                    if hs[r] == T::Top && es[r].is_num() {
                         let e = spec.entry(h).or_default();
                         if !e.contains(&(r as u8)) {
                             e.push(r as u8);
@@ -161,7 +176,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
                 }
                 let h = (pc as i64 + ins.sbx() as i64 + 1) as usize;
                 if let (Some(vs), Some(es)) = (spec.get_mut(&h), &states[pc]) {
-                    vs.retain(|&r| es[r as usize] == T::Num);
+                    vs.retain(|&r| es[r as usize].is_num());
                 }
             }
             // only speculate vregs LIVE-IN at the header: a dead loop
@@ -253,6 +268,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
             work = vec![0usize];
             num_facts = vec![[false; 3]; n];
             jumpif = vec![CondFact::Other; n];
+            const_ops = vec![[None; 2]; n];
         }
     while let Some(pc) = work.pop() {
         if pc >= n {
@@ -267,15 +283,31 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         // facts monotonically narrow across re-visits (lattice join only
         // widens toward Top), so last write is the sound fixpoint value
         num_facts[pc] = [
-            fact(&s, ins.a) == T::Num,
-            fact(&s, ins.b) == T::Num,
-            fact(&s, ins.c) == T::Num,
+            fact(&s, ins.a).is_num(),
+            fact(&s, ins.b).is_num(),
+            fact(&s, ins.c).is_num(),
+        ];
+        // constant integer operands (b, c) for constant-divisor codegen
+        const_ops[pc] = [
+            match fact(&s, ins.b) {
+                T::Int(v) => Some(v),
+                _ => None,
+            },
+            match fact(&s, ins.c) {
+                T::Int(v) => Some(v),
+                _ => None,
+            },
         ];
         let mut next: Vec<usize> = vec![pc + 1];
         match ins.op {
-            Op::LoadInt => s[a] = T::Num,
+            Op::LoadInt => s[a] = T::Int(ins.sbx() as i64),
             Op::LoadConst => {
                 s[a] = match body.consts.get(ins.bx() as usize) {
+                    Some(Const::Number(n))
+                        if n.fract() == 0.0 && n.abs() < 9e15 =>
+                    {
+                        T::Int(*n as i64)
+                    }
                     Some(Const::Number(_)) => T::Num,
                     _ => T::Top,
                 }
@@ -285,7 +317,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
             Op::Move => s[a] = fact(&s, ins.b),
             Op::Add => {
                 // string concat possible unless both proven Num
-                s[a] = if fact(&s, ins.b) == T::Num && fact(&s, ins.c) == T::Num {
+                s[a] = if fact(&s, ins.b).is_num() && fact(&s, ins.c).is_num() {
                     T::Num
                 } else {
                     T::Top
@@ -316,9 +348,9 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
             }
             Op::JumpIfFalse | Op::JumpIfTrue => {
                 jumpif[pc] = match fact(&s, ins.a) {
-                    T::Num => CondFact::Num,
+                    x if x.is_num() => CondFact::Num,
                     T::Bool => CondFact::Bool,
-                    T::Top => CondFact::Other,
+                    _ => CondFact::Other,
                 };
                 next = vec![pc + 1, (pc as i64 + ins.sbx() as i64 + 1) as usize];
             }
@@ -348,6 +380,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         reason: "",
         num_facts,
         jumpif,
+        const_ops,
         arg_guard,
         loop_spec,
     }

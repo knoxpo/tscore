@@ -41,3 +41,21 @@ Each ported 1:1 to every comparison runtime, same algorithm, no SIMD tricks.
 Absolute times on laptops swing ±40% with power/thermal state (observed:
 same binary, same day, 8.7s vs 12.4s on fnv serial). Benchmark plugged in,
 compare only numbers from one session, and trust ratios over absolutes.
+
+## JIT-aware profiling
+
+`sample` reports compiled-code addresses as `??? (in <unknown binary>)`.
+Two runtime hooks fix that:
+
+- `TSC_JIT_MAP=<file>` — one `<hex addr> <hex size> <name>` line per
+  published region (`tier1:`/`tier2:`/`osr:` + function name).
+- `TSC_JIT_DUMP=<dir>` — raw bytes per region, for offset-level
+  disassembly (`clang -c` a `.long` listing, then `otool -tvV`).
+
+`benchmarks/jitprof.sh <program.ts>` joins a sample against the map and
+prints the hot symbols plus the hottest offsets inside the top JIT
+region — the input to any codegen change.
+
+`benchmarks/compare/http_bench.sh [workers]` produces the HTTP row
+(needs `wrk`; servers are long-lived, so it is not part of
+`run_compare.sh`).

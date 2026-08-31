@@ -1,6 +1,6 @@
 # Engine comparison: tscore vs node (V8) vs bun (JSC)
 
-- date: 2026-08-31 17:26
+- date: 2026-08-31 19:43
 - machine: Apple M5 Max, 18 logical cpus (6P + 12E)
 - tscore: tscore 0.1.0, node: v24.17.0, bun: 1.4.0
 - steady-state cells: median TIME_MS of 5 runs, first run discarded; in-program warmup pass before timing
@@ -13,40 +13,40 @@
 
 | benchmark | tscore | node | bun | winner |
 |---|---|---|---|---|
-| startup (hello.ts) | 1.6 (0.04x) | 38.2 (1.00x) | 4.9 (0.13x) | **tscore** |
-| parse+compile (~50k LOC) | 8.0 (0.08x) | 102.9 (1.00x) | 12.4 (0.12x) | **tscore** |
+| startup (hello.ts) | 1.6 (0.04x) | 36.7 (1.00x) | 4.2 (0.11x) | **tscore** |
+| parse+compile (~50k LOC) | 7.5 (0.08x) | 98.2 (1.00x) | 11.2 (0.11x) | **tscore** |
 
 ## Steady-state (shared sources, in-program TIME_MS)
 
 | benchmark | tscore | node | bun | winner |
 |---|---|---|---|---|
-| objects | 186.7 (7.70x) | 24.3 (1.00x) | 23.5 (0.97x) | **bun** |
-| closures | 113.9 (2.72x) | 41.9 (1.00x) | 71.6 (1.71x) | **node** |
-| alloc | 188.6 (4.28x) | 44.1 (1.00x) | 48.4 (1.10x) | **node** |
-| gc_churn | 483.5 (8.96x) | 54.0 (1.00x) | 44.1 (0.82x) | **bun** |
-| promises | 64.5 (1.01x) | 63.9 (1.00x) | 58.4 (0.91x) | **bun** |
+| objects | 168.3 (7.09x) | 23.7 (1.00x) | 23.2 (0.98x) | **bun** |
+| closures | 115.4 (3.38x) | 34.1 (1.00x) | 47.7 (1.40x) | **node** |
+| alloc | 177.8 (4.06x) | 43.8 (1.00x) | 45.7 (1.04x) | **node** |
+| gc_churn | 453.3 (8.52x) | 53.2 (1.00x) | 41.3 (0.78x) | **bun** |
+| promises | 63.5 (1.01x) | 63.2 (1.00x) | 57.1 (0.90x) | **bun** |
 
 ## Async (per-engine variants, same algorithm)
 
 | benchmark | tscore | node | bun | winner |
 |---|---|---|---|---|
-| timer storm (2000x sleep 1ms) | 12.6 (0.95x) | 13.3 (1.00x) | 12.0 (0.90x) | **bun** |
-| channel 100k msgs (vs worker postMessage) | 5.1 (0.15x) | 34.9 (1.00x) | 29.2 (0.84x) | **tscore** |
+| timer storm (2000x sleep 1ms) | 15.0 (1.03x) | 14.5 (1.00x) | 13.4 (0.92x) | **bun** |
+| channel 100k msgs (vs worker postMessage) | 5.2 (0.15x) | 34.1 (1.00x) | 28.3 (0.83x) | **tscore** |
 
 ## Long-running (30s sustained mixed compute+alloc, single run)
 
 | metric | tscore | node | bun | winner |
 |---|---|---|---|---|
-| throughput (ops/sec) | 406252 (0.41x) | 1002619 (1.00x) | 776542 (0.77x) | **node** |
-| stability (last/first decile) | 0.997 | 1.02 | 1.036 | |
+| throughput (ops/sec) | 435657 (0.42x) | 1034130 (1.00x) | 799257 (0.77x) | **node** |
+| stability (last/first decile) | 0.999 | 1.018 | 1.036 | |
 
-## HTTP hello (wrk -t4 -c64 -d5s, 8 workers each; measured 2026-08-31)
+## HTTP hello (wrk -t4 -c64 -d5s, 8 workers each; `benchmarks/compare/http_bench.sh`)
 
-| engine | req/s | vs node |
-|---|---|---|
-| tscore (http.serve, workers:8) | 125,708 | 0.74x |
-| node (cluster x8) | 170,374 | 1.00x |
-| bun (Bun.serve) | 190,350 | 1.12x |
+| engine | req/s | vs node | winner |
+|---|---|---|---|
+| tscore (http.serve) | 127,404 | 0.74x | |
+| node (cluster) | 172,116 | 1.00x | |
+| bun (Bun.serve) | 195,430 | 1.14x | **bun** |
 
 ## Multicore (tscore parallel.map vs node/bun worker_threads)
 
@@ -54,19 +54,19 @@
 
 | workers | tscore | node | bun | winner |
 |---|---|---|---|---|
-| 1 | 76.3 (1.25x) | 61.2 (1.00x) | 35.1 (0.57x) | **bun** |
-| 2 | 41.4 (0.93x) | 44.4 (1.00x) | 24.0 (0.54x) | **bun** |
-| 4 | 20.4 (0.65x) | 31.2 (1.00x) | 16.7 (0.54x) | **bun** |
-| 8 | 11.8 (0.46x) | 25.7 (1.00x) | 15.0 (0.58x) | **tscore** |
+| 1 | 73.5 (1.24x) | 59.5 (1.00x) | 33.5 (0.56x) | **bun** |
+| 2 | 39.6 (0.97x) | 40.9 (1.00x) | 23.7 (0.58x) | **bun** |
+| 4 | 20.4 (0.65x) | 31.4 (1.00x) | 16.7 (0.53x) | **bun** |
+| 8 | 11.8 (0.47x) | 24.9 (1.00x) | 14.2 (0.57x) | **tscore** |
 
 ### mandelbrot
 
 | workers | tscore | node | bun | winner |
 |---|---|---|---|---|
-| 1 | 25.0 (0.70x) | 35.5 (1.00x) | 30.9 (0.87x) | **tscore** |
-| 2 | 12.8 (0.52x) | 24.5 (1.00x) | 20.2 (0.83x) | **tscore** |
-| 4 | 6.9 (0.30x) | 22.7 (1.00x) | 18.5 (0.82x) | **tscore** |
-| 8 | 4.0 (0.18x) | 22.8 (1.00x) | 16.6 (0.73x) | **tscore** |
+| 1 | 24.4 (0.74x) | 33.0 (1.00x) | 29.3 (0.89x) | **tscore** |
+| 2 | 12.7 (0.53x) | 23.9 (1.00x) | 20.0 (0.84x) | **tscore** |
+| 4 | 6.8 (0.31x) | 22.3 (1.00x) | 18.4 (0.83x) | **tscore** |
+| 8 | 3.8 (0.17x) | 22.1 (1.00x) | 16.1 (0.73x) | **tscore** |
 
 ## Scoreboard
 

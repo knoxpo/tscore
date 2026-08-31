@@ -170,6 +170,19 @@ impl Asm {
     pub fn eor_reg(&mut self, rd: Reg, rn: Reg, rm: Reg) {
         self.push(0xCA00_0000 | rm << 16 | rn << 5 | rd);
     }
+    /// SMULH Rd, Rn, Rm — high 64 bits of a signed 64x64 product
+    /// (byte-verified: 0x9b4b7d4c = smulh x12, x10, x11).
+    pub fn smulh(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.push(0x9B40_7C00 | rm << 16 | rn << 5 | rd);
+    }
+    /// ASR Rd, Rn, #sh (SBFM alias; 0x9349fd8d = asr x13, x12, #9).
+    pub fn asr_imm(&mut self, rd: Reg, rn: Reg, sh: u32) {
+        self.push(0x9340_FC00 | sh << 16 | rn << 5 | rd);
+    }
+    /// ADD Rd, Rn, Rm, LSR #sh (0x8b4dfdae = add x14, x13, x13, lsr #63).
+    pub fn add_reg_lsr(&mut self, rd: Reg, rn: Reg, rm: Reg, sh: u32) {
+        self.push(0x8B40_0000 | rm << 16 | sh << 10 | rn << 5 | rd);
+    }
     pub fn mul(&mut self, rd: Reg, rn: Reg, rm: Reg) {
         // MADD Rd, Rn, Rm, XZR
         self.push(0x9B00_7C00 | rm << 16 | rn << 5 | rd);

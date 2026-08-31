@@ -15,6 +15,38 @@ unsafe impl Send for Inner {}
 static HEAP: Mutex<Option<Inner>> = Mutex::new(None);
 
 /// Copy `code` into executable memory; returns the entry pointer.
+/// Emit a symbol line for a published region when `TSC_JIT_MAP` names a
+/// file. Format: `<hex addr> <hex size> <name>` — the perf-map convention
+/// `sample`/`perf` consumers and our own symbolizer understand.
+pub fn note_symbol(addr: *const u8, bytes: usize, name: &str) {
+    use std::io::Write;
+    // TSC_JIT_DUMP=<dir>: raw code per region, for offset-level disassembly
+    if let Some(dir) = std::env::var_os("TSC_JIT_DUMP") {
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .collect();
+        let path = std::path::PathBuf::from(dir).join(format!("{safe}.bin"));
+        let slice = unsafe { std::slice::from_raw_parts(addr, bytes) };
+        let _ = std::fs::write(path, slice);
+    }
+    static MAP: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let f = MAP.get_or_init(|| {
+        std::env::var_os("TSC_JIT_MAP").map(|p| {
+            let path = std::path::PathBuf::from(p);
+            std::sync::Mutex::new(
+                std::fs::File::create(path).expect("create TSC_JIT_MAP file"),
+            )
+        })
+    });
+    if let Some(f) = f {
+        let mut g = f.lock().unwrap();
+        let _ = writeln!(g, "{:x} {:x} {}", addr as usize, bytes, name);
+        let _ = g.flush();
+    }
+}
+
 pub fn publish(code: &[u32]) -> *const u8 {
     let bytes = code.len() * 4;
     let mut g = HEAP.lock();
