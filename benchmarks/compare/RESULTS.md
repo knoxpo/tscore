@@ -40,10 +40,24 @@
 | throughput (ops/sec) | 431333 (0.42x) | 1034509 (1.00x) | 834778 (0.81x) | **node** |
 | stability (last/first decile) | 0.996 | 1.013 | 1.001 | |
 
-## HTTP hello (wrk -t2 -c32 -d5s, 8 workers each; `benchmarks/compare/http_bench.sh`)
+## HTTP hello, single-threaded (wrk -t2 -c32 -d5s; `benchmarks/compare/http_bench.sh`)
+
+Per-core comparison: one tscore worker, one node process, one Bun.serve
+event loop (its default). This is the honest engine head-to-head.
 
 | engine | req/s | vs node | winner |
 |---|---|---|---|
-| tscore (http.serve) | 233,546 | 1.23x | **tscore** |
-| node (cluster) | 190,408 | 1.00x | |
-| bun (Bun.serve) | 194,224 | 1.02x | |
+| tscore (workers:1) | 213,806 | 1.49x | **tscore** |
+| node (single process) | 143,172 | 1.00x | |
+| bun (Bun.serve) | 189,753 | 1.33x | |
+
+## HTTP hello, 8 workers
+
+Scale-out on a loopback benchmark is client-bound for every engine —
+a ceiling check, not a speedup.
+
+| engine | req/s | vs node | vs own 1-thread |
+|---|---|---|---|
+| tscore (workers:8) | 230,785 | 1.23x | 1.08x |
+| node (cluster x8) | 187,523 | 1.00x | 1.31x |
+| bun | single-threaded by default | — | — |

@@ -55,9 +55,13 @@ not visible inside it, the same rule as parallel.map. Handlers return a
 string (200 text) or `{status?, headers?, body?}`; `serve` never
 returns.
 
-Measured: 233k req/s at workers:8 — 1.23x node cluster, 1.20x
-Bun.serve (wrk -t2 -c32; see benchmarks/compare/http_bench.sh for why
-the client thread count matters).
+Measured single-threaded (the honest per-core comparison — Bun.serve is
+a single-threaded event loop by default): 214k req/s vs bun 190k and
+node 143k. At workers:8 it reaches 231k, but scale-out on a loopback
+benchmark is client-bound for every engine (node's own cluster x8 gains
+only 1.31x over its single process), so read that as a ceiling check.
+See benchmarks/compare/http_bench.sh, which reports both rows and
+explains why the client thread count matters.
 
 ## runtime.bytes + fs binary
 
