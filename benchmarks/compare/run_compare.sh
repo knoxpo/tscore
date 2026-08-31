@@ -193,6 +193,16 @@ mc "mandelbrot" benchmarks/programs/mandelbrot.ts "$DIR/bench/mc/mandel_workers.
     echo
 } >>"$OUT"
 
+# ---- HTTP throughput ----
+# Generated here rather than pasted in: this script rewrites RESULTS.md
+# wholesale, so a hand-maintained section silently disappears on the next run.
+echo "== http ==" >&2
+if command -v wrk >/dev/null 2>&1; then
+    python3 "$DIR/http_bench.py" >>"$OUT" || echo "(http bench failed)" >>"$OUT"
+else
+    { echo "## HTTP hello"; echo; echo "skipped — wrk not installed (\`brew install wrk\`)"; echo; } >>"$OUT"
+fi
+
 # ---- not benchmarkable yet ----
 {
     echo "## Runtime surface"
@@ -202,7 +212,7 @@ mc "mandelbrot" benchmarks/programs/mandelbrot.ts "$DIR/bench/mc/mandel_workers.
     echo "| modules | SHIPPED — full ESM (static + dynamic import, cycles, bare specifiers, TLA) |"
     echo "| networking | SHIPPED — runtime.net TCP (kqueue reactor, connect) + runtime.http |"
     echo "| async file I/O | SHIPPED — runtime.fs (promise-native, dedicated I/O pool) + bytes |"
-    echo "| http throughput | see the HTTP row above (benchmarks/compare/http_bench.sh) |"
+    echo "| http throughput | see the HTTP section above (benchmarks/compare/http_bench.py) |"
     echo "| async I/O | proxied by timer-storm + channel benchmarks above |"
 } >>"$OUT"
 
