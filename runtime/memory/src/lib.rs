@@ -525,80 +525,66 @@ pub enum HStr {
     /// loop is then O(total bytes) instead of O(n^2) copying, which is
     /// what every production JS engine does (V8 ConsString, JSC ropes).
     ///
-    /// The tree holds `Arc`s, not heap refs, so the collector needs to
-    /// know nothing about it and `as_str` stays `&self`.
-    Rope(Arc<RopeNode>, usize),
+    /// The node lives in `Heap::ropes`; read it through `Heap::str_at`.
+    Rope(u32, u32),
 }
 
-/// One node of a lazy concatenation tree. `flat` caches the flattened
-/// bytes on first read (interior mutability: reading a string must not
-/// require `&mut Heap`).
+/// One node of a lazy concatenation tree, living in `Heap::ropes`.
+/// Creating one is a `Vec::push` — no allocator call — which is what
+/// makes deferring cheap enough to use for short concatenations too.
+///
+/// `flat` caches the flattened bytes on first read, so reading a string
+/// never needs `&mut Heap`.
 #[derive(Debug)]
-pub struct RopeNode {
-    kind: RopeKind,
+pub struct RopeNodeData {
+    left: RopeSide,
+    right: RopeSide,
+    len: u32,
     flat: std::sync::OnceLock<Arc<str>>,
 }
 
+/// One side of a rope node. Short pieces (numbers, punctuation, small
+/// literals) live in the node itself, so `s + i` allocates nothing.
 #[derive(Debug)]
-enum RopeKind {
-    Leaf(Arc<str>),
-    Cat(Arc<RopeNode>, Arc<RopeNode>),
+enum RopeSide {
+    Shared(Arc<str>),
+    Node(u32),
+    Inline(u8, [u8; ROPE_INLINE]),
 }
 
-impl RopeNode {
-    pub fn leaf(s: Arc<str>) -> Arc<RopeNode> {
-        Arc::new(RopeNode { kind: RopeKind::Leaf(s), flat: std::sync::OnceLock::new() })
-    }
+pub const ROPE_INLINE: usize = 15;
 
-    pub fn cat(l: Arc<RopeNode>, r: Arc<RopeNode>) -> Arc<RopeNode> {
-        Arc::new(RopeNode { kind: RopeKind::Cat(l, r), flat: std::sync::OnceLock::new() })
-    }
-
-    /// Flatten once; later reads hit the cache.
-    pub fn as_str(&self) -> &str {
-        if let RopeKind::Leaf(s) = &self.kind {
-            return s; // leaves need no flattening
+impl RopeSide {
+    fn from_str(s: &str) -> RopeSide {
+        if s.len() <= ROPE_INLINE {
+            let mut b = [0u8; ROPE_INLINE];
+            b[..s.len()].copy_from_slice(s.as_bytes());
+            RopeSide::Inline(s.len() as u8, b)
+        } else {
+            RopeSide::Shared(Arc::from(s))
         }
-        self.flat.get_or_init(|| {
-            let mut out = String::with_capacity(self.byte_len());
-            // iterative walk: deep left-leaning trees must not blow the
-            // Rust stack (a 100k-iteration append loop is 100k deep)
-            let mut stack: Vec<&RopeNode> = vec![self];
-            while let Some(n) = stack.pop() {
-                match &n.kind {
-                    RopeKind::Leaf(s) => out.push_str(s),
-                    RopeKind::Cat(l, r) => {
-                        if let Some(f) = n.flat.get() {
-                            out.push_str(f); // already-flattened subtree
-                        } else {
-                            stack.push(r);
-                            stack.push(l);
-                        }
-                    }
-                }
-            }
-            Arc::from(out.as_str())
-        })
     }
-
-    pub fn byte_len(&self) -> usize {
-        if let Some(f) = self.flat.get() {
-            return f.len();
-        }
-        match &self.kind {
-            RopeKind::Leaf(s) => s.len(),
-            RopeKind::Cat(l, r) => l.byte_len() + r.byte_len(),
+    fn dup(&self) -> RopeSide {
+        match self {
+            RopeSide::Shared(a) => RopeSide::Shared(a.clone()),
+            RopeSide::Node(i) => RopeSide::Node(*i),
+            RopeSide::Inline(n, b) => RopeSide::Inline(*n, *b),
         }
     }
 }
 
 impl HStr {
+    /// Flat bytes. Ropes live in the heap's arena and must be read with
+    /// `Heap::str_at`; this returns "" for them.
     #[inline(always)]
     pub fn as_str(&self) -> &str {
         match self {
             HStr::Shared(a) => a,
             HStr::Buf(b) => b,
-            HStr::Rope(n, _) => n.as_str(),
+            HStr::Rope(..) => {
+                debug_assert!(false, "rope must be read via Heap::str_at");
+                ""
+            }
         }
     }
 
@@ -609,20 +595,11 @@ impl HStr {
         match self {
             HStr::Shared(a) => a.len(),
             HStr::Buf(b) => b.len(),
-            HStr::Rope(_, n) => *n,
+            HStr::Rope(_, n) => *n as usize,
         }
     }
 
-    /// The rope node for this string, cloning cheaply where possible.
-    /// A `Buf` must be materialized once; after that concatenation is
-    /// O(1) per operation.
-    pub fn to_rope(&self) -> Arc<RopeNode> {
-        match self {
-            HStr::Shared(a) => RopeNode::leaf(a.clone()),
-            HStr::Buf(b) => RopeNode::leaf(Arc::from(b.as_str())),
-            HStr::Rope(n, _) => n.clone(),
-        }
-    }
+
 }
 
 /// Young-generation tag: bit 31 of an obj/arr/str Value payload. Young
@@ -651,6 +628,19 @@ pub struct Nursery {
 
 pub struct Heap {
     pub strs: Vec<HStr>,
+    /// Bump arena of rope nodes. Creating a lazy concatenation is a push
+    /// here, not an allocator call. Reclaimed by `compact_ropes()` at
+    /// every collection, which copies the still-reachable trees into a
+    /// fresh arena and rewrites the indices.
+    pub ropes: Vec<RopeNodeData>,
+    /// String slots currently holding a rope — the roots compaction walks
+    /// from. Young entries are re-registered by `promote_str` when they
+    /// survive evacuation, since evacuation changes their ref.
+    pub rope_slots: Vec<Ref>,
+    /// Live node count at the last compaction. Compaction costs O(live),
+    /// so running it at every GC would re-copy a growing accumulator each
+    /// cycle — O(n²) again. Doubling makes it amortized O(1) per node.
+    rope_live: usize,
     pub objs: Vec<Obj>,
     pub arrs: Vec<Vec<Value>>,
     pub closures: Vec<Closure>,
@@ -704,6 +694,9 @@ impl Default for Heap {
     fn default() -> Self {
         Heap {
             strs: Vec::new(),
+            ropes: Vec::new(),
+            rope_slots: Vec::new(),
+            rope_live: 0,
             objs: Vec::new(),
             arrs: Vec::new(),
             closures: Vec::new(),
@@ -873,7 +866,11 @@ impl Heap {
 
     #[inline(always)]
     pub fn str_at(&self, r: Ref) -> &str {
-        self.str_raw(r).as_str()
+        match self.str_raw(r) {
+            HStr::Shared(a) => a,
+            HStr::Buf(b) => b,
+            HStr::Rope(n, _) => self.rope_str(*n),
+        }
     }
 
     /// Arc for cross-realm/portable use (copies Buf strings; ropes
@@ -881,40 +878,197 @@ impl Heap {
     pub fn str_arc(&self, r: Ref) -> Arc<str> {
         match self.str_raw(r) {
             HStr::Shared(a) => a.clone(),
-            other => Arc::from(other.as_str()),
+            HStr::Buf(b) => Arc::from(b.as_str()),
+            HStr::Rope(n, _) => self.rope_arc(*n),
         }
     }
 
-    /// Lazy concatenation: build a rope node instead of copying both
+    /// Lazy concatenation: push a rope node instead of copying both
     /// sides. Short results are still copied — a flat small string beats
     /// a tree node, and this keeps `a + b` for tiny pieces cheap.
     pub fn alloc_concat(&mut self, a: Ref, b: Ref) -> Ref {
-        let FLAT_LIMIT = rope_limit();
+        let flat_limit = rope_limit();
         let (la, lb) = (self.str_raw(a).byte_len(), self.str_raw(b).byte_len());
-        if la + lb <= FLAT_LIMIT {
-            let mut s = String::with_capacity(la + lb);
+        if la + lb <= flat_limit {
+            let mut s = self.pool_str_bufs.pop().unwrap_or_default();
+            s.reserve(la + lb);
             s.push_str(self.str_at(a));
             s.push_str(self.str_at(b));
             return self.alloc_str_owned(s);
         }
-        let node = RopeNode::cat(self.str_raw(a).to_rope(), self.str_raw(b).to_rope());
-        self.alloc_str_slot_pub(HStr::Rope(node, la + lb))
+        let l = self.side_of(a);
+        let r = self.side_of(b);
+        let n = self.push_rope(l, r, (la + lb) as u32);
+        self.alloc_rope_slot(n, (la + lb) as u32)
     }
 
     /// Concatenate a heap string with a plain `&str` (the common
     /// `s + literal` / `s + number` shape) without materializing an
     /// intermediate heap slot for the right-hand side.
     pub fn alloc_concat_str(&mut self, a: Ref, b: &str) -> Ref {
-        let FLAT_LIMIT = rope_limit();
+        let flat_limit = rope_limit();
         let la = self.str_raw(a).byte_len();
-        if la + b.len() <= FLAT_LIMIT {
-            let mut s = String::with_capacity(la + b.len());
+        if la + b.len() <= flat_limit {
+            let mut s = self.pool_str_bufs.pop().unwrap_or_default();
+            s.reserve(la + b.len());
             s.push_str(self.str_at(a));
             s.push_str(b);
             return self.alloc_str_owned(s);
         }
-        let node = RopeNode::cat(self.str_raw(a).to_rope(), RopeNode::leaf(Arc::from(b)));
-        self.alloc_str_slot_pub(HStr::Rope(node, la + b.len()))
+        let l = self.side_of(a);
+        let n = self.push_rope(l, RopeSide::from_str(b), (la + b.len()) as u32);
+        self.alloc_rope_slot(n, (la + b.len()) as u32)
+    }
+
+    /// One side of a new rope node, taken from an existing string slot.
+    /// A rope operand is referenced by index (no copy); a flat one is
+    /// inlined when short, shared otherwise.
+    fn side_of(&mut self, r: Ref) -> RopeSide {
+        match self.str_raw(r) {
+            HStr::Rope(n, _) => RopeSide::Node(*n),
+            HStr::Shared(a) if a.len() > ROPE_INLINE => RopeSide::Shared(a.clone()),
+            other => RopeSide::from_str(other.as_str()),
+        }
+    }
+
+    fn push_rope(&mut self, left: RopeSide, right: RopeSide, len: u32) -> u32 {
+        self.ropes.push(RopeNodeData { left, right, len, flat: std::sync::OnceLock::new() });
+        (self.ropes.len() - 1) as u32
+    }
+
+    fn alloc_rope_slot(&mut self, node: u32, len: u32) -> Ref {
+        let r = self.alloc_str_slot_pub(HStr::Rope(node, len));
+        self.rope_slots.push(r);
+        r
+    }
+
+    /// Flat bytes of a rope, cached in the node on first read.
+    pub fn rope_str(&self, idx: u32) -> &str {
+        let n = &self.ropes[idx as usize];
+        n.flat.get_or_init(|| self.flatten(idx))
+    }
+
+    pub fn rope_arc(&self, idx: u32) -> Arc<str> {
+        let n = &self.ropes[idx as usize];
+        n.flat.get_or_init(|| self.flatten(idx)).clone()
+    }
+
+    /// Walk the tree left-to-right appending leaves. Iterative: an
+    /// accumulator loop builds a left-leaning chain tens of thousands of
+    /// nodes deep, which would overflow the Rust stack if recursive.
+    fn flatten(&self, idx: u32) -> Arc<str> {
+        let mut out = String::with_capacity(self.ropes[idx as usize].len as usize);
+        // stack of pending sides, in reverse visit order
+        let mut stack: Vec<&RopeSide> = Vec::new();
+        let root = &self.ropes[idx as usize];
+        stack.push(&root.right);
+        stack.push(&root.left);
+        while let Some(side) = stack.pop() {
+            match side {
+                RopeSide::Shared(a) => out.push_str(a),
+                RopeSide::Inline(n, b) => {
+                    out.push_str(std::str::from_utf8(&b[..*n as usize]).unwrap_or(""))
+                }
+                RopeSide::Node(i) => {
+                    let n = &self.ropes[*i as usize];
+                    // an already-flattened subtree short-circuits the walk
+                    if let Some(f) = n.flat.get() {
+                        out.push_str(f);
+                    } else {
+                        stack.push(&n.right);
+                        stack.push(&n.left);
+                    }
+                }
+            }
+        }
+        Arc::from(out)
+    }
+
+    /// Reclaim the rope arena: copy the trees still reachable from string
+    /// slots into a fresh arena and rewrite every index. Run at the start
+    /// of a collection, before evacuation moves any string ref.
+    ///
+    /// Deliberately *not* a flatten: flattening the live trees at every
+    /// GC re-copies a growing accumulator each cycle, which puts the O(n²)
+    /// back that the ropes exist to remove.
+    pub fn compact_ropes(&mut self) {
+        if self.ropes.is_empty() {
+            self.rope_slots.clear();
+            self.rope_live = 0;
+            return;
+        }
+        if self.ropes.len() < self.rope_live * 2 + 4096 {
+            // not enough garbage yet to pay for the copy — but young refs
+            // must still go: evacuation is about to move them, and
+            // `promote_str` re-registers the survivors under the new ref
+            self.rope_slots.retain(|r| !is_young(*r));
+            return;
+        }
+        let old = std::mem::take(&mut self.ropes);
+        let slots = std::mem::take(&mut self.rope_slots);
+        let mut remap = vec![u32::MAX; old.len()];
+        let mut new: Vec<RopeNodeData> = Vec::new();
+        let mut kept = Vec::with_capacity(slots.len());
+        let mut work: Vec<(u32, bool)> = Vec::new();
+        for r in slots {
+            let idx = match self.str_raw(r) {
+                HStr::Rope(i, _) => *i,
+                _ => continue, // slot swept or overwritten since
+            };
+            if remap[idx as usize] == u32::MAX {
+                // iterative post-order: children copied before parents so
+                // their new indices are known when the parent is built
+                work.push((idx, false));
+                while let Some((i, done)) = work.pop() {
+                    if remap[i as usize] != u32::MAX {
+                        continue;
+                    }
+                    let n = &old[i as usize];
+                    if !done {
+                        work.push((i, true));
+                        for side in [&n.left, &n.right] {
+                            if let RopeSide::Node(c) = side {
+                                if remap[*c as usize] == u32::MAX {
+                                    work.push((*c, false));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let fix = |side: &RopeSide| match side {
+                        RopeSide::Node(c) => RopeSide::Node(remap[*c as usize]),
+                        other => other.dup(),
+                    };
+                    let flat = std::sync::OnceLock::new();
+                    if let Some(f) = n.flat.get() {
+                        let _ = flat.set(f.clone());
+                    }
+                    new.push(RopeNodeData {
+                        left: fix(&n.left),
+                        right: fix(&n.right),
+                        len: n.len,
+                        flat,
+                    });
+                    remap[i as usize] = (new.len() - 1) as u32;
+                }
+            }
+            let ni = remap[idx as usize];
+            if let HStr::Rope(i, _) = self.str_at_mut(r) {
+                *i = ni;
+            }
+            // young slots get re-registered by `promote_str` under their
+            // post-evacuation ref; keeping the pre-move ref would dangle
+            if !is_young(r) {
+                kept.push(r);
+            }
+        }
+        // a slot can be registered twice (freed, then re-used by another
+        // rope before the next GC) — collapse so the list can't grow
+        kept.sort_unstable();
+        kept.dedup();
+        self.rope_live = new.len();
+        self.ropes = new;
+        self.rope_slots = kept;
     }
 
     /// Store an already-built String (reuses a freed slot's allocation
@@ -1223,6 +1377,7 @@ impl Heap {
 
     pub fn promote_str(&mut self, s: HStr) -> Ref {
         self.promoted_bytes_since_major += 24 + s.byte_len();
+        let is_rope = matches!(s, HStr::Rope(..));
         let r = match self.free_strs.pop() {
             Some(r) => {
                 let old = std::mem::replace(&mut self.strs[r as usize], s);
@@ -1241,6 +1396,9 @@ impl Heap {
         };
         self.gen_strs.old.set(r);
         self.promoted_since_major += 1;
+        if is_rope {
+            self.rope_slots.push(r);
+        }
         r
     }
 }

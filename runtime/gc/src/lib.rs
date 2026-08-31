@@ -51,6 +51,7 @@ pub fn collect<'a>(
         "major GC with a non-empty nursery: evacuate first"
     );
     let t0 = std::time::Instant::now();
+    heap.compact_ropes();
     // persistent scratch: no per-collection mark-vector mallocs
     let mut m = std::mem::take(&mut heap.gc_scratch);
     reset_marks(&mut m.strs, heap.strs.len());
@@ -344,6 +345,9 @@ pub fn collect_minor<'a>(
     stats: &mut GcStats,
 ) {
     let t0 = std::time::Instant::now();
+    // before the nursery is detached and before evacuation moves any
+    // string ref — compaction rewrites indices in place
+    heap.compact_ropes();
 
     // persistent minor-mark bitmaps + queues (no per-collection mallocs)
     let mut m = std::mem::take(&mut heap.gc_scratch);
