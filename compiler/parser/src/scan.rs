@@ -30,7 +30,6 @@ fn walk_stmts(stmts: &[Statement], worst: &mut Option<(String, u32)>) {
 }
 
 fn walk_stmt(s: &Statement, worst: &mut Option<(String, u32)>) {
-    use tsc_ast::oxc_span::GetSpan;
     match s {
         Statement::ThrowStatement(t) => note(worst, "throw", t.span.start),
         Statement::TryStatement(t) => note(worst, "try/catch", t.span.start),
@@ -38,11 +37,8 @@ fn walk_stmt(s: &Statement, worst: &mut Option<(String, u32)>) {
         Statement::SwitchStatement(sw) => note(worst, "switch", sw.span.start),
         Statement::DoWhileStatement(d) => note(worst, "do-while", d.span.start),
         Statement::ForInStatement(f) => note(worst, "for-in", f.span.start),
-        Statement::ImportDeclaration(i) => {
-            note(worst, "import (single-file entry only)", i.span.start)
-        }
-        Statement::ExportNamedDeclaration(e) => note(worst, "export", e.span().start),
-        Statement::ExportDefaultDeclaration(e) => note(worst, "export", e.span.start),
+        // import/export are handled by the module pipeline (the CLI routes
+        // module-syntax entries there before this scan can matter)
         Statement::FunctionDeclaration(f) => {
             if let Some(body) = &f.body {
                 walk_stmts(&body.statements, worst);

@@ -1,0 +1,11 @@
+[package]
+name = "tsr-fs"
+description = "runtime.fs — promise-native filesystem API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tsr-memory.workspace = true
+tsr-realm.workspace = true
+tsr-task.workspace = true

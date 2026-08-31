@@ -25,7 +25,7 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
             let proto = realm.heap.closure(c).proto.clone();
             realm.stack.resize(base + proto.body().n_regs as usize, Value::UNDEFINED);
             if let Some((msg, span)) = proto.fill_error() {
-                return Err(RtError { msg: msg.clone(), span: Some(*span), cancelled: false });
+                return Err(RtError { msg: msg.clone(), span: Some(*span), cancelled: false, source: proto.source_name_arc() });
             }
             let n = (proto.arity as usize).min(args.len());
             realm.stack[base..base + n].copy_from_slice(&args[..n]);
@@ -92,6 +92,7 @@ fn drive_inner(
                     msg: e.msg.clone(),
                     span: e.span,
                     cancelled: e.cancelled,
+                    source: None,
                 })
             }
             PromiseState::Pending => {
@@ -429,13 +430,21 @@ fn to_num(v: Value) -> f64 {
 }
 
 fn err(proto: &FunctionProto, pc: usize, msg: String) -> RtError {
-    RtError { msg, span: proto.body().spans.get(pc).copied(), cancelled: false }
+    RtError {
+        msg,
+        span: proto.body().spans.get(pc).copied(),
+        cancelled: false,
+        source: proto.source_name_arc(),
+    }
 }
 
 /// Attach a source span to an existing error, keeping its cancelled flag.
 fn at(mut e: RtError, proto: &FunctionProto, pc: usize) -> RtError {
     if e.span.is_none() {
         e.span = proto.body().spans.get(pc).copied();
+    }
+    if e.source.is_none() {
+        e.source = proto.source_name_arc();
     }
     e
 }
@@ -685,6 +694,7 @@ fn run_frame(
                             msg: msg.clone(),
                             span: Some(*span),
                             cancelled: false,
+                            source: callee.source_name_arc(),
                         });
                     }
                     if realm.stack.len() < need {
@@ -751,6 +761,7 @@ fn run_frame(
                                     msg: e.msg.clone(),
                                     span: e.span.or_else(|| pbody.spans.get(pc).copied()),
                                     cancelled: e.cancelled,
+                                    source: proto.source_name_arc(),
                                 })
                             }
                             PromiseState::Pending => {
@@ -882,6 +893,13 @@ fn run_frame(
                             }
                             None => Value::UNDEFINED,
                         }
+                    };
+                    // module-namespace fields hold cells (live bindings);
+                    // user objects can never store a cell, so deref here is
+                    // exact ns semantics with zero cost elsewhere
+                    let v = match v.as_cell() {
+                        Some(c) => *realm.heap.cell(c),
+                        None => v,
                     };
                     set_reg!(realm, a, v);
                 } else {
@@ -1043,7 +1061,14 @@ pub fn get_field_pub(realm: &mut Realm, obj: Value, name: &str) -> Result<Value,
 
 fn get_field(realm: &mut Realm, obj: Value, name: &str) -> Result<Value, RtError> {
     match obj.kind() {
-        Kind::Object(r) => Ok(realm.heap.obj(r).get(name).unwrap_or(Value::UNDEFINED)),
+        Kind::Object(r) => {
+            let v = realm.heap.obj(r).get(name).unwrap_or(Value::UNDEFINED);
+            // ns fields hold cells (live module bindings): deref
+            Ok(match v.as_cell() {
+                Some(c) => *realm.heap.cell(c),
+                None => v,
+            })
+        }
         Kind::Array(r) if name == "length" => {
             Ok(Value::number(realm.heap.arr(r).len() as f64))
         }

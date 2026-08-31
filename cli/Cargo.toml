@@ -11,6 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 tsc-parser.workspace = true
+tsc-modules.workspace = true
+tsr-modules.workspace = true
+tsr-fs.workspace = true
+tsr-net.workspace = true
 tsc-ir.workspace = true
 tsr-realm.workspace = true
 tsr-io.workspace = true

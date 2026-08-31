@@ -28,16 +28,28 @@ fn golden_outputs_match_at_all_worker_counts() {
     let mut checked = 0;
     for entry in std::fs::read_dir(golden_dir()).unwrap() {
         let path = entry.unwrap().path();
-        if path.extension().is_none_or(|e| e != "ts") {
-            continue;
-        }
-        let expected = std::fs::read_to_string(path.with_extension("out")).unwrap();
+        // directory fixture: <name>/main.ts (entry, may import siblings)
+        // + <name>/expected.out
+        let (entry_file, expected_file) = if path.is_dir() {
+            let main = path.join("main.ts");
+            let exp = path.join("expected.out");
+            if !main.exists() || !exp.exists() {
+                continue;
+            }
+            (main, exp)
+        } else {
+            if path.extension().is_none_or(|e| e != "ts") {
+                continue;
+            }
+            (path.clone(), path.with_extension("out"))
+        };
+        let expected = std::fs::read_to_string(&expected_file).unwrap();
         for workers in ["1", "4"] {
-            let got = run(&path, workers);
+            let got = run(&entry_file, workers);
             assert_eq!(
                 got, expected,
                 "{} diverged at --workers {workers}",
-                path.display()
+                entry_file.display()
             );
         }
         checked += 1;

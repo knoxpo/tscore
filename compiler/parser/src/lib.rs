@@ -5,7 +5,7 @@
 //! outside TS-M1 fails here with a source span, never at runtime.
 
 mod emit;
-mod resolve;
+pub mod resolve;
 mod scan;
 mod split;
 
@@ -151,6 +151,45 @@ fn compile_parallel(
     out
 }
 
+/// Per-module compile context: how imports resolve and which bindings are
+/// exported (drives cell-vs-value lowering).
+#[derive(Clone, Default)]
+pub struct ModuleCtx {
+    /// This module's reserved global key ("\0mod:<id>").
+    pub key: std::sync::Arc<str>,
+    /// local binding name -> where it comes from
+    pub imports: std::collections::HashMap<String, ImportBinding>,
+    /// exported binding name -> (export name used in the ns, mutable)
+    pub exports: std::collections::HashMap<String, (std::sync::Arc<str>, bool)>,
+}
+
+#[derive(Clone)]
+pub struct ImportBinding {
+    pub dep_key: std::sync::Arc<str>,
+    pub kind: ImportKind,
+}
+
+#[derive(Clone)]
+pub enum ImportKind {
+    /// Immutable export: ns field holds the value.
+    Value(std::sync::Arc<str>),
+    /// Mutable export: ns field holds a cell.
+    Cell(std::sync::Arc<str>),
+    /// `import * as ns` — the namespace object itself, with the dep's
+    /// export-name -> mutable map (static ns.field derefs cells).
+    Namespace(std::collections::HashMap<std::sync::Arc<str>, bool>),
+}
+
+/// Compile one module file (serial pipeline; the module graph provides
+/// file-level parallelism).
+pub fn compile_module(
+    source: &str,
+    source_name: &str,
+    ctx: ModuleCtx,
+) -> Result<Chunk, CompileError> {
+    compile_serial_with(source, source_name, Some(ctx))
+}
+
 pub fn compile(source: &str, source_name: &str) -> Result<Chunk, CompileError> {
     let phases = std::env::var_os("TSC_COMPILE_PHASES").is_some();
     if emit::lazy_enabled() && std::env::var_os("TSC_NO_PARALLEL_FRONTEND").is_none() {
@@ -161,6 +200,15 @@ pub fn compile(source: &str, source_name: &str) -> Result<Chunk, CompileError> {
             }
         }
     }
+    compile_serial_with(source, source_name, None)
+}
+
+fn compile_serial_with(
+    source: &str,
+    source_name: &str,
+    module: Option<ModuleCtx>,
+) -> Result<Chunk, CompileError> {
+    let phases = std::env::var_os("TSC_COMPILE_PHASES").is_some();
     let t0 = std::time::Instant::now();
     // pre-size the AST arena: ~8x source is oxc's typical footprint, and
     // growth chunks mid-parse cost mmap + zeroing syscalls
@@ -175,7 +223,9 @@ pub fn compile(source: &str, source_name: &str) -> Result<Chunk, CompileError> {
     let t1 = std::time::Instant::now();
     let (captured, mutated, fn_caps) = resolve::Resolver::run(&program);
     let t2 = std::time::Instant::now();
-    let out = emit::Emitter::compile(&program, captured, mutated, fn_caps, source, source_name);
+    let out = emit::Emitter::compile_with(
+        &program, captured, mutated, fn_caps, source, source_name, module,
+    );
     if phases {
         eprintln!(
             "[compile] parse={:?} resolve={:?} emit={:?}",

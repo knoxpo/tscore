@@ -2,6 +2,10 @@
 resolver = "2"
 members = [
     "compiler/parser",
+    "compiler/modules",
+    "runtime/modules",
+    "runtime/fs",
+    "runtime/net",
     "compiler/ast",
     "compiler/types",
     "compiler/ir",
@@ -36,6 +40,10 @@ repository = "https://github.com/knoxpo/typescript-core"
 [workspace.dependencies]
 # compiler
 tsc-parser = { path = "compiler/parser" }
+tsc-modules = { path = "compiler/modules" }
+tsr-modules = { path = "runtime/modules" }
+tsr-fs = { path = "runtime/fs" }
+tsr-net = { path = "runtime/net" }
 tsc-ast = { path = "compiler/ast" }
 tsc-types = { path = "compiler/types" }
 tsc-ir = { path = "compiler/ir" }

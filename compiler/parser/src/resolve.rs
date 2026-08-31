@@ -139,7 +139,19 @@ impl<'a> Resolver<'a> {
 
     fn hoist_functions(&mut self, stmts: &'a [Statement<'a>]) {
         for s in stmts {
-            if let Statement::FunctionDeclaration(f) = s {
+            let f = match s {
+                Statement::FunctionDeclaration(f) => f,
+                Statement::ExportNamedDeclaration(e) => match &e.declaration {
+                    Some(tsc_ast::oxc_ast::ast::Declaration::FunctionDeclaration(f)) => f,
+                    _ => continue,
+                },
+                Statement::ExportDefaultDeclaration(e) => match &e.declaration {
+                    tsc_ast::oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) => f,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            {
                 if let Some(id) = &f.id {
                     self.declare(&id.name, id.span.start);
                     // the declaration itself stores the closure after hoist
@@ -255,6 +267,49 @@ impl<'a> Resolver<'a> {
                 }
                 self.scopes.pop();
             }
+            // module forms: analyze the wrapped declaration/expression
+            Statement::ExportNamedDeclaration(e) => {
+                if let Some(d) = &e.declaration {
+                    match d {
+                        tsc_ast::oxc_ast::ast::Declaration::VariableDeclaration(v) => {
+                            for decl in &v.declarations {
+                                if let Some(init) = &decl.init {
+                                    self.expr(init);
+                                }
+                                if let BindingPattern::BindingIdentifier(b) = &decl.id {
+                                    self.declare(&b.name, b.span.start);
+                                }
+                            }
+                        }
+                        tsc_ast::oxc_ast::ast::Declaration::FunctionDeclaration(f) => {
+                            if let Some(body) = &f.body {
+                                self.function(f.span.start, &f.params, body);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for sp in &e.specifiers {
+                    // `export { x }` reads x
+                    self.reference(sp.local.name().as_str());
+                }
+            }
+            Statement::ExportDefaultDeclaration(e) => {
+                use tsc_ast::oxc_ast::ast::ExportDefaultDeclarationKind as K;
+                match &e.declaration {
+                    K::FunctionDeclaration(f) => {
+                        if let Some(body) = &f.body {
+                            self.function(f.span.start, &f.params, body);
+                        }
+                    }
+                    other => {
+                        if let Some(expr) = other.as_expression() {
+                            self.expr(expr);
+                        }
+                    }
+                }
+            }
+            Statement::ImportDeclaration(_) => {}
             _ => {}
         }
     }

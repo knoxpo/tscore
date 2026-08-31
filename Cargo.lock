@@ -636,6 +636,15 @@ name = "tsc-ir"
 version = "0.1.0"
 
 [[package]]
+name = "tsc-modules"
+version = "0.1.0"
+dependencies = [
+ "tsc-ast",
+ "tsc-ir",
+ "tsc-parser",
+]
+
+[[package]]
 name = "tsc-optimizer"
 version = "0.1.0"
 dependencies = [
@@ -663,10 +672,14 @@ name = "tscore"
 version = "0.1.0"
 dependencies = [
  "tsc-ir",
+ "tsc-modules",
  "tsc-parser",
  "tsr-actor",
  "tsr-channel",
+ "tsr-fs",
  "tsr-io",
+ "tsr-modules",
+ "tsr-net",
  "tsr-realm",
  "tss-async",
  "tss-parallel",
@@ -715,6 +728,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tsr-fs"
+version = "0.1.0"
+dependencies = [
+ "tsr-memory",
+ "tsr-realm",
+ "tsr-task",
+]
+
+[[package]]
 name = "tsr-gc"
 version = "0.1.0"
 dependencies = [
@@ -746,6 +768,26 @@ name = "tsr-memory"
 version = "0.1.0"
 dependencies = [
  "tsc-ir",
+]
+
+[[package]]
+name = "tsr-modules"
+version = "0.1.0"
+dependencies = [
+ "tsc-ir",
+ "tsc-modules",
+ "tsr-memory",
+ "tsr-realm",
+]
+
+[[package]]
+name = "tsr-net"
+version = "0.1.0"
+dependencies = [
+ "tsr-memory",
+ "tsr-realm",
+ "tsr-task",
+ "tss-parallel",
 ]
 
 [[package]]

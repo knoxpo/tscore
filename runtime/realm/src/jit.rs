@@ -29,7 +29,12 @@ fn fail(realm: &mut Realm, e: RtError) -> JitRet {
 }
 
 fn err_at(proto: &FunctionProto, pc: usize, msg: String) -> RtError {
-    RtError { msg, span: proto.body().spans.get(pc).copied(), cancelled: false }
+    RtError {
+        msg,
+        span: proto.body().spans.get(pc).copied(),
+        cancelled: false,
+        source: proto.source_name_arc(),
+    }
 }
 
 /// Per-pc shape-transition cache entry (leaked once per monomorphic
@@ -220,6 +225,7 @@ extern "C" fn h_call(
                     msg: msg.clone(),
                     span: Some(*span),
                     cancelled: false,
+                    source: callee.source_name_arc(),
                 });
             }
             if r.stack.len() < need {
@@ -753,6 +759,11 @@ extern "C" fn h_get_field(
                 None => Value::UNDEFINED,
             }
         };
+        // ns fields hold cells (live module bindings): deref
+        let v = match v.as_cell() {
+            Some(c) => *r.heap.cell(c),
+            None => v,
+        };
         return JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 };
     }
     let name = name_const(pr, cidx as usize).to_string();
@@ -1202,6 +1213,7 @@ extern "C" fn h_await(
                         msg: e.msg.clone(),
                         span: e.span,
                         cancelled: e.cancelled,
+                        source: None,
                     };
                     return fail(r, err);
                 }

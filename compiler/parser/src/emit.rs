@@ -68,6 +68,11 @@ pub struct Emitter {
     fn_caps: HashMap<FnId, Vec<String>>,
     /// Retained source for lazy body fills (M6c); None inside a fill.
     source: Option<Arc<str>>,
+    /// Originating file, stamped on every created proto (error attribution
+    /// across module files).
+    src_name: Arc<str>,
+    /// Module compile context (imports/exports lowering); None = script.
+    module: Option<crate::ModuleCtx>,
     /// Defer direct children of <main> (M6c); off inside fills and under
     /// TSC_NO_LAZY=1.
     lazy: bool,
@@ -77,6 +82,8 @@ pub struct Emitter {
 /// Everything a deferred body fill needs (payload of ir::LazySource).
 struct LazyPayload {
     source: Arc<str>,
+    src_name: Arc<str>,
+    module: Option<crate::ModuleCtx>,
     start: u32,
     end: u32,
     /// Expression forms (arrows, function expressions) re-parse wrapped in
@@ -129,6 +136,8 @@ fn fill_lazy(lz: &tsc_ir::LazySource) -> Result<tsc_ir::ProtoBody, (String, u32)
         mutated,
         fn_caps,
         source: None,
+        src_name: p.src_name.clone(),
+        module: p.module.clone(),
         lazy: false,
         cur_span: p.start,
     };
@@ -199,12 +208,27 @@ impl Emitter {
         source: &str,
         source_name: &str,
     ) -> R<tsc_ir::Chunk> {
+        Self::compile_with(program, captured, mutated, fn_caps, source, source_name, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_with(
+        program: &Program,
+        captured: HashSet<BindingId>,
+        mutated: HashSet<BindingId>,
+        fn_caps: HashMap<FnId, Vec<String>>,
+        source: &str,
+        source_name: &str,
+        module: Option<crate::ModuleCtx>,
+    ) -> R<tsc_ir::Chunk> {
         let mut em = Emitter {
             fs: Vec::new(),
             captured,
             mutated,
             fn_caps,
             source: Some(Arc::from(source)),
+            src_name: Arc::from(source_name),
+            module,
             lazy: lazy_enabled(),
             cur_span: 0,
         };
@@ -224,7 +248,11 @@ impl Emitter {
         // <main> is eligible for OSR/Tier-2 (async frames never JIT).
         fs.is_async = fs.code.iter().any(|i| i.op == Op::Await);
         Ok(tsc_ir::Chunk {
-            main: Arc::new(finish(fs)),
+            main: {
+                let m = Arc::new(finish(fs));
+                m.set_source_name(&em.src_name);
+                m
+            },
             source_name: source_name.into(),
         })
     }
@@ -319,9 +347,49 @@ impl Emitter {
         self.f().next_reg = mark;
     }
 
+    /// (export name, mutable) when `name` is a top-level module export and
+    /// we are emitting <main>'s top scope.
+    fn export_info(&self, name: &str) -> Option<(Arc<str>, bool)> {
+        if self.fs.len() != 1 || self.fs[0].scopes.len() != 1 {
+            return None;
+        }
+        self.module.as_ref()?.exports.get(name).cloned()
+    }
+
+    /// Publish an export into the namespace: the cell itself for mutable
+    /// bindings (readers deref through GetField — live), the value for
+    /// immutable ones.
+    fn export_value_if_needed(&mut self, name: &str, local: Local, tmp: u8) -> R {
+        if let Some((export_name, _)) = self.export_info(name) {
+            let key = self.module.as_ref().unwrap().key.clone();
+            let mark = self.mark();
+            let ns = self.alloc_reg(self.cur_span)?;
+            let k = self.str_const(&key);
+            self.emit_abx(Op::GetGlobal, ns, k);
+            let f = self.str_const(&export_name);
+            let src = if local.cell { local.reg } else if local.reg != tmp { local.reg } else { tmp };
+            // SetField A[const B] = C
+            self.emit(Op::SetField, ns, f as u8, src);
+            self.free_to(mark);
+        }
+        Ok(())
+    }
+
+    /// Initialize a cell-local. Module exports publish the cell into the
+    /// namespace afterwards (export_value_if_needed) — importers read the
+    /// field and GetField auto-derefs cells, giving live bindings.
+    fn cell_init(&mut self, local: Local, _name: &str) {
+        self.emit(Op::NewCell, local.reg, 0, 0);
+    }
+
     fn declare_local(&mut self, name: &str, binding_span: u32) -> R<Local> {
         let captured = self.captured.contains(&binding_span);
-        let cell = captured && self.mutated.contains(&binding_span);
+        let mut cell = captured && self.mutated.contains(&binding_span);
+        // a mutated module export always lives in a (host-provided) cell,
+        // captured or not — importers observe reassignments through it
+        if self.mutated.contains(&binding_span) && self.export_info(name).map_or(false, |e| e.1) {
+            cell = true;
+        }
         let reg = self.alloc_reg(binding_span)?;
         let local = Local { reg, cell, captured };
         self.f().scopes.last_mut().unwrap().insert(name.to_string(), local);
@@ -392,6 +460,28 @@ impl Emitter {
                 self.emit(Op::GetUpval, dst, i, 0);
             }
             Place::Global => {
+                if let Some(b) = self
+                    .module
+                    .as_ref()
+                    .and_then(|m| m.imports.get(name))
+                    .cloned()
+                {
+                    let k = self.str_const(&b.dep_key);
+                    self.emit_abx(Op::GetGlobal, dst, k);
+                    match b.kind {
+                        crate::ImportKind::Namespace(_) => {}
+                        crate::ImportKind::Value(ref n) => {
+                            let f = self.str_const(n);
+                            self.emit(Op::GetField, dst, dst, f as u8);
+                        }
+                        crate::ImportKind::Cell(ref n) => {
+                            // GetField auto-derefs ns cells (helper path)
+                            let f = self.str_const(n);
+                            self.emit(Op::GetField, dst, dst, f as u8);
+                        }
+                    }
+                    return;
+                }
                 let k = self.str_const(name);
                 self.emit_abx(Op::GetGlobal, dst, k);
             }
@@ -412,6 +502,16 @@ impl Emitter {
                 self.emit(Op::SetUpval, i, src, 0);
             }
             Place::Global => {
+                if self
+                    .module
+                    .as_ref()
+                    .is_some_and(|m| m.imports.contains_key(name))
+                {
+                    return self.unsupported(
+                        &format!("assignment to import '{name}'"),
+                        span,
+                    );
+                }
                 return self.unsupported(&format!("assignment to global '{name}'"), span)
             }
         }
@@ -512,12 +612,26 @@ impl Emitter {
 
     fn hoist_functions(&mut self, stmts: &[Statement]) -> R {
         for s in stmts {
-            if let Statement::FunctionDeclaration(f) = s {
+            let f = match s {
+                Statement::FunctionDeclaration(f) => Some(f),
+                Statement::ExportNamedDeclaration(e) => match &e.declaration {
+                    Some(tsc_ast::oxc_ast::ast::Declaration::FunctionDeclaration(f)) => Some(f),
+                    _ => None,
+                },
+                Statement::ExportDefaultDeclaration(e) => match &e.declaration {
+                    tsc_ast::oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                        Some(f)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(f) = f {
                 if let Some(id) = &f.id {
                     let local = self.declare_local(&id.name, id.span.start)?;
                     self.emit(Op::LoadUndef, local.reg, 0, 0);
                     if local.cell {
-                        self.emit(Op::NewCell, local.reg, 0, 0);
+                        self.cell_init(local, &id.name);
                     }
                 }
             }
@@ -547,14 +661,28 @@ impl Emitter {
                             self.emit(Op::LoadUndef, tmp, 0, 0);
                         }
                     }
-                    self.free_to(mark);
+                    // cell locals must keep tmp alive past declare (the
+                    // freed-tmp/local alias would store the cell into
+                    // itself); plain locals keep the alias optimization
+                    let will_cell = {
+                        let cap = self.captured.contains(&b.span.start);
+                        let mu = self.mutated.contains(&b.span.start);
+                        (cap && mu)
+                            || (mu && self.export_info(&b.name).map_or(false, |e| e.1))
+                    };
+                    if !will_cell {
+                        self.free_to(mark);
+                    }
                     let local = self.declare_local(&b.name, b.span.start)?;
-                    if local.reg != tmp {
+                    if local.cell {
+                        self.cell_init(local, &b.name);
+                        self.emit(Op::StoreCell, local.reg, tmp, 0);
+                        // tmp leaks one register (freeing to mark would
+                        // release the local's own reg allocated after it)
+                    } else if local.reg != tmp {
                         self.emit(Op::Move, local.reg, tmp, 0);
                     }
-                    if local.cell {
-                        self.emit(Op::NewCell, local.reg, 0, 0);
-                    }
+                    self.export_value_if_needed(&b.name, local, tmp)?;
                 }
                 Ok(())
             }
@@ -585,6 +713,179 @@ impl Emitter {
                 let mark = self.mark();
                 let tmp = self.alloc_reg(e.span.start)?;
                 self.expr(&e.expression, tmp)?;
+                self.free_to(mark);
+                Ok(())
+            }
+            Statement::ImportDeclaration(i) => {
+                if self.module.is_none() {
+                    return self.unsupported("import (module pipeline only)", i.span.start);
+                }
+                Ok(()) // bindings resolve through the import map
+            }
+            Statement::ExportAllDeclaration(e) => {
+                if self.module.is_none() {
+                    return self.unsupported("export (module pipeline only)", e.span.start);
+                }
+                Ok(()) // the host materializes star re-exports
+            }
+            Statement::ExportNamedDeclaration(e) => {
+                if self.module.is_none() {
+                    return self.unsupported("export (module pipeline only)", e.span.start);
+                }
+                if e.export_kind.is_type() {
+                    return Ok(());
+                }
+                if e.source.is_some() {
+                    return Ok(()); // re-exports are materialized by the host
+                }
+                if let Some(d) = &e.declaration {
+                    use tsc_ast::oxc_ast::ast::Declaration as D;
+                    match d {
+                        D::VariableDeclaration(v) => {
+                            for decl in &v.declarations {
+                                let BindingPattern::BindingIdentifier(b) = &decl.id else {
+                                    return self.unsupported(
+                                        "destructuring declarations",
+                                        decl.span.start,
+                                    );
+                                };
+                                let mark = self.mark();
+                                let tmp = self.alloc_reg(decl.span.start)?;
+                                match &decl.init {
+                                    Some(init) => self.expr(init, tmp)?,
+                                    None => {
+                                        self.emit(Op::LoadUndef, tmp, 0, 0);
+                                    }
+                                }
+                                let will_cell = {
+                                    let cap = self.captured.contains(&b.span.start);
+                                    let mu = self.mutated.contains(&b.span.start);
+                                    (cap && mu)
+                                        || (mu
+                                            && self
+                                                .export_info(&b.name)
+                                                .map_or(false, |e| e.1))
+                                };
+                                if !will_cell {
+                                    self.free_to(mark);
+                                }
+                                let local = self.declare_local(&b.name, b.span.start)?;
+                                if local.cell {
+                                    self.cell_init(local, &b.name);
+                                    self.emit(Op::StoreCell, local.reg, tmp, 0);
+                                } else if local.reg != tmp {
+                                    self.emit(Op::Move, local.reg, tmp, 0);
+                                }
+                                self.export_value_if_needed(&b.name, local, tmp)?;
+                            }
+                        }
+                        D::FunctionDeclaration(f) => {
+                            let Some(id) = &f.id else {
+                                return self.unsupported(
+                                    "anonymous function declaration",
+                                    f.span.start,
+                                );
+                            };
+                            let Some(body) = &f.body else {
+                                return self.unsupported("declare function", f.span.start);
+                            };
+                            let mark = self.mark();
+                            let tmp = self.alloc_reg(f.span.start)?;
+                            let proto_idx = self.compile_function(
+                                f.span.start,
+                                &id.name,
+                                &f.params,
+                                &body.statements,
+                                f.r#async,
+                                Some((f.span.start, f.span.end, false)),
+                            )?;
+                            self.emit_abx(Op::Closure, tmp, proto_idx);
+                            let place = self.resolve(&id.name);
+                            self.store_place(place, &id.name, tmp, id.span.start)?;
+                            if let Place::Local(local) = place {
+                                self.export_value_if_needed(&id.name, local, tmp)?;
+                            }
+                            self.free_to(mark);
+                        }
+                        _ => return Ok(()), // type-only declarations
+                    }
+                    return Ok(());
+                }
+                // `export { a, b as c }`: mutable ones already share the ns
+                // cell; immutable ones publish their current value
+                for sp in &e.specifiers {
+                    let local_name = sp.local.name().to_string();
+                    let export_name: Arc<str> = Arc::from(sp.exported.name().as_str());
+                    let mark = self.mark();
+                    let tmp = self.alloc_reg(e.span.start)?;
+                    let place = self.resolve(&local_name);
+                    match place {
+                        // mutable binding: publish the CELL, not a snapshot
+                        Place::Local(l) if l.cell => {
+                            self.emit(Op::Move, tmp, l.reg, 0);
+                        }
+                        _ => self.load_place(place, &local_name, tmp),
+                    }
+                    let ns = self.alloc_reg(e.span.start)?;
+                    let key = self.module.as_ref().unwrap().key.clone();
+                    let k = self.str_const(&key);
+                    self.emit_abx(Op::GetGlobal, ns, k);
+                    let f = self.str_const(&export_name);
+                    self.emit(Op::SetField, ns, f as u8, tmp);
+                    self.free_to(mark);
+                }
+                Ok(())
+            }
+            Statement::ExportDefaultDeclaration(e) => {
+                if self.module.is_none() {
+                    return self.unsupported("export (module pipeline only)", e.span.start);
+                }
+                use tsc_ast::oxc_ast::ast::ExportDefaultDeclarationKind as K;
+                let mark = self.mark();
+                let tmp = self.alloc_reg(e.span.start)?;
+                match &e.declaration {
+                    K::FunctionDeclaration(f) => {
+                        let Some(body) = &f.body else {
+                            return self.unsupported("declare function", f.span.start);
+                        };
+                        let name = f
+                            .id
+                            .as_ref()
+                            .map(|i| i.name.to_string())
+                            .unwrap_or_else(|| "<default>".into());
+                        let proto_idx = self.compile_function(
+                            f.span.start,
+                            &name,
+                            &f.params,
+                            &body.statements,
+                            f.r#async,
+                            Some((f.span.start, f.span.end, false)),
+                        )?;
+                        self.emit_abx(Op::Closure, tmp, proto_idx);
+                        // named default fn is also bound locally
+                        if let Some(id) = &f.id {
+                            let local = self.declare_local(&id.name, id.span.start)?;
+                            if local.cell {
+                                self.cell_init(local, &id.name);
+                                self.emit(Op::StoreCell, local.reg, tmp, 0);
+                            } else if local.reg != tmp {
+                                self.emit(Op::Move, local.reg, tmp, 0);
+                            }
+                        }
+                    }
+                    other => {
+                        let Some(expr) = other.as_expression() else {
+                            return self.unsupported("export default form", e.span.start);
+                        };
+                        self.expr(expr, tmp)?;
+                    }
+                }
+                let ns = self.alloc_reg(e.span.start)?;
+                let key = self.module.as_ref().unwrap().key.clone();
+                let k = self.str_const(&key);
+                self.emit_abx(Op::GetGlobal, ns, k);
+                let f = self.str_const("default");
+                self.emit(Op::SetField, ns, f as u8, tmp);
                 self.free_to(mark);
                 Ok(())
             }
@@ -900,6 +1201,8 @@ impl Emitter {
                     name: name.to_string(),
                     is_async,
                     env,
+                    src_name: self.src_name.clone(),
+                    module: self.module.clone(),
                 };
                 let proto = Arc::new(FunctionProto::new_lazy(
                     Arc::from(name),
@@ -909,6 +1212,7 @@ impl Emitter {
                     arg_types,
                     tsc_ir::LazySource { payload: Arc::new(payload), fill: fill_lazy },
                 ));
+                proto.set_source_name(&self.src_name);
                 let parent = self.f();
                 parent.protos.push(proto);
                 return Ok((parent.protos.len() - 1) as u16);
@@ -919,6 +1223,7 @@ impl Emitter {
         self.emit_function_body(params, body, expr_body)?;
         let fs = self.fs.pop().unwrap();
         let proto = Arc::new(finish(fs));
+        proto.set_source_name(&self.src_name);
         let parent = self.f();
         parent.protos.push(proto);
         Ok((parent.protos.len() - 1) as u16)
@@ -1176,6 +1481,24 @@ impl Emitter {
                 Ok(())
             }
             Expression::CallExpression(c) => self.call(c, dst),
+            Expression::ImportExpression(imp) => {
+                // dynamic import(): hidden native __import(spec, importerId)
+                let mark = self.mark();
+                let f = self.alloc_reg(imp.span.start)?;
+                let k = self.str_const("__import");
+                self.emit_abx(Op::GetGlobal, f, k);
+                let spec = self.alloc_reg(imp.span.start)?;
+                self.expr(&imp.source, spec)?;
+                let importer = self.alloc_reg(imp.span.start)?;
+                let src_name = self.src_name.clone();
+                let ik = self.str_const(&src_name);
+                self.emit_abx(Op::LoadConst, importer, ik);
+                self.cur_span = imp.span.start;
+                self.emit(Op::Call, f, 2, 0);
+                self.emit(Op::Move, dst, f, 0);
+                self.free_to(mark);
+                return Ok(());
+            }
             Expression::StaticMemberExpression(m) => {
                 let mark = self.mark();
                 let obj = self.alloc_reg(m.span.start)?;
@@ -1188,6 +1511,7 @@ impl Emitter {
                         return self.unsupported("too many constants", m.span.start);
                     }
                     self.emit(Op::GetField, dst, obj, k as u8);
+                    // ns cells deref inside GetField itself (helper path)
                 }
                 self.free_to(mark);
                 Ok(())

@@ -80,18 +80,50 @@ fn main() -> ExitCode {
     if phases {
         eprintln!("[cli] read={:?}", t_start.elapsed());
     }
-    let chunk = match tsc_parser::compile(&source, &file) {
-        Ok(c) => c,
-        Err(e) => {
-            let (line, col) = e.line_col(&source);
-            eprintln!("{file}:{line}:{col}: {}", e.msg);
-            return ExitCode::FAILURE;
+    // module-syntax entries take the graph pipeline; plain scripts keep
+    // the (parallel-frontend) single-file path untouched
+    let program: Option<tsc_ir::Program> = if tsc_modules::looks_like_module(&source) {
+        match tsc_modules::compile_graph(std::path::Path::new(&file)) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                let src = std::fs::read_to_string(&e.path).unwrap_or_default();
+                let err = tsc_parser::CompileError {
+                    msg: String::new(),
+                    span_start: e.span_start,
+                };
+                let (line, col) = err.line_col(&src);
+                eprintln!("{}:{line}:{col}: {}", e.path, e.msg);
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let chunk = if program.is_some() {
+        None
+    } else {
+        match tsc_parser::compile(&source, &file) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                let (line, col) = e.line_col(&source);
+                eprintln!("{file}:{line}:{col}: {}", e.msg);
+                return ExitCode::FAILURE;
+            }
         }
     };
 
     if dump {
         let mut out = String::new();
-        tsc_ir::disassemble(&chunk.main, &mut out);
+        match (&program, &chunk) {
+            (Some(p), _) => {
+                for m in &p.modules {
+                    out.push_str(&format!("== module {} ==\n", m.id));
+                    tsc_ir::disassemble(&m.main, &mut out);
+                }
+            }
+            (None, Some(c)) => tsc_ir::disassemble(&c.main, &mut out),
+            _ => unreachable!(),
+        }
         print!("{out}");
         return ExitCode::SUCCESS;
     }
@@ -121,11 +153,18 @@ fn main() -> ExitCode {
             tsr_actor::install(&mut realm);
             tss_async::install(&mut realm);
             tsr_channel::install(&mut realm);
+            tsr_modules::install(&mut realm);
+            tsr_fs::install(&mut realm);
+            tsr_net::install(&mut realm);
             {
                 if std::env::var_os("TSC_COMPILE_PHASES").is_some() {
                     eprintln!("[cli] to-exec={:?}", t_start.elapsed());
                 }
-                let r = tsr_realm::interp::run_main(&mut realm, &chunk.main);
+                let r = match (&program, &chunk) {
+                    (Some(p), _) => tsr_modules::run_program(&mut realm, p),
+                    (None, Some(c)) => tsr_realm::interp::run_main(&mut realm, &c.main),
+                    _ => unreachable!(),
+                };
                 if std::env::var_os("TSC_COMPILE_PHASES").is_some() {
                     use std::sync::atomic::Ordering::Relaxed;
                     eprintln!(
@@ -148,16 +187,24 @@ fn main() -> ExitCode {
     match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
+            // attribute to the originating module file when known
+            let (err_file, err_src) = match &e.source {
+                Some(src) if !src.is_empty() && src.as_ref() != file => (
+                    src.to_string(),
+                    std::fs::read_to_string(src.as_ref()).unwrap_or_default(),
+                ),
+                _ => (file.clone(), source.clone()),
+            };
             match e.span {
                 Some(span) => {
                     let err = tsc_parser::CompileError {
                         msg: String::new(),
                         span_start: span,
                     };
-                    let (line, col) = err.line_col(&source);
-                    eprintln!("{file}:{line}:{col}: runtime error: {}", e.msg);
+                    let (line, col) = err.line_col(&err_src);
+                    eprintln!("{err_file}:{line}:{col}: runtime error: {}", e.msg);
                 }
-                None => eprintln!("{file}: runtime error: {}", e.msg),
+                None => eprintln!("{err_file}: runtime error: {}", e.msg),
             }
             ExitCode::FAILURE
         }

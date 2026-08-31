@@ -1,0 +1,12 @@
+[package]
+name = "tsr-net"
+description = "runtime.net (TCP) + runtime.http — sockets and a minimal HTTP/1.1 server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tsr-memory.workspace = true
+tsr-realm.workspace = true
+tsr-task.workspace = true
+tss-parallel.workspace = true

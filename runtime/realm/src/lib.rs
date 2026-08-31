@@ -75,15 +75,17 @@ pub struct RtError {
     pub span: Option<u32>,
     /// True when this "error" is cooperative cancellation, not a failure.
     pub cancelled: bool,
+    /// Originating file (module graphs): which source `span` indexes.
+    pub source: Option<std::sync::Arc<str>>,
 }
 
 impl RtError {
     pub fn new(msg: impl Into<String>) -> Self {
-        RtError { msg: msg.into(), span: None, cancelled: false }
+        RtError { msg: msg.into(), span: None, cancelled: false, source: None }
     }
 
     pub fn cancelled() -> Self {
-        RtError { msg: "task cancelled".into(), span: None, cancelled: true }
+        RtError { msg: "task cancelled".into(), span: None, cancelled: true, source: None }
     }
 }
 

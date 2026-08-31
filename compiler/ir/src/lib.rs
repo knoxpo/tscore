@@ -300,6 +300,9 @@ pub struct FunctionProto {
     /// TS parameter annotations (Top when unannotated).
     pub arg_types: Vec<TypeHint>,
     pub jit: JitState,
+    /// Originating file (set once by the compile pipeline; "" = legacy
+    /// single-chunk). Used for cross-module runtime error attribution.
+    source_name: std::sync::OnceLock<Arc<str>>,
     body: std::sync::OnceLock<ProtoBody>,
     lazy: Option<LazySource>,
     /// Set when a lazy fill failed; raised at the next call boundary.
@@ -307,6 +310,20 @@ pub struct FunctionProto {
 }
 
 impl FunctionProto {
+    /// Originating file for error attribution ("" when never set).
+    pub fn source_name(&self) -> &str {
+        self.source_name.get().map(|a| a.as_ref()).unwrap_or("")
+    }
+
+    pub fn source_name_arc(&self) -> Option<Arc<str>> {
+        self.source_name.get().cloned()
+    }
+
+    /// Set by the compile pipeline (first write wins).
+    pub fn set_source_name(&self, name: &Arc<str>) {
+        let _ = self.source_name.set(name.clone());
+    }
+
     pub fn new(
         name: Arc<str>,
         arity: u8,
@@ -326,6 +343,7 @@ impl FunctionProto {
             jit: JitState::default(),
             body: cell,
             lazy: None,
+            source_name: std::sync::OnceLock::new(),
             fill_err: std::sync::OnceLock::new(),
         }
     }
@@ -349,6 +367,7 @@ impl FunctionProto {
             jit: JitState::default(),
             body: std::sync::OnceLock::new(),
             lazy: Some(lazy),
+            source_name: std::sync::OnceLock::new(),
             fill_err: std::sync::OnceLock::new(),
         }
     }
@@ -410,6 +429,41 @@ impl Default for FunctionProto {
 pub struct Chunk {
     pub main: Arc<FunctionProto>,
     pub source_name: String,
+}
+
+/// One compiled module in a graph.
+pub struct Module {
+    /// Canonical absolute path (the registry key).
+    pub id: Arc<str>,
+    pub source_name: String,
+    pub main: Arc<FunctionProto>,
+    /// Canonical ids of static dependencies, in import order.
+    pub deps: Vec<Arc<str>>,
+    pub exports: Vec<ExportMeta>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExportMeta {
+    pub name: Arc<str>,
+    /// Reassigned somewhere in the module: importers go through a cell.
+    pub mutable: bool,
+    /// Local binding name behind this export (None: default expr or
+    /// re-export). Aliased exports of one mutable binding share its cell.
+    pub binding: Option<Arc<str>>,
+    /// Re-export source: (dep id, which name — or the whole star set).
+    pub from: Option<(Arc<str>, ReExport)>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ReExport {
+    Named(Arc<str>),
+    Star,
+}
+
+/// A compiled module graph (entry + everything it reaches).
+pub struct Program {
+    pub modules: Vec<Module>,
+    pub entry: usize,
 }
 
 impl fmt::Debug for Instr {
