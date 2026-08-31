@@ -1,6 +1,6 @@
 # Engine comparison: tscore vs node (V8) vs bun (JSC)
 
-- date: 2026-08-31 20:06
+- date: 2026-08-31 21:45
 - machine: Apple M5 Max, 18 logical cpus (6P + 12E)
 - tscore: tscore 0.1.0, node: v24.17.0, bun: 1.4.0
 - steady-state cells: median TIME_MS of 5 runs, first run discarded; in-program warmup pass before timing
@@ -13,51 +13,92 @@
 
 | benchmark | tscore | node | bun | winner |
 |---|---|---|---|---|
-| startup (hello.ts) | 1.6 (0.04x) | 36.6 (1.00x) | 4.2 (0.11x) | **tscore** |
-| parse+compile (~50k LOC) | 7.6 (0.08x) | 96.8 (1.00x) | 10.9 (0.11x) | **tscore** |
+| startup (hello.ts) | 2.5 (0.04x) | 56.1 (1.00x) | 6.6 (0.12x) | **tscore** |
+| parse+compile (~50k LOC) | 11.6 (0.08x) | 147.1 (1.00x) | 17.5 (0.12x) | **tscore** |
 
 ## Steady-state (shared sources, in-program TIME_MS)
 
 | benchmark | tscore | node | bun | winner |
 |---|---|---|---|---|
-| objects | 162.8 (7.04x) | 23.1 (1.00x) | 23.4 (1.01x) | **node** |
-| closures | 110.2 (3.32x) | 33.1 (1.00x) | 48.3 (1.46x) | **node** |
-| alloc | 174.2 (4.13x) | 42.2 (1.00x) | 46.7 (1.11x) | **node** |
-| gc_churn | 453.9 (8.69x) | 52.3 (1.00x) | 42.8 (0.82x) | **bun** |
-| promises | 61.8 (1.01x) | 61.3 (1.00x) | 56.7 (0.92x) | **bun** |
+| objects | 255.1 (7.03x) | 36.3 (1.00x) | 34.9 (0.96x) | **bun** |
+| closures | 170.5 (3.27x) | 52.1 (1.00x) | 72.5 (1.39x) | **node** |
+| alloc | 272.5 (4.16x) | 65.6 (1.00x) | 78.2 (1.19x) | **node** |
+| gc_churn | 764.9 (5.84x) | 131.0 (1.00x) | 81.3 (0.62x) | **bun** |
+| promises | 101.5 (1.03x) | 98.2 (1.00x) | 124.5 (1.27x) | **node** |
 
 ## Async (per-engine variants, same algorithm)
 
 | benchmark | tscore | node | bun | winner |
 |---|---|---|---|---|
-| timer storm (2000x sleep 1ms) | 15.0 (1.12x) | 13.4 (1.00x) | 13.3 (0.99x) | **bun** |
-| channel 100k msgs (vs worker postMessage) | 5.0 (0.15x) | 33.8 (1.00x) | 28.1 (0.83x) | **tscore** |
+| timer storm (2000x sleep 1ms) | 12.3 (0.97x) | 12.6 (1.00x) | 12.0 (0.95x) | **bun** |
+| channel 100k msgs (vs worker postMessage) | 7.9 (0.15x) | 53.5 (1.00x) | 44.1 (0.82x) | **tscore** |
 
 ## Long-running (30s sustained mixed compute+alloc, single run)
 
 | metric | tscore | node | bun | winner |
 |---|---|---|---|---|
-| throughput (ops/sec) | 431333 (0.42x) | 1034509 (1.00x) | 834778 (0.81x) | **node** |
-| stability (last/first decile) | 0.996 | 1.013 | 1.001 | |
+| throughput (ops/sec) | 274910 (0.42x) | 653815 (1.00x) | 498898 (0.76x) | **node** |
+| stability (last/first decile) | 1.002 | 1.018 | 0.968 | |
 
-## HTTP hello, single-threaded (wrk -t2 -c32 -d5s; `benchmarks/compare/http_bench.sh`)
+## HTTP hello (wrk -t2 -c32 -d5s; `python3 benchmarks/compare/http_bench.py`)
 
-Per-core comparison: one tscore worker, one node process, one Bun.serve
-event loop (its default). This is the honest engine head-to-head.
+Total req/s here is capped by this machine's loopback stack, not by any
+engine: four *independent* server processes, each with its own wrk,
+total the same as one server alone. A multi-worker config can therefore
+look faster while only burning more cores. **Compare the per-core
+column** — it is the only figure that measures the engine.
 
-| engine | req/s | vs node | winner |
+| engine | req/s | cores | req/s per core |
 |---|---|---|---|
-| tscore (workers:1) | 213,806 | 1.49x | **tscore** |
-| node (single process) | 143,172 | 1.00x | |
-| bun (Bun.serve) | 189,753 | 1.33x | |
+| tscore workers:1 | 142,337 | 1.1 | **127,532** |
+| bun x8 reusePort | 127,546 | 1.0 | 122,864 |
+| bun x1 | 126,123 | 1.0 | 122,430 |
+| node x1 | 93,634 | 1.0 | 91,616 |
+| tscore workers:8 | 153,225 | 2.0 | 78,020 |
+| node cluster x8 | 131,997 | 3.7 | 36,131 |
 
-## HTTP hello, 8 workers
+Notes: bun's `reusePort` processes add no busy cores here (~1.0), so
+multi-process bun is not a speedup on this box. tscore `workers:8` buys
+~+8% throughput for ~2x the CPU — a poor trade on this benchmark, which
+is why `workers:1` is the default. Absolute numbers drift with ambient
+machine load; only same-window comparisons are meaningful.
 
-Scale-out on a loopback benchmark is client-bound for every engine —
-a ceiling check, not a speedup.
+## Multicore (tscore parallel.map vs node/bun worker_threads)
 
-| engine | req/s | vs node | vs own 1-thread |
-|---|---|---|---|
-| tscore (workers:8) | 230,785 | 1.23x | 1.08x |
-| node (cluster x8) | 187,523 | 1.00x | 1.31x |
-| bun | single-threaded by default | — | — |
+### primes
+
+| workers | tscore | node | bun | winner |
+|---|---|---|---|---|
+| 1 | 114.4 (1.22x) | 94.0 (1.00x) | 52.1 (0.55x) | **bun** |
+| 2 | 59.4 (0.91x) | 65.1 (1.00x) | 36.4 (0.56x) | **bun** |
+| 4 | 30.4 (0.69x) | 44.3 (1.00x) | 24.5 (0.55x) | **bun** |
+| 8 | 15.7 (0.46x) | 34.0 (1.00x) | 18.6 (0.55x) | **tscore** |
+
+### mandelbrot
+
+| workers | tscore | node | bun | winner |
+|---|---|---|---|---|
+| 1 | 37.2 (0.73x) | 50.8 (1.00x) | 46.1 (0.91x) | **tscore** |
+| 2 | 19.0 (0.54x) | 35.5 (1.00x) | 30.3 (0.85x) | **tscore** |
+| 4 | 10.1 (0.31x) | 32.7 (1.00x) | 27.3 (0.84x) | **tscore** |
+| 8 | 5.2 (0.17x) | 30.6 (1.00x) | 21.3 (0.70x) | **tscore** |
+
+## Scoreboard
+
+| engine | wins |
+|---|---|
+| tscore | 8 |
+| node | 4 |
+| bun | 6 |
+
+Win = fastest median (highest throughput for long-running) on that row.
+
+## Runtime surface
+
+| category | status |
+|---|---|
+| modules | SHIPPED — full ESM (static + dynamic import, cycles, bare specifiers, TLA) |
+| networking | SHIPPED — runtime.net TCP (kqueue reactor, connect) + runtime.http |
+| async file I/O | SHIPPED — runtime.fs (promise-native, dedicated I/O pool) + bytes |
+| http throughput | see the HTTP row above (benchmarks/compare/http_bench.sh) |
+| async I/O | proxied by timer-storm + channel benchmarks above |
