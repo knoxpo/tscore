@@ -527,6 +527,27 @@ pub enum HStr {
     ///
     /// The node lives in `Heap::ropes`; read it through `Heap::str_at`.
     Rope(u32, u32),
+    /// Short string carrying its bytes in the slot itself. Most runtime
+    /// strings — rendered numbers, keys, small concatenations — fit, and
+    /// this is what keeps them off the allocator entirely.
+    Inline(u8, [u8; STR_INLINE]),
+}
+
+/// Widest inline string: the largest array that keeps `HStr` at 32
+/// bytes. 31 tips the slot to 40 (`slot_stays_32_bytes` guards this).
+pub const STR_INLINE: usize = 30;
+
+impl HStr {
+    /// Inline `s` if it fits, else `None`.
+    #[inline(always)]
+    pub fn inline(s: &str) -> Option<HStr> {
+        if s.len() > STR_INLINE {
+            return None;
+        }
+        let mut b = [0u8; STR_INLINE];
+        b[..s.len()].copy_from_slice(s.as_bytes());
+        Some(HStr::Inline(s.len() as u8, b))
+    }
 }
 
 /// One node of a lazy concatenation tree, living in `Heap::ropes`.
@@ -581,6 +602,10 @@ impl HStr {
         match self {
             HStr::Shared(a) => a,
             HStr::Buf(b) => b,
+            HStr::Inline(n, b) => unsafe {
+                // only ever built from a `&str`
+                std::str::from_utf8_unchecked(b.get_unchecked(..*n as usize))
+            },
             HStr::Rope(..) => {
                 debug_assert!(false, "rope must be read via Heap::str_at");
                 ""
@@ -596,6 +621,7 @@ impl HStr {
             HStr::Shared(a) => a.len(),
             HStr::Buf(b) => b.len(),
             HStr::Rope(_, n) => *n as usize,
+            HStr::Inline(n, _) => *n as usize,
         }
     }
 
@@ -837,8 +863,25 @@ impl Heap {
         r
     }
 
+    /// A scratch buffer from the reuse pool with room for `n` bytes.
+    /// Pops until one is big enough rather than growing a small buffer —
+    /// `reserve` on a too-small pooled buffer is a realloc, which is the
+    /// allocator call the pool exists to avoid.
+    #[inline]
+    fn take_str_buf(&mut self, n: usize) -> String {
+        while let Some(b) = self.pool_str_bufs.pop() {
+            if b.capacity() >= n {
+                return b;
+            }
+        }
+        String::with_capacity(n.max(32))
+    }
+
     /// Runtime-built string: reuses a freed slot's buffer when possible.
     pub fn alloc_str_copy(&mut self, s: &str) -> Ref {
+        if let Some(h) = HStr::inline(s) {
+            return self.alloc_str_slot_pub(h);
+        }
         if self.nursery_on {
             let mut b = self.pool_str_bufs.pop().unwrap_or_default();
             b.push_str(s);
@@ -869,6 +912,7 @@ impl Heap {
         match self.str_raw(r) {
             HStr::Shared(a) => a,
             HStr::Buf(b) => b,
+            HStr::Inline(..) => self.str_raw(r).as_str(),
             HStr::Rope(n, _) => self.rope_str(*n),
         }
     }
@@ -878,8 +922,8 @@ impl Heap {
     pub fn str_arc(&self, r: Ref) -> Arc<str> {
         match self.str_raw(r) {
             HStr::Shared(a) => a.clone(),
-            HStr::Buf(b) => Arc::from(b.as_str()),
             HStr::Rope(n, _) => self.rope_arc(*n),
+            other => Arc::from(other.as_str()),
         }
     }
 
@@ -890,8 +934,13 @@ impl Heap {
         let flat_limit = rope_limit();
         let (la, lb) = (self.str_raw(a).byte_len(), self.str_raw(b).byte_len());
         if la + lb <= flat_limit {
-            let mut s = self.pool_str_bufs.pop().unwrap_or_default();
-            s.reserve(la + lb);
+            if la + lb <= STR_INLINE {
+                let mut buf = [0u8; STR_INLINE];
+                buf[..la].copy_from_slice(self.str_at(a).as_bytes());
+                buf[la..la + lb].copy_from_slice(self.str_at(b).as_bytes());
+                return self.alloc_str_slot_pub(HStr::Inline((la + lb) as u8, buf));
+            }
+            let mut s = self.take_str_buf(la + lb);
             s.push_str(self.str_at(a));
             s.push_str(self.str_at(b));
             return self.alloc_str_owned(s);
@@ -909,8 +958,13 @@ impl Heap {
         let flat_limit = rope_limit();
         let la = self.str_raw(a).byte_len();
         if la + b.len() <= flat_limit {
-            let mut s = self.pool_str_bufs.pop().unwrap_or_default();
-            s.reserve(la + b.len());
+            if la + b.len() <= STR_INLINE {
+                let mut buf = [0u8; STR_INLINE];
+                buf[..la].copy_from_slice(self.str_at(a).as_bytes());
+                buf[la..la + b.len()].copy_from_slice(b.as_bytes());
+                return self.alloc_str_slot_pub(HStr::Inline((la + b.len()) as u8, buf));
+            }
+            let mut s = self.take_str_buf(la + b.len());
             s.push_str(self.str_at(a));
             s.push_str(b);
             return self.alloc_str_owned(s);
@@ -1592,5 +1646,68 @@ mod tests {
         assert_eq!(fmt_number(3.0), "3");
         assert_eq!(fmt_number(3.5), "3.5");
         assert_eq!(fmt_number(-0.0), "0");
+    }
+}
+
+#[cfg(test)]
+mod str_slots {
+    use super::*;
+
+    /// The inline width is picked to keep the slot at 32 bytes; a wider
+    /// array would grow every string slot without covering more strings.
+    #[test]
+    fn slot_stays_32_bytes() {
+        assert_eq!(std::mem::size_of::<HStr>(), 32);
+    }
+
+    #[test]
+    fn inline_roundtrips_and_hands_off_when_too_long() {
+        let mut h = Heap::default();
+        h.nursery_on = false;
+        for s in ["", "a", "item-1234-x", &"x".repeat(STR_INLINE)] {
+            let r = h.alloc_str_copy(s);
+            assert!(matches!(h.str_raw(r), HStr::Inline(..)), "{s:?} should inline");
+            assert_eq!(h.str_at(r), s);
+            assert_eq!(h.str_raw(r).byte_len(), s.len());
+        }
+        let long = "y".repeat(STR_INLINE + 1);
+        let r = h.alloc_str_copy(&long);
+        assert!(!matches!(h.str_raw(r), HStr::Inline(..)));
+        assert_eq!(h.str_at(r), long);
+    }
+
+    /// A concatenation that fits inline must not touch the allocator, and
+    /// one that does not must still read back correctly through the rope.
+    #[test]
+    fn concat_inlines_then_ropes() {
+        let mut h = Heap::default();
+        h.nursery_on = false;
+        let a = h.alloc_str_copy("item-");
+        let r = h.alloc_concat_str(a, "42");
+        assert!(matches!(h.str_raw(r), HStr::Inline(..)));
+        assert_eq!(h.str_at(r), "item-42");
+
+        let big = h.alloc_str_copy(&"z".repeat(200));
+        let cat = h.alloc_concat(big, big);
+        assert_eq!(h.str_at(cat).len(), 400);
+        assert_eq!(h.str_at(cat), "z".repeat(400));
+    }
+
+    /// Compaction must preserve the trees still reachable from slots and
+    /// drop the rest; indices are rewritten in place.
+    #[test]
+    fn compaction_keeps_live_ropes() {
+        let mut h = Heap::default();
+        h.nursery_on = false;
+        let base = h.alloc_str_copy(&"ab".repeat(100));
+        let live = h.alloc_concat(base, base);
+        for _ in 0..8192 {
+            let dead = h.alloc_concat(base, base);
+            h.strs[dead as usize] = HStr::Buf(String::new()); // simulate a sweep
+        }
+        let before = h.ropes.len();
+        h.compact_ropes();
+        assert!(h.ropes.len() < before, "arena should shrink");
+        assert_eq!(h.str_at(live), "ab".repeat(200));
     }
 }
