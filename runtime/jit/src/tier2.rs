@@ -656,14 +656,20 @@ fn magic_div(d: i64) -> Option<(i64, u32)> {
             break;
         }
     }
-    let mut m = (q2 + 1) as i128;
-    if d < 0 {
-        m = -m;
-    }
-    if m > i64::MAX as i128 || m < i64::MIN as i128 {
+    // A multiplier that needs 65 bits is the normal case for many
+    // divisors, not a failure: it is carried as a negative i64 and the
+    // emitter adds the dividend back, which is what the `d > 0 && m < 0`
+    // arm below exists for. Rejecting it here meant `%` silently took the
+    // slow path for 2, 100, 128, 1024, 1000003 and 1000000007, among
+    // others — including the modulus in five of the suite's benchmarks.
+    if q2 + 1 > u64::MAX as u128 {
         return None;
     }
-    Some((m as i64, p - 64))
+    let mut m = (q2 + 1) as u64 as i64;
+    if d < 0 {
+        m = m.wrapping_neg();
+    }
+    Some((m, p - 64))
 }
 
 /// Mod with a known integer divisor: the divisor needs no runtime
@@ -2123,5 +2129,57 @@ fn emit_op(
         // ponytail: NewObject/NewArray via step costs spill+reload per
         // alloc; inline bump-nursery alloc is the upgrade path.
         _ => c.step_full(pc),
+    }
+}
+
+#[cfg(test)]
+mod magic_div_tests {
+    use super::magic_div;
+
+    /// The quotient exactly as the emitted code computes it, so the test
+    /// checks the constants against the sequence that will run.
+    fn magic_quot(n: i64, d: i64, m: i64, sh: u32) -> i64 {
+        let mut q = ((n as i128 * m as i128) >> 64) as i64;
+        if d > 0 && m < 0 {
+            q = q.wrapping_add(n);
+        } else if d < 0 && m > 0 {
+            q = q.wrapping_sub(n);
+        }
+        if sh > 0 {
+            q >>= sh;
+        }
+        q.wrapping_add(((q as u64) >> 63) as i64)
+    }
+
+    #[test]
+    fn magic_matches_division_over_the_i32_range() {
+        let divisors = [
+            2i64, 3, 7, 10, 13, 50, 97, 100, 128, 997, 1000, 1024, 100000,
+            1000003, 1000000007, -7, -100, -1024, -1000000007,
+        ];
+        for d in divisors {
+            let (m, sh) = magic_div(d).unwrap_or_else(|| panic!("no magic for {d}"));
+            for n in [
+                0i64, 1, -1, 2, -2, 12345, -12345, 999999, -999999,
+                i32::MAX as i64, i32::MIN as i64, 1 << 40, -(1 << 40),
+                d - 1, d, d + 1, d * 3 + 1, -(d * 3 + 1),
+            ] {
+                assert_eq!(magic_quot(n, d, m, sh), n / d, "{n} / {d}");
+                let r = n - magic_quot(n, d, m, sh) * d;
+                assert_eq!(r, n % d, "{n} % {d}");
+            }
+        }
+    }
+
+    /// Only genuinely undefined divisors have no magic number.
+    #[test]
+    fn only_degenerate_divisors_are_rejected() {
+        assert!(magic_div(0).is_none());
+        assert!(magic_div(1).is_none());
+        assert!(magic_div(-1).is_none());
+        assert!(magic_div(i64::MIN).is_none());
+        for d in [2i64, 100, 128, 1024, 1000003, 1000000007] {
+            assert!(magic_div(d).is_some(), "{d} should have a magic number");
+        }
     }
 }
