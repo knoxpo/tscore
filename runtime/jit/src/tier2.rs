@@ -1450,21 +1450,38 @@ fn emit_op(
                     // CSE'd: object address in x15 (validated, 0 = cold
                     // path clobbered it), its shape id in x16 — skip
                     // tag / arena / shape loads; only this pc's IC check
+                    // A repeat access is bound by its dependent loads. When
+                    // the site's IC is warm the shape and slot are already
+                    // compile-time constants, so reading the live IC table
+                    // here would add a dependent load for values we know.
+                    let baked = facts
+                        .ic_baked
+                        .get(pc)
+                        .copied()
+                        .flatten()
+                        .filter(|&(_, slot)| (slot as usize) < o.obj_inline_n as usize);
                     c.a.cbz(15, full);
-                    if pc < 4096 {
-                        c.a.ldr_imm(14, R_ICS, (pc as u32) * 8);
+                    if let Some((sid, slot)) = baked {
+                        c.a.mov_imm64(13, sid as u64);
+                        c.a.cmp_reg(16, 13);
+                        c.a.b_cond(Cond::Ne, full);
+                        c.a.ldr_imm(8, 15, o.obj_inline + slot * 8);
                     } else {
-                        c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
-                        c.a.ldr_imm(14, 13, 0);
+                        if pc < 4096 {
+                            c.a.ldr_imm(14, R_ICS, (pc as u32) * 8);
+                        } else {
+                            c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
+                            c.a.ldr_imm(14, 13, 0);
+                        }
+                        c.a.lsr_imm(13, 14, 32);
+                        c.a.cmp_reg(13, 16);
+                        c.a.b_cond(Cond::Ne, full);
+                        c.a.sub_imm32(13, 14, 1);
+                        c.a.cmp_imm(13, o.obj_inline_n);
+                        c.a.b_cond(Cond::Hs, full);
+                        c.index_addr(17, 15, 13, 8);
+                        c.a.ldr_imm(8, 17, o.obj_inline);
                     }
-                    c.a.lsr_imm(13, 14, 32);
-                    c.a.cmp_reg(13, 16);
-                    c.a.b_cond(Cond::Ne, full);
-                    c.a.sub_imm32(13, 14, 1);
-                    c.a.cmp_imm(13, o.obj_inline_n);
-                    c.a.b_cond(Cond::Hs, full);
-                    c.index_addr(17, 15, 13, 8);
-                    c.a.ldr_imm(8, 17, o.obj_inline);
                     c.put_x(ins.a, 8);
                     c.a.b(done);
                 }
