@@ -1276,6 +1276,7 @@ fn heap_offsets() -> Option<tsr_jit::tier1::HeapOffsets> {
         arr_size: l.arr_size,
         vec_ptr: l.vec_ptr,
         vec_len: l.vec_len,
+        vec_cap: l.vec_cap,
     })
 }
 

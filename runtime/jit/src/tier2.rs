@@ -1829,12 +1829,51 @@ fn emit_op(
             c.a.bind(done);
         }
         Op::ArrayPush => {
+            let slow = c.a.new_label();
+            let done = c.a.new_label();
+            if let Some(o) = c.offsets {
+                // Inline only for a YOUNG array. A push into spare capacity
+                // allocates nothing, so the only thing the helper does that
+                // matters here is `barrier_arr` — and that returns straight
+                // away for young containers, which are traced wholesale. An
+                // old array keeps the helper so the barrier still runs, and
+                // that is what lets this store any value type rather than
+                // only numbers.
+                //
+                // The helper also bumps `allocs_since_gc`, deliberately not
+                // replicated: that counter drives the old-space collection
+                // trigger, and a push that reuses existing capacity has not
+                // allocated. Growth still goes through the helper and still
+                // counts.
+                c.fetch_x(ins.a, 8);
+                c.a.lsr_imm(10, 8, 48);
+                c.a.movz(11, 0xFFFC, 0); // TAG_ARR
+                c.a.cmp_reg(10, 11);
+                c.a.b_cond(Cond::Ne, slow);
+                c.a.ubfx32(13, 8, 31, 1); // YOUNG_BIT
+                c.a.cbz(13, slow); // old array -> helper (barrier)
+                c.a.orr_reg32(12, 31, 8);
+                c.arena_base(10, 12, o.arr_bases_off);
+                c.index_addr(10, 10, 12, o.arr_size);
+                c.a.ldr_imm(13, 10, o.vec_len);
+                c.a.ldr_imm(14, 10, o.vec_cap);
+                c.a.cmp_reg(13, 14);
+                c.a.b_cond(Cond::Hs, slow); // full -> helper (realloc)
+                c.a.ldr_imm(17, 10, o.vec_ptr);
+                c.fetch_x(ins.b, 9);
+                c.a.str_reg_lsl3(9, 17, 13);
+                c.a.add_imm(13, 13, 1);
+                c.a.str_imm(13, 10, o.vec_len);
+                c.a.b(done);
+            }
+            c.a.bind(slow);
             c.a.mov(0, R_REALM);
             c.a.mov(1, R_PROTO);
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.a, 3);
             c.fetch_x(ins.b, 4);
             c.thin(c.helpers.push);
+            c.a.bind(done);
         }
         Op::GetGlobal => {
             c.a.mov(0, R_REALM);

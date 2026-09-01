@@ -126,6 +126,7 @@ pub struct HeapOffsets {
     pub arr_size: u32,
     pub vec_ptr: u32,
     pub vec_len: u32,
+    pub vec_cap: u32,
 }
 
 #[repr(C)]

@@ -245,6 +245,10 @@ impl Asm {
     pub fn ldr_reg_lsl3(&mut self, rt: Reg, rn: Reg, rm: Reg) {
         self.push(0xF860_7800 | rm << 16 | rn << 5 | rt);
     }
+    /// STR Xt, [Xn, Xm, LSL #3]
+    pub fn str_reg_lsl3(&mut self, rt: Reg, rn: Reg, rm: Reg) {
+        self.push(0xF820_7800 | rm << 16 | rn << 5 | rt);
+    }
     /// LDR Wt, [Xn, #imm] (imm multiple of 4).
     pub fn ldr_w_imm(&mut self, rt: Reg, rn: Reg, imm: u32) {
         debug_assert!(imm % 4 == 0 && imm / 4 < 4096);

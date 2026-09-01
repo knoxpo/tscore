@@ -54,6 +54,8 @@ pub struct HeapLayout {
     pub arr_size: u32,
     pub vec_ptr: u32,
     pub vec_len: u32,
+    /// Capacity word inside a Vec, derived from the other two.
+    pub vec_cap: u32,
 }
 
 fn find_word(hay: &[u64], needle: u64) -> Option<u32> {
@@ -352,6 +354,7 @@ pub fn discover() -> Option<HeapLayout> {
         arr_size: std::mem::size_of::<Vec<Value>>() as u32,
         vec_ptr,
         vec_len,
+        vec_cap: vec_cap_off,
     };
 
     if std::env::var_os("TSC_LAYOUT_DEBUG").is_some() {
