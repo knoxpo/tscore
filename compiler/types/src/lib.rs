@@ -33,6 +33,45 @@ pub struct TypedProto {
     /// compiler must guard the fall-in path (and OSR entries) and deopt
     /// to the header on a miss.
     pub loop_spec: Vec<(usize, Vec<u8>)>,
+    /// Subset of `loop_spec` worth holding unboxed in an integer register
+    /// for the body of the loop: (header pc, vregs).
+    ///
+    /// Integrality cannot be *proven* forward — `Add` is not closed over
+    /// it, since a large enough product is infinity and infinity has no
+    /// fractional part to test. Real engines do not try: they speculate
+    /// int32 and let the hardware carry the check, so an overflowing add
+    /// sets V and branches to deopt. That is only possible on an unboxed
+    /// value, which is what this list marks.
+    ///
+    /// A vreg qualifies when it is numeric at the header and every write
+    /// to it inside the loop is an operation that keeps an integer an
+    /// integer (given an overflow check). Anything else — a division, a
+    /// call, a field read — leaves it out. Being numeric is not enough to
+    /// unbox, so the compiler owes an int32 guard at the header.
+    pub int_spec: Vec<(usize, Vec<u8>)>,
+}
+
+/// Ops whose result stays an integer when their inputs are integers,
+/// assuming the overflow check the compiler emits alongside them.
+/// `Div` and `Pow` are deliberately absent: 5/2 is not an integer.
+fn keeps_int(op: Op) -> bool {
+    matches!(
+        op,
+        Op::LoadInt
+            | Op::Move
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Mod
+            | Op::Neg
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::BitNot
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+    )
 }
 
 // internal lattice: Num / Bool / Top (strings, objects, etc. all Top —
@@ -72,6 +111,7 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         const_ops: Vec::new(),
         arg_guard: Vec::new(),
         loop_spec: Vec::new(),
+        int_spec: Vec::new(),
     };
     if proto.arity > 8 {
         return reject("arity > 8 (unprofiled)");
@@ -375,6 +415,53 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         v
     };
 
+    // integer lane: loop-carried numeric vregs whose every in-loop write
+    // keeps an integer an integer. Derived from the header state rather
+    // than from `loop_spec` — a counter that was already proven Num never
+    // needed speculation, and it is exactly what we want unboxed.
+    //
+    // Being a number is not enough to unbox (1.5 is a number), so the
+    // compiler still owes an int32 guard at the header. That guard is
+    // paid once per loop entry instead of per use.
+    let mut int_spec: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut headers: Vec<usize> = body
+        .code
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.op == Op::Jump && i.sbx() < 0)
+        .map(|(pc, i)| (pc as i64 + i.sbx() as i64 + 1) as usize)
+        .collect();
+    headers.sort_unstable();
+    headers.dedup();
+    for h in headers {
+        let Some(hs) = &states[h] else { continue };
+        let end = loop_end(body, h);
+        let keep: Vec<u8> = (0..nregs)
+            .filter(|&r| {
+                if !hs[r].is_num() {
+                    return false;
+                }
+                let mut written = false;
+                for i in body.code[h..=end].iter() {
+                    if !writes_a(i.op) || i.a as usize != r {
+                        continue;
+                    }
+                    written = true;
+                    if !keeps_int(i.op) {
+                        return false;
+                    }
+                }
+                // never written in the loop: loop-invariant, so unboxing
+                // and reboxing it would buy nothing
+                written
+            })
+            .map(|r| r as u8)
+            .collect();
+        if !keep.is_empty() {
+            int_spec.push((h, keep));
+        }
+    }
+
     TypedProto {
         tier2_ok: true,
         reason: "",
@@ -383,7 +470,44 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         const_ops,
         arg_guard,
         loop_spec,
+        int_spec,
     }
+}
+
+/// Last instruction of the loop whose header is `h`: its furthest back edge.
+fn loop_end(body: &tsc_ir::ProtoBody, h: usize) -> usize {
+    body.code
+        .iter()
+        .enumerate()
+        .filter(|(pc, i)| {
+            i.op == Op::Jump && i.sbx() < 0 && (*pc as i64 + i.sbx() as i64 + 1) as usize == h
+        })
+        .map(|(pc, _)| pc)
+        .max()
+        .unwrap_or(h)
+}
+
+/// Whether this op writes its `a` operand (the rest read it).
+fn writes_a(op: Op) -> bool {
+    !matches!(
+        op,
+        Op::SetField
+            | Op::SetIndex
+            | Op::ArrayPush
+            | Op::StoreCell
+            | Op::SetUpval
+            | Op::Jump
+            | Op::JumpIfFalse
+            | Op::JumpIfTrue
+            | Op::Return
+            | Op::Halt
+            | Op::EqSkip
+            | Op::NeSkip
+            | Op::LtSkip
+            | Op::LeSkip
+            | Op::GtSkip
+            | Op::GeSkip
+    )
 }
 
 #[cfg(test)]
@@ -441,5 +565,89 @@ mod tests {
         assert!(t.tier2_ok);
         assert!(!t.arg_guard[0]);
         assert!(!t.num_facts[1][1]); // NewObject result not Num
+    }
+}
+
+#[cfg(test)]
+mod int_lane {
+    use super::*;
+    use std::sync::Arc;
+    use tsc_ir::{Instr, Op};
+
+    fn loopy(code: Vec<Instr>) -> FunctionProto {
+        FunctionProto::new(
+            Arc::from("t"),
+            1,
+            false,
+            vec![],
+            vec![TypeHint::Num],
+            tsc_ir::ProtoBody {
+                n_regs: 8,
+                spans: vec![0; code.len()],
+                code,
+                consts: vec![],
+                protos: vec![],
+            },
+        )
+    }
+
+    /// `for (i = 0; i < n; i++) acc += i` — both induction variables are
+    /// written only by integer-preserving ops, so both take the int lane.
+    #[test]
+    fn counter_and_accumulator_qualify() {
+        let p = loopy(vec![
+            Instr::asbx(Op::LoadInt, 1, 0),  // i = 0
+            Instr::asbx(Op::LoadInt, 2, 0),  // acc = 0
+            Instr::abc(Op::LtSkip, 0, 1, 0), // header: i < n
+            Instr::asbx(Op::Jump, 0, 4),
+            Instr::abc(Op::Add, 2, 2, 1), // acc += i
+            Instr::asbx(Op::LoadInt, 3, 1),
+            Instr::abc(Op::Add, 1, 1, 3), // i += 1
+            Instr::asbx(Op::Jump, 0, -6),
+            Instr::abc(Op::Return, 2, 0, 0),
+        ]);
+        let t = analyze(&p);
+        let vs = &t.int_spec.first().expect("a loop was speculated").1;
+        assert!(vs.contains(&1), "counter should be unboxed: {vs:?}");
+        assert!(vs.contains(&2), "accumulator should be unboxed: {vs:?}");
+    }
+
+    /// A division in the loop makes the value non-integral, so it must be
+    /// left boxed even though it is still a number.
+    #[test]
+    fn division_disqualifies() {
+        let p = loopy(vec![
+            Instr::asbx(Op::LoadInt, 1, 0),
+            Instr::asbx(Op::LoadInt, 2, 0),
+            Instr::abc(Op::LtSkip, 0, 1, 0),
+            Instr::asbx(Op::Jump, 0, 4),
+            Instr::abc(Op::Div, 2, 2, 1), // acc = acc / i  -- not an integer
+            Instr::asbx(Op::LoadInt, 3, 1),
+            Instr::abc(Op::Add, 1, 1, 3),
+            Instr::asbx(Op::Jump, 0, -6),
+            Instr::abc(Op::Return, 2, 0, 0),
+        ]);
+        let t = analyze(&p);
+        let vs = t.int_spec.first().map(|(_, v)| v.clone()).unwrap_or_default();
+        assert!(!vs.contains(&2), "divided value must stay boxed: {vs:?}");
+    }
+
+    /// A value the loop never writes is loop-invariant; unboxing it would
+    /// pay for a guard and buy nothing back.
+    #[test]
+    fn loop_invariant_value_is_not_unboxed() {
+        let p = loopy(vec![
+            Instr::asbx(Op::LoadInt, 1, 0),
+            Instr::abc(Op::LtSkip, 0, 1, 0),
+            Instr::asbx(Op::Jump, 0, 3),
+            Instr::asbx(Op::LoadInt, 3, 1),
+            Instr::abc(Op::Add, 1, 1, 3),
+            Instr::asbx(Op::Jump, 0, -4),
+            Instr::abc(Op::Return, 1, 0, 0),
+        ]);
+        let t = analyze(&p);
+        let vs = &t.int_spec.first().expect("a loop was found").1;
+        assert!(vs.contains(&1), "counter should be unboxed: {vs:?}");
+        assert!(!vs.contains(&0), "the parameter is never written: {vs:?}");
     }
 }

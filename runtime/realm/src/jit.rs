@@ -1489,6 +1489,14 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
             (ic != 0).then(|| ((ic >> 32) as u32, (ic & 0xFFFF_FFFF) as u32 - 1))
         })
         .collect();
+    // TSC_INT_SPEC=1 dumps the integer-lane candidates per compiled
+    // function. Compilation is cold, so the lookup costs nothing.
+    if std::env::var_os("TSC_INT_SPEC").is_some() {
+        eprintln!(
+            "int_spec {}: {:?}  (loop_spec {:?})",
+            proto.name, typed.int_spec, typed.loop_spec
+        );
+    }
     let facts = tsr_jit::tier2::Facts {
         num: &typed.num_facts,
         jumpif: &jumpif,
