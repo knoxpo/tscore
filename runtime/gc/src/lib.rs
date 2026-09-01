@@ -591,6 +591,15 @@ pub fn collect_minor<'a>(
     nur.strs.clear();
     nur.bytes = 0;
     heap.nursery = nur;
+    // The nursery was detached for the whole collection, so any
+    // `refresh_bases` that ran during evacuation (promotion does one
+    // whenever the old arena grows) recorded the *empty* nursery's
+    // dangling pointer. Put the real one back.
+    //
+    // The Rust allocator hides this by refreshing on its next young
+    // allocation; the JIT's inline bump does not allocate through it, so
+    // a stale base survives to the next read and faults.
+    heap.refresh_bases();
 
     heap.promoted_since_major += promoted;
     heap.promoted_bytes_since_major += promoted_bytes;
