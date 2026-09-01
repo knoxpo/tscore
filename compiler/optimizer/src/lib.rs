@@ -204,9 +204,11 @@ fn rewritable_reads(op: Op) -> (bool, bool, bool) {
         | UShr | Eq | Ne | Lt | Le | Gt | Ge | Concat | GetIndex | EqSkip | NeSkip
         | LtSkip | LeSkip | GtSkip | GeSkip => (false, true, true),
         JumpIfFalse | JumpIfTrue | Return => (true, false, false),
-        SetField => (false, false, true),
-        SetIndex => (false, true, true),
-        ArrayPush | StoreCell => (false, true, false),
+        // `a` is the container these read, not a destination — leaving it
+        // out kept a redundant `Move` alive in every field-store loop
+        SetField => (true, false, true),
+        SetIndex => (true, true, true),
+        ArrayPush | StoreCell => (true, true, false),
         SetUpval => (false, true, false),
         _ => (false, false, false),
     }
@@ -258,6 +260,10 @@ pub fn optimize(
     }
 
     copy_prop(&mut p, consts, upval_srcs);
+    if forward_field_stores(&mut p, consts, upval_srcs) {
+        // the rewrite leaves `Move dst, val` behind for copy-prop to chase
+        copy_prop(&mut p, consts, upval_srcs);
+    }
     sink_move_dst(&mut p, consts, upval_srcs, n_regs);
     dead_store_elim(&mut p, consts, upval_srcs, n_regs);
     hoist_loop_consts(&mut p, consts, upval_srcs, n_regs);
@@ -402,6 +408,50 @@ fn sink_move_dst(
         // the Move becomes `Move rD, rD` — a no-op DSE will delete
         p.ins[pc + 1] = Instr::abc(Op::Move, m.a, m.a, 0);
     }
+}
+
+/// Pass 1.6: forward a field store to the load that reads it back.
+/// `o.f = v; ... = o.f` is the shape every compound assignment produces
+/// (`p.z = ...` then `p.z % 7`), and the reload costs a full inline-cache
+/// access. Rewrites the load to `Move dst, val`, which copy-prop then
+/// folds into the consumer.
+///
+/// Block-local and conservative: the record is dropped at any call, any
+/// indexed or computed store (which may alias the same property), any
+/// other field store, and any redefinition of the object or value
+/// register. The language has no getters or setters, so a field access
+/// cannot run user code — that is what makes this sound.
+fn forward_field_stores(p: &mut P, consts: &[Const], upval_srcs: &[Vec<UpvalSrc>]) -> bool {
+    let lead = leaders(p);
+    let mut changed = false;
+    // live record: (object reg, key const, value reg)
+    let mut rec: Option<(u8, u16, u8)> = None;
+    for pc in 0..p.ins.len() {
+        if lead[pc] {
+            rec = None;
+        }
+        let i = p.ins[pc];
+        if i.op == Op::GetField {
+            if let Some((obj, key, val)) = rec {
+                if i.b == obj && i.c as u16 == key {
+                    p.ins[pc] = Instr::abc(Op::Move, i.a, val, 0);
+                    changed = true;
+                }
+            }
+        }
+        if p.ins[pc].op == Op::SetField {
+            rec = Some((i.a, i.b as u16, i.c));
+            continue;
+        }
+        let Some((obj, _, val)) = rec else { continue };
+        let e = effects(p.ins[pc], consts, upval_srcs);
+        // any other side effect may reach the same property; any write to
+        // the object or the stored value invalidates the record
+        if e.effectful || e.writes == Some(obj) || e.writes == Some(val) {
+            rec = None;
+        }
+    }
+    changed
 }
 
 /// Pass 2: delete pure defs whose target is never read afterwards.

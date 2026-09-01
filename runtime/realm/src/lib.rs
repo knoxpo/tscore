@@ -167,6 +167,12 @@ pub struct Realm {
     /// Refcounted GC pins: multiple holders (drive loop, resume, external
     /// completers) can pin the same promise independently.
     pub pinned: rustc_hash::FxHashMap<tsr_memory::Ref, u32>,
+    /// Multiplier on the major-collection trigger, raised when a major
+    /// reclaims almost nothing. A monotonically growing live set (a
+    /// retained history chain, a cache that only fills) otherwise pays a
+    /// full trace every time it grows by half, and every one of those
+    /// traces frees nothing — O(live^2) work for no memory back.
+    major_slack: usize,
     /// Direct-mapped intern cache for string constants, keyed by the
     /// constant's `Arc` address. A literal load used to allocate a fresh
     /// slot every time it was evaluated, so a loop body containing `"x"`
@@ -212,6 +218,7 @@ impl Realm {
             cancel: None,
             microtasks: std::collections::VecDeque::new(),
             pinned: rustc_hash::FxHashMap::default(),
+            major_slack: 1,
             const_cache: vec![(0, Value::UNDEFINED); CONST_CACHE],
             const_roots: Vec::new(),
             external_pending: 0,
@@ -289,11 +296,12 @@ impl Realm {
             static MAJOR_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let major_only =
                 *MAJOR_ONLY.get_or_init(|| std::env::var_os("TSCORE_GC_MAJOR_ONLY").is_some());
+            let slack = self.major_slack;
             let major = major_only
                 || self.heap.promoted_since_major
-                    > (self.gc_stats.last_live / 2).max(64 * 1024)
+                    > (self.gc_stats.last_live / 2).max(64 * 1024) * slack
                 || self.heap.promoted_bytes_since_major
-                    > (self.gc_stats.last_live_bytes / 2).max(8 << 20)
+                    > (self.gc_stats.last_live_bytes / 2).max(8 << 20) * slack
                 || self.heap.remembered.len() > 32 * 1024;
             if major {
                 // evacuate first when the nursery is live: the major trace
@@ -321,6 +329,17 @@ impl Realm {
                     &extra,
                     &mut self.gc_stats,
                 );
+            }
+            if major {
+                // a major that frees less than a fifth of the heap did not
+                // pay for itself; back off so the next one traces a heap
+                // that has actually accumulated garbage. Capped so a
+                // program that starts collecting again is not starved.
+                self.major_slack = if self.gc_stats.last_freed * 5 < self.gc_stats.last_live {
+                    (self.major_slack * 2).min(16)
+                } else {
+                    1
+                };
             }
             self.check_memory_limit();
             self.publish_stats();
