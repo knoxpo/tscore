@@ -841,6 +841,24 @@ fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> O
         .map(|(p2, _)| p2)
         .max()
         .unwrap_or(h);
+    // Legality is not profitability. The lane only removes conversions
+    // where the loop actually performs one: a Mod by a constant divisor,
+    // or a bitwise op. In a loop whose Mod divisor is a variable — primes'
+    // `n % d` — there is nothing to remove and the per-write syncs are
+    // pure cost, measured at 23%.
+    let converts = pbody.code[h..=end].iter().enumerate().any(|(off, i)| match i.op {
+        Op::Mod => facts
+            .const_ops
+            .get(h + off)
+            .and_then(|o| o[1])
+            .is_some_and(|d| magic_div(d).is_some()),
+        Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr
+        | Op::BitNot => true,
+        _ => false,
+    });
+    if !converts {
+        return None;
+    }
     vs.iter().copied().find(|&v| {
         pbody.code[h..=end].iter().enumerate().all(|(off, i)| {
             if i.a != v {

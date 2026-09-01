@@ -436,25 +436,61 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
     for h in headers {
         let Some(hs) = &states[h] else { continue };
         let end = loop_end(body, h);
+
+        // Optimistically assume every vreg the loop writes stays integral,
+        // then withdraw any whose producer is not integer-preserving or
+        // whose operands are not themselves integral. Iterating matters:
+        // one float operand has to propagate through everything it feeds.
+        //
+        // Checking only the operation was not enough. `zr = zr*zr - zi*zi
+        // + cr` is nothing but Mul, Sub and Add, so the op test accepted
+        // it and every entry to a float loop then failed the header guard
+        // and deopted — 2.5x on mandelbrot.
+        let mut cand: Vec<bool> = (0..nregs)
+            .map(|r| body.code[h..=end].iter().any(|i| writes_a(i.op) && i.a as usize == r))
+            .collect();
+        loop {
+            let mut changed = false;
+            for (off, i) in body.code[h..=end].iter().enumerate() {
+                let pc2 = h + off;
+                if !writes_a(i.op) || !cand[i.a as usize] {
+                    continue;
+                }
+                // an operand is integral if it is a known integer constant
+                // at this site, or a vreg still believed integral
+                let int_operand = |r: u8, side: usize| {
+                    const_ops[pc2][side].is_some()
+                        || cand.get(r as usize).copied().unwrap_or(false)
+                };
+                let ok = match i.op {
+                    // loads an integer immediate; b/c are not registers
+                    Op::LoadInt => true,
+                    // a constant load is integral when the constant is —
+                    // the emitter reuses one vreg for a literal and for an
+                    // arithmetic result, so missing this withdrew the whole
+                    // chain that fed off it
+                    Op::LoadConst => matches!(
+                        body.consts.get(i.bx() as usize),
+                        Some(Const::Number(n)) if n.fract() == 0.0 && n.abs() < 2147483648.0
+                    ),
+                    Op::Move | Op::Neg | Op::BitNot => int_operand(i.b, 0),
+                    _ if keeps_int(i.op) => {
+                        int_operand(i.b, 0) && int_operand(i.c, 1)
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    cand[i.a as usize] = false;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
         let keep: Vec<u8> = (0..nregs)
-            .filter(|&r| {
-                if !hs[r].is_num() {
-                    return false;
-                }
-                let mut written = false;
-                for i in body.code[h..=end].iter() {
-                    if !writes_a(i.op) || i.a as usize != r {
-                        continue;
-                    }
-                    written = true;
-                    if !keeps_int(i.op) {
-                        return false;
-                    }
-                }
-                // never written in the loop: loop-invariant, so unboxing
-                // and reboxing it would buy nothing
-                written
-            })
+            .filter(|&r| hs[r].is_num() && cand[r])
             .map(|r| r as u8)
             .collect();
         if !keep.is_empty() {
