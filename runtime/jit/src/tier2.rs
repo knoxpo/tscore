@@ -29,7 +29,13 @@ use tsr_memory::{Value, JIT_AWAIT_SENTINEL, JIT_ERR_SENTINEL};
 
 const R_REALM: u32 = 19;
 const R_BASE: u32 = 20;
+/// Current closure, unless this function traded it for the array-base
+/// cache (`R_ACACHE`).
 const R_CLOSURE: u32 = 22;
+/// Cached array data pointer, 0 when invalid — same discipline as the
+/// field cache in x15. Only live when `int_lane`.
+const R_ACACHE: u32 = 22;
+const CLOSURE_SLOT: u32 = 8;
 const R_POLL: u32 = 24;
 const R_PROTO: u32 = 26;
 /// Call depth, unless this function traded it for the integer lane.
@@ -211,11 +217,57 @@ impl C {
         }
     }
 
+    /// Current closure, either still in its register or loaded.
+    fn closure(&mut self, scratch: u32) -> u32 {
+        if self.int_lane {
+            self.a.ldr_imm(scratch, SP, CLOSURE_SLOT);
+            scratch
+        } else {
+            R_CLOSURE
+        }
+    }
+
+    /// x{dst} = the array's `Vec<Value>` address, tag-checked.
+    ///
+    /// Deriving this is thirteen instructions — fetch the value, check the
+    /// tag, select the arena on the young bit, scale by the slot stride —
+    /// and a loop reading `a.length` then `a[i]` derives the same pointer
+    /// twice. When `reuse` is set the previous one is still in R_ACACHE
+    /// (zeroed by any safepoint or slow path) and it collapses to a test
+    /// and a move.
+    fn array_base(&mut self, dst: u32, v: u8, off: u32, size: u32, slow: Label, reuse: bool) {
+        let derived = self.a.new_label();
+        let cached = self.a.new_label();
+        if reuse {
+            self.a.cbnz(R_ACACHE, cached);
+        }
+        self.fetch_x(v, 8);
+        self.a.lsr_imm(10, 8, 48);
+        self.a.movz(11, 0xFFFC, 0); // TAG_ARR
+        self.a.cmp_reg(10, 11);
+        self.a.b_cond(Cond::Ne, slow);
+        self.a.orr_reg32(12, 31, 8);
+        self.arena_base(dst, 12, off);
+        self.index_addr(dst, dst, 12, size);
+        if self.int_lane {
+            self.a.mov(R_ACACHE, dst);
+        }
+        if reuse {
+            self.a.b(derived);
+            self.a.bind(cached);
+            self.a.mov(dst, R_ACACHE);
+            self.a.bind(derived);
+        }
+    }
+
     /// The field-access CSE cache lives in x15 (validated obj address;
     /// 0 = invalid) and x16 (its shape id). Both are caller-saved, so any
     /// emitted blr must zero x15 — cached accesses guard with one cbz.
     fn zero_cache(&mut self) {
         self.a.movz(15, 0, 0);
+        if self.int_lane {
+            self.a.movz(R_ACACHE, 0, 0);
+        }
     }
 
     /// blr a thin helper whose args are staged in x0..; sentinel check +
@@ -239,7 +291,8 @@ impl C {
         self.a.mov(1, R_PROTO);
         self.a.mov_imm64(2, pc as u64);
         self.a.mov(3, R_BASE);
-        self.a.mov(4, R_CLOSURE);
+        let cl = self.closure(4);
+        self.a.mov(4, cl);
         self.a.mov_imm64(8, self.helpers.step as u64);
         self.a.blr(8);
         self.a.cmp_reg(0, R_SENTINEL);
@@ -311,7 +364,8 @@ pub fn compile(
     let n_low = pbody.n_regs.min(LOW);
     let mut c = {
         let mut a = Asm::new();
-        let int_lane = !facts.int_spec.is_empty();
+        let int_lane = !facts.int_spec.is_empty()
+            || pbody.code.iter().any(|i| matches!(i.op, Op::Len | Op::GetIndex));
         let bail = a.new_label();
         let await_exit = a.new_label();
         let deopt_exit = a.new_label();
@@ -343,14 +397,15 @@ pub fn compile(
     // move again, so the offset stays valid for the whole body (the pair
     // keeps SP 16-byte aligned)
     if c.int_lane {
-        c.a.stp_pre(4, 4, SP, -16);
+        c.a.stp_pre(4, 3, SP, -16);
+        c.a.movz(R_ACACHE, 0, 0);
     } else {
         c.a.mov(R_DEPTH, 4);
+        c.a.mov(R_CLOSURE, 3);
     }
     c.a.mov(R_REALM, 0);
     c.a.mov(R_PROTO, 1);
     c.a.mov(R_BASE, 2);
-    c.a.mov(R_CLOSURE, 3);
     c.a.mov_imm64(R_SENTINEL, JIT_ERR_SENTINEL);
     c.a.movz(R_TAGLIM, 0xFFF9, 0);
     c.a.movz(R_POLL, SAFEPOINT_INTERVAL, 0);
@@ -447,9 +502,12 @@ pub fn compile(
         }
     }
     let mut fcache: Option<u8> = None;
+    // which vreg's array data pointer is in R_ACACHE (0 there = invalid)
+    let mut acache: Option<u8> = None;
     for (pc, ins) in pbody.code.iter().enumerate() {
         if jump_targets[pc] {
             fcache = None;
+            acache = None;
         }
         // loop-header speculation: guard the fall-in path (back-edges jump
         // to the label BELOW these guards and are already proven)
@@ -472,7 +530,7 @@ pub fn compile(
         }
         let l = c.pc_labels[pc];
         c.a.bind(l);
-        emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache);
+        emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache);
         // ops with only cold-path blrs (which zero x15) preserve the cache;
         // everything else — calls, allocation, heap ops that clobber
         // x15/x16 outright — kills it at compile time
@@ -487,6 +545,20 @@ pub fn compile(
             Op::GetField | Op::SetField => true, // arms manage the cache
             _ => false,
         };
+        // the array cache follows the same conservative set plus its own
+        // arms; a back edge runs a safepoint, which can move the arena
+        let apreserves = match ins.op {
+            Op::Len | Op::GetIndex => true, // arms manage it
+            Op::Jump => ins.sbx() >= 0,
+            _ => preserves,
+        };
+        if !apreserves {
+            acache = None;
+        } else if acache == Some(ins.a) && !matches!(ins.op, Op::Jump) {
+            // the register holding the array was overwritten — including
+            // by the op that just cached it, as in `a = a[0]`
+            acache = None;
+        }
         if !preserves {
             fcache = None;
         } else if let Some(v) = fcache {
@@ -946,6 +1018,7 @@ fn emit_op(
     lit_shapes: &[(u64, u32)],
     inlines: &[Option<(u64, std::sync::Arc<FunctionProto>)>],
     fcache: &mut Option<u8>,
+    acache: &mut Option<u8>,
 ) {
     let pbody = proto.body();
     let num_bc = facts.num[pc][1] && facts.num[pc][2];
@@ -1677,16 +1750,13 @@ fn emit_op(
             let slow = c.a.new_label();
             let done = c.a.new_label();
             if let Some(o) = c.offsets {
-                c.fetch_x(ins.b, 8);
-                c.a.lsr_imm(10, 8, 48);
-                c.a.movz(11, 0xFFFC, 0); // TAG_ARR
-                c.a.cmp_reg(10, 11);
-                c.a.b_cond(Cond::Ne, slow);
+                // the index guard clobbers x10, so it has to run before
+                // the base pointer lands there
                 c.fetch_x(ins.c, 9);
                 c.guard_number(9, slow);
-                c.a.orr_reg32(12, 31, 8);
-                c.arena_base(10, 12, o.arr_bases_off);
-                c.index_addr(10, 10, 12, o.arr_size);
+                let reuse = *acache == Some(ins.b) && c.int_lane;
+                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse);
+                *acache = Some(ins.b);
                 c.a.fmov_dx(0, 9);
                 c.a.fcvtzs(13, 0);
                 c.a.scvtf(1, 13);
@@ -1723,14 +1793,9 @@ fn emit_op(
             let slow = c.a.new_label();
             let done = c.a.new_label();
             if let Some(o) = c.offsets {
-                c.fetch_x(ins.b, 8);
-                c.a.lsr_imm(10, 8, 48);
-                c.a.movz(11, 0xFFFC, 0);
-                c.a.cmp_reg(10, 11);
-                c.a.b_cond(Cond::Ne, slow);
-                c.a.orr_reg32(12, 31, 8);
-                c.arena_base(10, 12, o.arr_bases_off);
-                c.index_addr(10, 10, 12, o.arr_size);
+                let reuse = *acache == Some(ins.b) && c.int_lane;
+                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse);
+                *acache = Some(ins.b);
                 c.a.ldr_imm(14, 10, o.vec_len);
                 c.a.scvtf(0, 14);
                 c.put(ins.a, 0);
@@ -1774,7 +1839,8 @@ fn emit_op(
             match (c.offsets, kind) {
                 (Some(o), Some(is_cell)) => {
                     c.a.ldr_imm(10, R_REALM, o.realm_closures_ptr);
-                    c.index_addr(10, 10, R_CLOSURE, o.closure_size);
+                    let cl = c.closure(9);
+                    c.index_addr(10, 10, cl, o.closure_size);
                     c.a.ldr_imm(11, 10, o.closure_upvals_ptr);
                     c.a.ldr_imm(8, 11, ins.b as u32 * 8);
                     if is_cell {
@@ -1786,7 +1852,8 @@ fn emit_op(
                 }
                 _ => {
                     c.a.mov(0, R_REALM);
-                    c.a.mov(1, R_CLOSURE);
+                    let cl = c.closure(1);
+                    c.a.mov(1, cl);
                     c.a.mov_imm64(2, ins.b as u64);
                     c.thin(c.helpers.get_upval);
                     c.put_x(ins.a, 0);
@@ -1795,7 +1862,8 @@ fn emit_op(
         }
         Op::SetUpval => {
             c.a.mov(0, R_REALM);
-            c.a.mov(1, R_CLOSURE);
+            let cl = c.closure(1);
+            c.a.mov(1, cl);
             c.a.mov_imm64(2, ins.a as u64);
             c.fetch_x(ins.b, 3);
             c.thin(c.helpers.set_upval);
@@ -1961,7 +2029,8 @@ fn emit_op(
             c.a.mov(1, R_PROTO);
             c.a.mov_imm64(2, pc as u64);
             c.a.mov(3, R_BASE);
-            c.a.mov(4, R_CLOSURE);
+            let cl = c.closure(4);
+            c.a.mov(4, cl);
             c.thin(c.helpers.new_closure);
             c.put_x(ins.a, 0);
         }
