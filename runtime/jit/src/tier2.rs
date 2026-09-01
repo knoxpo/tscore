@@ -55,6 +55,20 @@ const R_DEPTH: u32 = 23;
 /// safepoint counter is decremented on every back edge, where a spill
 /// would cost instructions per loop iteration.
 const DEPTH_SLOT: u32 = 0;
+/// The loop-carried integer lane. Holds one `int_spec` vreg as a raw
+/// integer for the body of its loop, so an integer dependency chain stops
+/// round-tripping through f64 between every operation.
+const R_LANE: u32 = 23;
+/// Holds one in-flight integer intermediate — an expression like
+/// `(s * 31 + i) % M` only ever has one live at a time.
+///
+/// Shares x22 with the array-base cache, which is what makes it usable:
+/// a caller-saved scratch register does not survive the ops that sit
+/// between the halves of an expression (a `LoadConst` between the add and
+/// the mod was enough to lose it), and then the lane pays to keep the
+/// intermediate in sync without ever collecting the saving. A function
+/// takes whichever of the two it can use, never both.
+const R_ITMP: u32 = 22;
 const R_SLOTS: u32 = 25;
 const R_SENTINEL: u32 = 27;
 const R_TAGLIM: u32 = 28;
@@ -109,6 +123,18 @@ struct C {
     n_low: u8,
     /// This function traded x23 for a frame slot to get an integer lane.
     int_lane: bool,
+    /// vreg held as a raw integer in R_LANE for the current loop.
+    lane: Option<u8>,
+    /// vreg whose integer value is currently in R_ITMP (block-local).
+    itmp: Option<u8>,
+    /// x22 is the array-base cache in this function.
+    acache_on: bool,
+    /// x22 is the integer lane's intermediate in this function.
+    lane_on: bool,
+    /// vregs the current loop header proved to hold an i32. Converting one
+    /// needs no verification; anything outside this set does, because a
+    /// bare `fcvtzs` would silently truncate a fraction.
+    int_ok: Vec<u8>,
 }
 
 impl C {
@@ -217,6 +243,60 @@ impl C {
         }
     }
 
+    /// A GP register holding vreg `v` as an integer.
+    ///
+    /// Free when the value is already in the lane or is the in-flight
+    /// intermediate; otherwise it costs the `fcvtzs` that the boxed
+    /// representation requires. Callers must have proven `v` numeric.
+    fn int_src(&mut self, v: u8, scratch: u32) -> u32 {
+        if self.lane == Some(v) {
+            return R_LANE;
+        }
+        if self.itmp == Some(v) {
+            return R_ITMP;
+        }
+        let d = self.fetch(v, 0);
+        self.a.fcvtzs(scratch, d);
+        scratch
+    }
+
+    /// Record that `v`'s integer value is in `src`, and refresh its boxed
+    /// home so every other reader — a later block, a bail, a safepoint
+    /// spill — still sees the truth.
+    ///
+    /// The conversion is off the dependency chain: the next operation
+    /// reads the integer register, not the home, so it retires alongside
+    /// rather than in front of it. That is what makes syncing every write
+    /// affordable here, and it is what keeps every existing exit path
+    /// (bail, deopt, safepoint) correct with no extra machinery.
+    fn int_dst(&mut self, v: u8, src: u32, pc: usize) {
+        // A result that does not fit i32 is one f64 would have carried
+        // exactly and the integer form would not. Deopt to this pc: the
+        // inputs are all still live in their homes, so the interpreter
+        // re-runs the operation from correct state.
+        let ok = self.a.new_label();
+        self.a.sxtw(12, src);
+        self.a.cmp_reg(12, src);
+        self.a.b_cond(Cond::Eq, ok);
+        self.spill_low();
+        self.a.movz(0, 2, 0);
+        self.a.mov_imm64(1, pc as u64);
+        self.a.b(self.deopt_exit);
+        self.a.bind(ok);
+
+        let home = if self.lane == Some(v) { R_LANE } else { R_ITMP };
+        if src != home {
+            self.a.mov(home, src);
+        }
+        if self.lane == Some(v) {
+            self.itmp = None;
+        } else {
+            self.itmp = Some(v);
+        }
+        self.a.scvtf(3, home);
+        self.put(v, 3);
+    }
+
     /// Current closure, either still in its register or loaded.
     fn closure(&mut self, scratch: u32) -> u32 {
         if self.int_lane {
@@ -249,7 +329,7 @@ impl C {
         self.a.orr_reg32(12, 31, 8);
         self.arena_base(dst, 12, off);
         self.index_addr(dst, dst, 12, size);
-        if self.int_lane {
+        if self.acache_on {
             self.a.mov(R_ACACHE, dst);
         }
         if reuse {
@@ -265,7 +345,7 @@ impl C {
     /// emitted blr must zero x15 — cached accesses guard with one cbz.
     fn zero_cache(&mut self) {
         self.a.movz(15, 0, 0);
-        if self.int_lane {
+        if self.acache_on {
             self.a.movz(R_ACACHE, 0, 0);
         }
     }
@@ -364,14 +444,18 @@ pub fn compile(
     let n_low = pbody.n_regs.min(LOW);
     let mut c = {
         let mut a = Asm::new();
-        let int_lane = !facts.int_spec.is_empty()
-            || pbody.code.iter().any(|i| matches!(i.op, Op::Len | Op::GetIndex));
+        // x22 serves one purpose per function: the array-base cache where
+        // there are arrays to index, otherwise the integer lane's
+        // intermediate. x23 is the lane value itself.
+        let acache_on = pbody.code.iter().any(|i| matches!(i.op, Op::Len | Op::GetIndex));
+        let lane_on = !acache_on && !facts.int_spec.is_empty();
+        let int_lane = acache_on || lane_on;
         let bail = a.new_label();
         let await_exit = a.new_label();
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, ics_base, tics_base, n_low, int_lane }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, ics_base, tics_base, n_low, int_lane, lane: None, itmp: None, acache_on, lane_on, int_ok: Vec::new() }
     };
     let out = c.a.new_label();
 
@@ -398,7 +482,9 @@ pub fn compile(
     // keeps SP 16-byte aligned)
     if c.int_lane {
         c.a.stp_pre(4, 3, SP, -16);
-        c.a.movz(R_ACACHE, 0, 0);
+        if c.acache_on {
+            c.a.movz(R_ACACHE, 0, 0);
+        }
     } else {
         c.a.mov(R_DEPTH, 4);
         c.a.mov(R_CLOSURE, 3);
@@ -459,9 +545,18 @@ pub fn compile(
         for h in headers {
             c.a.mov_imm64(8, h as u64);
             c.a.cmp_reg(R_STARTPC, 8);
-            if let Some((_, vs)) = facts.loop_spec.iter().find(|(hh, _)| *hh == h) {
+            let ints = c
+                .lane_on
+                .then(|| facts.int_spec.iter().find(|(hh, _)| *hh == h))
+                .flatten();
+            if facts.loop_spec.iter().any(|(hh, _)| *hh == h) || ints.is_some() {
                 // speculated header: entering mid-loop must re-establish
                 // the guards (slots are current; d-homes just reloaded)
+                let vs: &[u8] = facts
+                    .loop_spec
+                    .iter()
+                    .find(|(hh, _)| *hh == h)
+                    .map_or(&[], |(_, v)| v.as_slice());
                 let next = c.a.new_label();
                 let fail = c.a.new_label();
                 c.a.b_cond(Cond::Ne, next);
@@ -470,6 +565,12 @@ pub fn compile(
                     c.a.lsr_imm(10, 8, 48);
                     c.a.cmp_reg(10, R_TAGLIM);
                     c.a.b_cond(Cond::Hs, fail);
+                }
+                if let Some((_, ivs)) = ints {
+                    let laned = lane_pick(pbody, facts, h, ivs);
+                    if laned.is_some() {
+                        emit_lane_guard(&mut c, ivs, laned, fail);
+                    }
                 }
                 let l = c.pc_labels[h];
                 c.a.b(l);
@@ -511,6 +612,31 @@ pub fn compile(
         }
         // loop-header speculation: guard the fall-in path (back-edges jump
         // to the label BELOW these guards and are already proven)
+        // integer lane: at a loop header, take one int_spec vreg into a
+        // raw integer register for the body. The guard runs on the fall-in
+        // edge only — back edges branch to the label below it — so an
+        // integer chain pays one conversion per loop entry instead of two
+        // per iteration.
+        if c.lane_on {
+            if let Some((_, vs)) = facts.int_spec.iter().find(|(h, _)| *h == pc) {
+                let laned = lane_pick(pbody, facts, pc, vs);
+                if laned.is_some() {
+                    let ok = c.a.new_label();
+                    let fail = c.a.new_label();
+                    emit_lane_guard(&mut c, vs, laned, fail);
+                    c.a.b(ok);
+                    c.a.bind(fail);
+                    c.spill_low();
+                    c.a.movz(0, 2, 0);
+                    c.a.mov_imm64(1, pc as u64);
+                    c.a.b(c.deopt_exit);
+                    c.a.bind(ok);
+                    c.lane = laned;
+                    c.itmp = None;
+                    c.int_ok = vs.clone();
+                }
+            }
+        }
         if let Some((_, vs)) = facts.loop_spec.iter().find(|(h, _)| *h == pc) {
             let fail = c.a.new_label();
             let pass = c.a.new_label();
@@ -545,6 +671,15 @@ pub fn compile(
             Op::GetField | Op::SetField => true, // arms manage the cache
             _ => false,
         };
+        // R_ITMP is callee-saved, so an intermediate survives intervening
+        // ops and calls; it dies only when its vreg is rewritten by
+        // something other than an integer arm, or at a merge
+        if c.itmp == Some(ins.a) && !matches!(ins.op, Op::Add | Op::Sub | Op::Mul | Op::Mod) {
+            c.itmp = None;
+        }
+        if jump_targets[pc.saturating_add(1)] {
+            c.itmp = None;
+        }
         // the array cache follows the same conservative set plus its own
         // arms; a back edge runs a safepoint, which can move the arena
         let apreserves = match ins.op {
@@ -672,10 +807,68 @@ fn magic_div(d: i64) -> Option<(i64, u32)> {
     Some((m, p - 64))
 }
 
+/// Prove every speculated vreg of a loop holds an i32, and put the laned
+/// one in R_LANE. Emitted both on the fall-in edge and at OSR entry — a
+/// loop that tiers up mid-flight arrives at the header label directly,
+/// below the fall-in guard, and would otherwise run the body against an
+/// uninitialised lane register.
+fn emit_lane_guard(c: &mut C, vs: &[u8], laned: Option<u8>, fail: Label) {
+    for &v in vs {
+        let d = c.fetch(v, 0);
+        c.a.fcvtzs(10, d);
+        c.a.scvtf(1, 10);
+        c.a.fcmp(1, d); // integral?
+        c.a.b_cond(Cond::Ne, fail);
+        c.a.sxtw(12, 10);
+        c.a.cmp_reg(12, 10);
+        c.a.b_cond(Cond::Ne, fail); // wider than i32
+        if Some(v) == laned {
+            c.a.mov(R_LANE, 10);
+        }
+    }
+}
+
+/// The laned vreg for a header, if any: the first speculated vreg whose
+/// every in-loop write goes through an arm that maintains the register.
+fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> Option<u8> {
+    let end = pbody
+        .code
+        .iter()
+        .enumerate()
+        .filter(|(p2, i)| {
+            i.op == Op::Jump && i.sbx() < 0 && (*p2 as i64 + i.sbx() as i64 + 1) as usize == h
+        })
+        .map(|(p2, _)| p2)
+        .max()
+        .unwrap_or(h);
+    vs.iter().copied().find(|&v| {
+        pbody.code[h..=end].iter().enumerate().all(|(off, i)| {
+            if i.a != v {
+                return true;
+            }
+            match i.op {
+                Op::Add | Op::Sub | Op::Mul => true,
+                // a divisor with no magic number falls back to a path that
+                // writes the home but not the lane register
+                Op::Mod => facts
+                    .const_ops
+                    .get(h + off)
+                    .and_then(|o| o[1])
+                    .is_some_and(|d| magic_div(d).is_some()),
+                Op::SetField | Op::SetIndex | Op::ArrayPush | Op::StoreCell
+                | Op::SetUpval | Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue
+                | Op::Return | Op::EqSkip | Op::NeSkip | Op::LtSkip
+                | Op::LeSkip | Op::GtSkip | Op::GeSkip => true,
+                _ => false,
+            }
+        })
+    })
+}
+
 /// Mod with a known integer divisor: the divisor needs no runtime
 /// integer check, and n/d becomes smulh+shift instead of sdiv (~10-cycle
 /// latency on Apple cores, and this sits in the loop-carried chain).
-fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize) {
+fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_in: Option<u32>) {
     let Some((m, sh)) = magic_div(d) else {
         // |d| < 2 or unrepresentable: fall back to the generic path
         c.a.mov_imm64(9, d as u64);
@@ -685,11 +878,19 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize) {
     };
     let slow = c.a.new_label();
     let done = c.a.new_label();
-    // dividend must be an exact integer (divisor is one by construction)
-    c.a.fcvtzs(10, db);
-    c.a.scvtf(2, 10);
-    c.a.fcmp(2, db);
-    c.a.b_cond(Cond::Ne, slow);
+    // dividend must be an exact integer (divisor is one by construction).
+    // When it already lives in an integer register the check is not just
+    // redundant, it is the pair of conversions this lane exists to remove.
+    if let Some(src) = int_in {
+        if src != 10 {
+            c.a.mov(10, src);
+        }
+    } else {
+        c.a.fcvtzs(10, db);
+        c.a.scvtf(2, 10);
+        c.a.fcmp(2, db);
+        c.a.b_cond(Cond::Ne, slow);
+    }
     // q = (smulh(n, m) >> sh) + (sign bit)
     c.a.mov_imm64(11, m as u64);
     c.a.smulh(12, 10, 11);
@@ -711,9 +912,17 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize) {
     c.a.fmov_xd(14, db);
     c.a.mov_imm64(12, 0x8000_0000_0000_0000);
     c.a.and_reg(14, 14, 12);
+    if c.lane == Some(a_reg) {
+        c.a.movz(R_LANE, 0, 0); // ±0 is 0 in the integer lane
+    }
     c.put_x(a_reg, 14);
     c.a.b(done);
     c.a.bind(nonzero);
+    // the lane must follow the result, or the next iteration reads the
+    // previous value out of the register while the home holds the new one
+    if c.lane == Some(a_reg) {
+        c.a.mov(R_LANE, 13);
+    }
     let dst = if a_reg < LOW { (8 + a_reg) as u32 } else { 2 };
     c.a.scvtf(dst, 13);
     if a_reg >= LOW {
@@ -1053,7 +1262,37 @@ fn emit_op(
             c.put(ins.a, src);
         }
 
-        Op::Add | Op::Sub | Op::Mul | Op::Div => {
+        Op::Add | Op::Sub | Op::Mul => {
+            // integer lane: when either operand already lives in an
+            // integer register, stay there. Leaving the lane would mean a
+            // conversion out and another back in, and both would sit in
+            // the middle of the dependency chain.
+            let known_int = |c: &C, v: u8, side: usize| {
+                c.lane == Some(v)
+                    || c.itmp == Some(v)
+                    || c.int_ok.contains(&v)
+                    || facts.const_ops.get(pc).and_then(|o| o[side]).is_some()
+            };
+            if num_bc
+                && c.lane_on
+                && (c.lane == Some(ins.b)
+                    || c.itmp == Some(ins.b)
+                    || c.lane == Some(ins.c)
+                    || c.itmp == Some(ins.c))
+                && known_int(c, ins.b, 0)
+                && known_int(c, ins.c, 1)
+            {
+                let ib = c.int_src(ins.b, 10);
+                let ic = c.int_src(ins.c, 11);
+                match ins.op {
+                    Op::Add => c.a.add_reg(14, ib, ic),
+                    Op::Sub => c.a.sub_reg(14, ib, ic),
+                    Op::Mul => c.a.mul(14, ib, ic),
+                    _ => unreachable!(),
+                }
+                c.int_dst(ins.a, 14, pc);
+                return;
+            }
             if num_bc {
                 let db = c.fetch(ins.b, 0);
                 let dc = c.fetch(ins.c, 1);
@@ -1062,7 +1301,6 @@ fn emit_op(
                     Op::Add => c.a.fadd(dst, db, dc),
                     Op::Sub => c.a.fsub(dst, db, dc),
                     Op::Mul => c.a.fmul(dst, db, dc),
-                    Op::Div => c.a.fdiv(dst, db, dc),
                     _ => unreachable!(),
                 }
                 if ins.a >= LOW {
@@ -1105,12 +1343,29 @@ fn emit_op(
                 c.a.bind(done);
             }
         }
+        Op::Div => {
+            if num_bc {
+                let db = c.fetch(ins.b, 0);
+                let dc = c.fetch(ins.c, 1);
+                let dst = if ins.a < LOW { (8 + ins.a) as u32 } else { 2 };
+                c.a.fdiv(dst, db, dc);
+                if ins.a >= LOW {
+                    c.a.str_d_imm(dst, R_SLOTS, C::slot(ins.a));
+                }
+            } else {
+                c.step_full(pc);
+            }
+        }
+
         Op::Mod => {
             let const_div = facts.const_ops.get(pc).and_then(|o| o[1]);
             if num_bc {
                 let db = c.fetch(ins.b, 0);
                 if let Some(d) = const_div {
-                    emit_mod_const(c, ins.a, db, d, fmod_addr);
+                    let int_in = (c.lane_on
+                        && (c.lane == Some(ins.b) || c.itmp == Some(ins.b)))
+                        .then(|| c.int_src(ins.b, 10));
+                    emit_mod_const(c, ins.a, db, d, fmod_addr, int_in);
                     return;
                 }
                 let dc = c.fetch(ins.c, 1);
@@ -1124,7 +1379,7 @@ fn emit_op(
                 if let Some(d) = const_div {
                     // divisor is a compile-time integer: no fetch, no
                     // guard, no runtime integer round-trip for it
-                    emit_mod_const(c, ins.a, 0, d, fmod_addr);
+                    emit_mod_const(c, ins.a, 0, d, fmod_addr, None);
                 } else {
                     c.fetch_x(ins.c, 9);
                     c.guard_number(9, slow);
