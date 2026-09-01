@@ -131,6 +131,9 @@ struct C {
     acache_on: bool,
     /// x22 is the integer lane's intermediate in this function.
     lane_on: bool,
+    /// currently emitting inside a loop that took the lane, so x22 holds
+    /// the integer intermediate and must not be blanked as a stale cache
+    in_lane_now: bool,
     /// vregs the current loop header proved to hold an i32. Converting one
     /// needs no verification; anything outside this set does, because a
     /// bare `fcvtzs` would silently truncate a fraction.
@@ -315,7 +318,7 @@ impl C {
     /// twice. When `reuse` is set the previous one is still in R_ACACHE
     /// (zeroed by any safepoint or slow path) and it collapses to a test
     /// and a move.
-    fn array_base(&mut self, dst: u32, v: u8, off: u32, size: u32, slow: Label, reuse: bool) {
+    fn array_base(&mut self, dst: u32, v: u8, off: u32, size: u32, slow: Label, reuse: bool, cache: bool) {
         let derived = self.a.new_label();
         let cached = self.a.new_label();
         if reuse {
@@ -329,7 +332,7 @@ impl C {
         self.a.orr_reg32(12, 31, 8);
         self.arena_base(dst, 12, off);
         self.index_addr(dst, dst, 12, size);
-        if self.acache_on {
+        if cache {
             self.a.mov(R_ACACHE, dst);
         }
         if reuse {
@@ -345,7 +348,7 @@ impl C {
     /// emitted blr must zero x15 — cached accesses guard with one cbz.
     fn zero_cache(&mut self) {
         self.a.movz(15, 0, 0);
-        if self.acache_on {
+        if self.acache_on && !self.in_lane_now {
             self.a.movz(R_ACACHE, 0, 0);
         }
     }
@@ -447,15 +450,36 @@ pub fn compile(
         // x22 serves one purpose per function: the array-base cache where
         // there are arrays to index, otherwise the integer lane's
         // intermediate. x23 is the lane value itself.
+        // x22 serves the integer lane inside loops that have one and the
+        // array-base cache everywhere else. Deciding per function instead
+        // left one of them unused in any function that does both, which is
+        // every realistic one.
         let acache_on = pbody.code.iter().any(|i| matches!(i.op, Op::Len | Op::GetIndex));
-        let lane_on = !acache_on && !facts.int_spec.is_empty();
+        let lane_on = facts.int_spec.iter().any(|(h, vs)| {
+            let end = pbody
+                .code
+                .iter()
+                .enumerate()
+                .filter(|(p2, i)| {
+                    i.op == Op::Jump
+                        && i.sbx() < 0
+                        && (*p2 as i64 + i.sbx() as i64 + 1) as usize == *h
+                })
+                .map(|(p2, _)| p2)
+                .max()
+                .unwrap_or(*h);
+            !pbody.code[*h..=end]
+                .iter()
+                .any(|i| matches!(i.op, Op::Len | Op::GetIndex))
+                && lane_pick(pbody, facts, *h, vs).is_some()
+        });
         let int_lane = acache_on || lane_on;
         let bail = a.new_label();
         let await_exit = a.new_label();
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, ics_base, tics_base, n_low, int_lane, lane: None, itmp: None, acache_on, lane_on, int_ok: Vec::new() }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, ics_base, tics_base, n_low, int_lane, lane: None, itmp: None, acache_on, lane_on, in_lane_now: false, int_ok: Vec::new() }
     };
     let out = c.a.new_label();
 
@@ -602,6 +626,41 @@ pub fn compile(
             _ => {}
         }
     }
+    // pcs inside a loop that took the integer lane: there x22 is the
+    // integer intermediate, so the array cache must keep off it
+    let mut in_lane = vec![false; pbody.code.len() + 2];
+    if c.lane_on {
+        for (h, vs) in facts.int_spec.iter() {
+            if lane_pick(pbody, facts, *h, vs).is_none() {
+                continue;
+            }
+            let end = pbody
+                .code
+                .iter()
+                .enumerate()
+                .filter(|(p2, i)| {
+                    i.op == Op::Jump
+                        && i.sbx() < 0
+                        && (*p2 as i64 + i.sbx() as i64 + 1) as usize == *h
+                })
+                .map(|(p2, _)| p2)
+                .max()
+                .unwrap_or(*h);
+            // A loop that also indexes arrays keeps x22 for the base
+            // cache: losing that costs more there (27% on a loop with
+            // three array reads) than the lane wins. Loops split cleanly
+            // in practice — longrun's arithmetic loop touches no arrays.
+            if pbody.code[*h..=end]
+                .iter()
+                .any(|i| matches!(i.op, Op::Len | Op::GetIndex))
+            {
+                continue;
+            }
+            for f in in_lane.iter_mut().take(end + 1).skip(*h) {
+                *f = true;
+            }
+        }
+    }
     let mut fcache: Option<u8> = None;
     // which vreg's array data pointer is in R_ACACHE (0 there = invalid)
     let mut acache: Option<u8> = None;
@@ -654,9 +713,13 @@ pub fn compile(
             c.a.b(c.deopt_exit);
             c.a.bind(pass);
         }
+        c.in_lane_now = in_lane[pc];
+        if in_lane[pc] {
+            acache = None; // x22 is the integer intermediate here
+        }
         let l = c.pc_labels[pc];
         c.a.bind(l);
-        emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache);
+        emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache, in_lane[pc]);
         // ops with only cold-path blrs (which zero x15) preserve the cache;
         // everything else — calls, allocation, heap ops that clobber
         // x15/x16 outright — kills it at compile time
@@ -859,7 +922,7 @@ fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> O
     if !converts {
         return None;
     }
-    vs.iter().copied().find(|&v| {
+    let handled = |v: u8| {
         pbody.code[h..=end].iter().enumerate().all(|(off, i)| {
             if i.a != v {
                 return true;
@@ -880,7 +943,30 @@ fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> O
                 _ => false,
             }
         })
-    })
+    };
+    // Prefer the value the converting op writes: that is the chain the
+    // lane exists to keep unboxed. Taking the first eligible candidate
+    // picked the loop counter in `(s * 31 + i) % M` — register order put
+    // it ahead of the accumulator — which removes no conversion at all.
+    let converted = |v: u8| {
+        pbody.code[h..=end].iter().enumerate().any(|(off, i)| {
+            i.a == v
+                && match i.op {
+                    Op::Mod => facts
+                        .const_ops
+                        .get(h + off)
+                        .and_then(|o| o[1])
+                        .is_some_and(|d| magic_div(d).is_some()),
+                    Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr
+                    | Op::UShr | Op::BitNot => true,
+                    _ => false,
+                }
+        })
+    };
+    vs.iter()
+        .copied()
+        .find(|&v| handled(v) && converted(v))
+        .or_else(|| vs.iter().copied().find(|&v| handled(v)))
 }
 
 /// Mod with a known integer divisor: the divisor needs no runtime
@@ -1252,6 +1338,7 @@ fn emit_op(
     inlines: &[Option<(u64, std::sync::Arc<FunctionProto>)>],
     fcache: &mut Option<u8>,
     acache: &mut Option<u8>,
+    in_lane: bool,
 ) {
     let pbody = proto.body();
     let num_bc = facts.num[pc][1] && facts.num[pc][2];
@@ -1293,6 +1380,7 @@ fn emit_op(
             };
             if num_bc
                 && c.lane_on
+                && in_lane
                 && (c.lane == Some(ins.b)
                     || c.itmp == Some(ins.b)
                     || c.lane == Some(ins.c)
@@ -1381,6 +1469,7 @@ fn emit_op(
                 let db = c.fetch(ins.b, 0);
                 if let Some(d) = const_div {
                     let int_in = (c.lane_on
+                        && in_lane
                         && (c.lane == Some(ins.b) || c.itmp == Some(ins.b)))
                         .then(|| c.int_src(ins.b, 10));
                     emit_mod_const(c, ins.a, db, d, fmod_addr, int_in);
@@ -2052,7 +2141,7 @@ fn emit_op(
                 c.fetch_x(ins.c, 9);
                 c.guard_number(9, slow);
                 let reuse = *acache == Some(ins.b) && c.int_lane;
-                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse);
+                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, c.acache_on && !in_lane);
                 *acache = Some(ins.b);
                 c.a.fmov_dx(0, 9);
                 c.a.fcvtzs(13, 0);
@@ -2091,7 +2180,7 @@ fn emit_op(
             let done = c.a.new_label();
             if let Some(o) = c.offsets {
                 let reuse = *acache == Some(ins.b) && c.int_lane;
-                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse);
+                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, c.acache_on && !in_lane);
                 *acache = Some(ins.b);
                 c.a.ldr_imm(14, 10, o.vec_len);
                 c.a.scvtf(0, 14);
