@@ -1647,24 +1647,42 @@ fn emit_op(
             if let Some(o) = c.offsets {
                 if *fcache == Some(ins.a) {
                     // CSE'd store: cached validated address in x15, shape
-                    // id in x16 — only this pc's IC + number-value guard
+                    // id in x16 — only this pc's IC + number-value guard.
+                    // As on the load side, a warm IC makes the shape and
+                    // slot compile-time constants, so reading the live IC
+                    // table would add a dependent load before the store
+                    // address is even known. The value is guarded numeric,
+                    // so the store needs no barrier either way.
+                    let baked = facts
+                        .ic_baked
+                        .get(pc)
+                        .copied()
+                        .flatten()
+                        .filter(|&(_, slot)| (slot as usize) < o.obj_inline_n as usize);
                     c.a.cbz(15, full);
                     c.fetch_x(ins.c, 9);
                     c.guard_number(9, full);
-                    if pc < 4096 {
-                        c.a.ldr_imm(14, R_ICS, (pc as u32) * 8);
+                    if let Some((sid, slot)) = baked {
+                        c.a.mov_imm64(13, sid as u64);
+                        c.a.cmp_reg(16, 13);
+                        c.a.b_cond(Cond::Ne, full);
+                        c.a.str_imm(9, 15, o.obj_inline + slot * 8);
                     } else {
-                        c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
-                        c.a.ldr_imm(14, 13, 0);
+                        if pc < 4096 {
+                            c.a.ldr_imm(14, R_ICS, (pc as u32) * 8);
+                        } else {
+                            c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
+                            c.a.ldr_imm(14, 13, 0);
+                        }
+                        c.a.lsr_imm(13, 14, 32);
+                        c.a.cmp_reg(13, 16);
+                        c.a.b_cond(Cond::Ne, full);
+                        c.a.sub_imm32(13, 14, 1);
+                        c.a.cmp_imm(13, o.obj_inline_n);
+                        c.a.b_cond(Cond::Hs, full);
+                        c.index_addr(17, 15, 13, 8);
+                        c.a.str_imm(9, 17, o.obj_inline);
                     }
-                    c.a.lsr_imm(13, 14, 32);
-                    c.a.cmp_reg(13, 16);
-                    c.a.b_cond(Cond::Ne, full);
-                    c.a.sub_imm32(13, 14, 1);
-                    c.a.cmp_imm(13, o.obj_inline_n);
-                    c.a.b_cond(Cond::Hs, full);
-                    c.index_addr(17, 15, 13, 8);
-                    c.a.str_imm(9, 17, o.obj_inline);
                     c.a.b(done);
                 }
                 c.a.bind(full);
