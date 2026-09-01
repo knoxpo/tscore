@@ -30,10 +30,26 @@ use tsr_memory::{Value, JIT_AWAIT_SENTINEL, JIT_ERR_SENTINEL};
 const R_REALM: u32 = 19;
 const R_BASE: u32 = 20;
 const R_CLOSURE: u32 = 22;
-const R_DEPTH: u32 = 23;
 const R_POLL: u32 = 24;
-const R_SLOTS: u32 = 25;
 const R_PROTO: u32 = 26;
+/// Call depth, unless this function traded it for the integer lane.
+const R_DEPTH: u32 = 23;
+/// Frame slot the call depth moves to when this function wants x23 for
+/// the integer lane.
+///
+/// Freeing a callee-saved register is not free. The reads themselves are
+/// — `ldr` costs what the `mov` it replaces did — but the slot needs a
+/// push and a pop, and a function full of small calls pays those on every
+/// entry and exit. Measured at about 1% on promises when applied
+/// unconditionally, so the frame only grows for functions that have an
+/// integer lane to spend the register on.
+///
+/// Its neighbours stay in registers regardless: the proto pointer is read
+/// by `step_full` on every generic slow path (1.5% on promises), and the
+/// safepoint counter is decremented on every back edge, where a spill
+/// would cost instructions per loop iteration.
+const DEPTH_SLOT: u32 = 0;
+const R_SLOTS: u32 = 25;
 const R_SENTINEL: u32 = 27;
 const R_TAGLIM: u32 = 28;
 const R_STARTPC: u32 = 15; // stashed x5, still live at the entry guards
@@ -66,6 +82,10 @@ pub struct Facts<'a> {
     /// loop-header speculation: (header pc, vregs) — number-guard on the
     /// fall-in edge and at OSR entry; deopt resumes at the header
     pub loop_spec: &'a [(usize, Vec<u8>)],
+    /// Loop-carried vregs worth holding unboxed in an integer register.
+    /// Non-empty means this function pays for the extra frame slot that
+    /// frees x23; empty means its frame is untouched.
+    pub int_spec: &'a [(usize, Vec<u8>)],
 }
 
 struct C {
@@ -81,6 +101,8 @@ struct C {
     ics_base: u64,
     tics_base: u64,
     n_low: u8,
+    /// This function traded x23 for a frame slot to get an integer lane.
+    int_lane: bool,
 }
 
 impl C {
@@ -176,6 +198,16 @@ impl C {
             self.a.mov_imm64(11, size as u64);
             self.a.mul(11, idx, 11);
             self.a.add_reg(dst, base, 11);
+        }
+    }
+
+    /// Call depth, either still in its register or loaded into `scratch`.
+    fn depth(&mut self, scratch: u32) -> u32 {
+        if self.int_lane {
+            self.a.ldr_imm(scratch, SP, DEPTH_SLOT);
+            scratch
+        } else {
+            R_DEPTH
         }
     }
 
@@ -279,12 +311,13 @@ pub fn compile(
     let n_low = pbody.n_regs.min(LOW);
     let mut c = {
         let mut a = Asm::new();
+        let int_lane = !facts.int_spec.is_empty();
         let bail = a.new_label();
         let await_exit = a.new_label();
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, ics_base, tics_base, n_low }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, ics_base, tics_base, n_low, int_lane }
     };
     let out = c.a.new_label();
 
@@ -306,11 +339,18 @@ pub fn compile(
         let rt = 8 + 2 * i;
         c.a.raw(0x6DBF_0000 | ((rt + 1) << 10) | (31 << 5) | rt);
     }
+    // depth to its frame slot when x23 is wanted elsewhere; SP does not
+    // move again, so the offset stays valid for the whole body (the pair
+    // keeps SP 16-byte aligned)
+    if c.int_lane {
+        c.a.stp_pre(4, 4, SP, -16);
+    } else {
+        c.a.mov(R_DEPTH, 4);
+    }
     c.a.mov(R_REALM, 0);
     c.a.mov(R_PROTO, 1);
     c.a.mov(R_BASE, 2);
     c.a.mov(R_CLOSURE, 3);
-    c.a.mov(R_DEPTH, 4);
     c.a.mov_imm64(R_SENTINEL, JIT_ERR_SENTINEL);
     c.a.movz(R_TAGLIM, 0xFFF9, 0);
     c.a.movz(R_POLL, SAFEPOINT_INTERVAL, 0);
@@ -490,6 +530,9 @@ pub fn compile(
     c.a.bind(await_exit);
     c.a.movz(0, 3, 0); // suspend: info stashed in realm.jit_await
     c.a.bind(out);
+    if c.int_lane {
+        c.a.ldp_post(9, 10, SP, 16); // discard the depth slot
+    }
     for i in (0..d_pairs).rev() {
         // ldp d(8+2i), d(9+2i), [sp], #16
         let rt = 8 + 2 * i;
@@ -1331,14 +1374,16 @@ fn emit_op(
                 c.a.b_cond(Cond::Hi, slow);
                 // depth check
                 c.a.movz(16, 10_000, 0);
-                c.a.cmp_reg(R_DEPTH, 16);
+                let d = c.depth(17);
+                c.a.cmp_reg(d, 16);
                 c.a.b_cond(Cond::Hs, slow);
                 // enter the compiled callee directly
                 c.a.mov(0, R_REALM);
                 c.a.ldr_imm(1, 13, 8); // ic.proto_data
                 c.a.add_imm(2, R_BASE, (ins.a as u32 + 1) * 8);
                 c.a.mov(3, 12);
-                c.a.add_imm(4, R_DEPTH, 1);
+                let d = c.depth(4);
+                c.a.add_imm(4, d, 1);
                 c.a.movz(5, 0, 0);
                 c.a.ldr_imm(16, 13, 16); // ic.code
                 c.a.blr(16);
@@ -1362,7 +1407,8 @@ fn emit_op(
                 c.a.ldr_imm(14, R_REALM, o.realm_closures_ptr);
                 c.a.ldr_imm(5, R_SLOTS, C::slot(ins.a));
                 c.a.orr_reg32(5, 31, 5); // closure ref
-                c.a.add_imm(6, R_DEPTH, 1);
+                let d = c.depth(6);
+                c.a.add_imm(6, d, 1);
                 c.thin(c.helpers.call_resume);
                 c.a.str_imm(0, R_SLOTS, C::slot(ins.a));
                 c.a.b(done);
@@ -1374,7 +1420,8 @@ fn emit_op(
             c.a.mov(3, R_BASE);
             c.a.mov_imm64(4, ins.a as u64);
             c.a.mov_imm64(5, ins.b as u64);
-            c.a.mov(6, R_DEPTH);
+            let d = c.depth(6);
+            c.a.mov(6, d);
             c.a.mov_imm64(8, c.helpers.call as u64);
             c.a.blr(8);
             c.a.cmp_reg(0, R_SENTINEL);

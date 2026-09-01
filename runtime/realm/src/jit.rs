@@ -1504,6 +1504,7 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
         const_ops: &typed.const_ops,
         ic_baked: &ic_baked,
         loop_spec: &typed.loop_spec,
+        int_spec: &typed.int_spec,
     };
     let ics = proto.jit.ics_base(proto.body().code.len()) as u64;
     let tics = proto.jit.tics_base(proto.body().code.len()) as u64;
