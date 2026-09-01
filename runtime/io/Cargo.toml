@@ -7,5 +7,7 @@ license.workspace = true
 
 [dependencies]
 tsr-realm.workspace = true
+crossbeam-channel.workspace = true
+libc.workspace = true
 tsr-memory.workspace = true
 tsr-task.workspace = true

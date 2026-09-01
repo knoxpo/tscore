@@ -748,6 +748,8 @@ dependencies = [
 name = "tsr-io"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
+ "libc",
  "tsr-memory",
  "tsr-realm",
  "tsr-task",
