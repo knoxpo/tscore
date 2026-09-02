@@ -1010,27 +1010,52 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
     // r = n - q*d
     c.a.mov_imm64(11, d as u64);
     c.a.msub(13, 12, 11, 10);
-    let nonzero = c.a.new_label();
-    c.a.cbnz(13, nonzero);
-    // remainder 0: ±0 carrying the dividend's sign
-    c.a.fmov_xd(14, db);
-    c.a.mov_imm64(12, 0x8000_0000_0000_0000);
-    c.a.and_reg(14, 14, 12);
-    if c.lane == Some(a_reg) {
-        c.a.movz(R_LANE, 0, 0); // ±0 is 0 in the integer lane
-    }
-    c.put_x(a_reg, 14);
-    c.a.b(done);
-    c.a.bind(nonzero);
-    // the lane must follow the result, or the next iteration reads the
-    // previous value out of the register while the home holds the new one
-    if c.lane == Some(a_reg) {
-        c.a.mov(R_LANE, 13);
-    }
+    // Sign fixup. JS `%` carries the dividend's sign, which a nonzero
+    // integer remainder already has — so OR-ing the dividend's sign bit
+    // is idempotent there, and supplies the -0 a zero remainder needs.
+    //
+    // Whether to branch on it depends on the divisor. A zero remainder
+    // turns up once every |d| iterations, so the branch is unpredictable
+    // for a small divisor and free for a large one: `% 7` mispredicts one
+    // time in seven, and its `cbnz` was the single hottest instruction in
+    // objects.ts. Misprediction costs about 15 cycles against roughly 1.5
+    // for the branchless form, so it pays out to |d| near 10; beyond that
+    // the branch predicts and the extra instructions are pure loss (1.3%
+    // on gc_churn, whose modulus is 1000000007).
     let dst = if a_reg < LOW { (8 + a_reg) as u32 } else { 2 };
-    c.a.scvtf(dst, 13);
-    if a_reg >= LOW {
-        c.a.str_d_imm(dst, R_SLOTS, C::slot(a_reg));
+    if d.unsigned_abs() <= 16 {
+        if c.lane == Some(a_reg) {
+            c.a.mov(R_LANE, 13);
+        }
+        c.a.scvtf(dst, 13);
+        c.a.fmov_xd(14, dst);
+        c.a.fmov_xd(9, db);
+        c.a.mov_imm64(12, 0x8000_0000_0000_0000);
+        c.a.and_reg(9, 9, 12);
+        c.a.orr_reg(14, 14, 9);
+        c.a.fmov_dx(dst, 14);
+        if a_reg >= LOW {
+            c.a.str_d_imm(dst, R_SLOTS, C::slot(a_reg));
+        }
+    } else {
+        let nonzero = c.a.new_label();
+        c.a.cbnz(13, nonzero);
+        c.a.fmov_xd(14, db);
+        c.a.mov_imm64(12, 0x8000_0000_0000_0000);
+        c.a.and_reg(14, 14, 12);
+        if c.lane == Some(a_reg) {
+            c.a.movz(R_LANE, 0, 0);
+        }
+        c.put_x(a_reg, 14);
+        c.a.b(done);
+        c.a.bind(nonzero);
+        if c.lane == Some(a_reg) {
+            c.a.mov(R_LANE, 13);
+        }
+        c.a.scvtf(dst, 13);
+        if a_reg >= LOW {
+            c.a.str_d_imm(dst, R_SLOTS, C::slot(a_reg));
+        }
     }
     c.a.b(done);
     c.a.bind(slow);
