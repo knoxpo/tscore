@@ -133,6 +133,11 @@ pub type NativeFn =
 /// probe a single indexed load; collisions just re-intern.
 const CONST_CACHE: usize = 512;
 
+/// Ceiling on how far the major trigger backs off when collections stop
+/// reclaiming. Bounds floating garbage at roughly this multiple of the
+/// live set.
+const MAJOR_SLACK_CAP: usize = 32;
+
 pub struct Realm {
     pub heap: Heap,
     pub globals: FxHashMap<Arc<str>, Value>,
@@ -335,10 +340,20 @@ impl Realm {
                 // pay for itself; back off so the next one traces a heap
                 // that has actually accumulated garbage. Capped so a
                 // program that starts collecting again is not starved.
-                self.major_slack = if self.gc_stats.last_freed * 5 < self.gc_stats.last_live {
-                    (self.major_slack * 2).min(16)
-                } else {
-                    1
+                // A major that freed nothing at all proved the old
+                // generation is entirely live, so the next one cannot
+                // reclaim anything either until enough new promotion has
+                // happened to plausibly contain garbage. Doubling is too
+                // timid for that: gc_churn's majors freed exactly 0 three
+                // times running while tracing 550k, then 1.5M, then 5M
+                // slots, and that last trace is a 105ms pause spent
+                // proving what the previous one already established.
+                self.major_slack = match self.gc_stats.last_freed {
+                    0 => MAJOR_SLACK_CAP,
+                    f if f * 5 < self.gc_stats.last_live => {
+                        (self.major_slack * 2).min(MAJOR_SLACK_CAP)
+                    }
+                    _ => 1,
                 };
             }
             self.check_memory_limit();
