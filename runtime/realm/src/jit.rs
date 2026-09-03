@@ -1100,13 +1100,19 @@ extern "C" fn h_new_closure(
     pc: u64,
     base_bytes: u64,
     closure: u32,
+    child: *const std::sync::Arc<FunctionProto>,
 ) -> JitRet {
     let r = realm(p);
     let pr = proto(pp);
     let pc = pc as usize;
     let base = (base_bytes / 8) as usize;
-    let ins = pr.body().code[pc];
-    let child = &pr.body().protos[ins.bx() as usize];
+    // The child proto is fixed for this site, so the compiler hands it
+    // over directly. Re-deriving it here — body(), then code[pc], then
+    // protos[bx] — ran on every single closure creation and made this
+    // helper cost more than the allocation it wraps. The pointer is to
+    // the `Arc` in the parent's `protos`, which outlives the compiled
+    // code that names it.
+    let child = unsafe { &*child };
     let mut upvals_buf = [Value::UNDEFINED; 8];
     let mut upvals_vec;
     let n_up = child.upvals.len();

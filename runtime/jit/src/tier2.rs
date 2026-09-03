@@ -2481,6 +2481,7 @@ fn emit_op(
             c.a.mov(3, R_BASE);
             let cl = c.closure(4);
             c.a.mov(4, cl);
+            c.a.mov_imm64(5, child as *const std::sync::Arc<FunctionProto> as u64);
             c.thin(c.helpers.new_closure);
             c.put_x(ins.a, 0);
         }

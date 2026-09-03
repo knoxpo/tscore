@@ -426,6 +426,16 @@ impl Realm {
             if let Some(rc) = c.as_str_ref() {
                 return Value::str_ref(self.heap.alloc_concat(lb, rc));
             }
+            // integer right-hand side straight into an inline slot, no
+            // scratch String and no second copy
+            if c.is_number() {
+                let n = c.as_number();
+                if n.fract() == 0.0 && n.abs() < 9e15 {
+                    if let Some(r) = self.heap.alloc_concat_int(lb, n as i64) {
+                        return Value::str_ref(r);
+                    }
+                }
+            }
             let mut s = std::mem::take(&mut self.concat_buf);
             s.clear();
             if tsr_memory::display_into(&mut s, c, &self.heap) {

@@ -951,6 +951,28 @@ impl Heap {
         self.alloc_rope_slot(n, (la + lb) as u32)
     }
 
+    /// `s + <integer>` straight into an inline slot.
+    ///
+    /// The general path renders the number into a scratch `String` and
+    /// then copies that into the slot; a template literal like
+    /// `` `s${i % 10}` `` does that five million times in the alloc
+    /// benchmark for a two-character result. Returns `None` when the
+    /// result would not fit inline, leaving the caller on the general
+    /// path.
+    pub fn alloc_concat_int(&mut self, a: Ref, v: i64) -> Option<Ref> {
+        let la = self.str_raw(a).byte_len();
+        let mut d = [0u8; 20];
+        let start = fmt_i64(&mut d, v);
+        let dl = d.len() - start;
+        if la + dl > STR_INLINE {
+            return None;
+        }
+        let mut buf = [0u8; STR_INLINE];
+        buf[..la].copy_from_slice(self.str_at(a).as_bytes());
+        buf[la..la + dl].copy_from_slice(&d[start..]);
+        Some(self.alloc_str_slot_pub(HStr::Inline((la + dl) as u8, buf)))
+    }
+
     /// Concatenate a heap string with a plain `&str` (the common
     /// `s + literal` / `s + number` shape) without materializing an
     /// intermediate heap slot for the right-hand side.
@@ -1535,8 +1557,9 @@ impl Value {
 /// Append JS-style number formatting without intermediate allocations.
 /// Integer-to-decimal without core::fmt (measured hot in string concat —
 /// the fmt machinery was ~10% of the alloc benchmark).
-fn push_i64(out: &mut String, mut v: i64) {
-    let mut buf = [0u8; 20];
+/// Decimal digits of `v` into `buf`, returning the start index. Written
+/// backwards from the end, so the text is `buf[start..]`.
+fn fmt_i64(buf: &mut [u8; 20], mut v: i64) -> usize {
     let neg = v < 0;
     if !neg {
         v = -v; // negative space covers i64::MIN
@@ -1554,6 +1577,12 @@ fn push_i64(out: &mut String, mut v: i64) {
         i -= 1;
         buf[i] = b'-';
     }
+    i
+}
+
+fn push_i64(out: &mut String, v: i64) {
+    let mut buf = [0u8; 20];
+    let i = fmt_i64(&mut buf, v);
     out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
 }
 
