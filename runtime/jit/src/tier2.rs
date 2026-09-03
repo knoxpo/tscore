@@ -622,7 +622,23 @@ pub fn compile(
                 jump_targets[t] = true;
             }
             Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip
-            | Op::GeSkip => jump_targets[pc + 2] = true,
+            | Op::GeSkip => {
+                // A skip's landing pc is only a merge if the instruction
+                // it skips over can also fall through to it. In the loop
+                // idiom the emitter produces — `LtSkip; Jump <exit>` —
+                // that instruction is an unconditional jump, so the
+                // landing pc has exactly one predecessor and the caches
+                // survive. Marking it regardless invalidated the array
+                // base immediately after `Len` had computed it, so every
+                // `a[i]` in a counted loop re-derived the whole thing.
+                let falls_through = !matches!(
+                    pbody.code.get(pc + 1).map(|i| i.op),
+                    Some(Op::Jump) | Some(Op::Return) | Some(Op::Halt) | None
+                );
+                if falls_through {
+                    jump_targets[pc + 2] = true;
+                }
+            }
             _ => {}
         }
     }
