@@ -1592,10 +1592,31 @@ pub fn push_number(out: &mut String, n: f64) {
         out.push_str("NaN");
     } else if n.is_infinite() {
         out.push_str(if n > 0.0 { "Infinity" } else { "-Infinity" });
-    } else if n == n.trunc() && n.abs() < 1e21 {
+    } else if n == n.trunc() && n.abs() < 1e18 {
+        // 1e18 keeps this inside i64; `n as i64` saturates past 2^63 and
+        // printed a clamped value for integers above it
         push_i64(out, n as i64);
     } else {
-        let _ = write!(out, "{n}");
+        let a = n.abs();
+        if a >= 1e21 || (a != 0.0 && a < 1e-6) {
+            // JS switches to exponential outside [1e-6, 1e21) and spells
+            // the exponent's sign; Rust's Display never switches, so
+            // 1e21 printed as twenty-two digits.
+            let e = format!("{n:e}");
+            match e.split_once('e') {
+                Some((mantissa, exp)) => {
+                    out.push_str(mantissa);
+                    out.push('e');
+                    if !exp.starts_with('-') {
+                        out.push('+');
+                    }
+                    out.push_str(exp);
+                }
+                None => out.push_str(&e),
+            }
+        } else {
+            let _ = write!(out, "{n}");
+        }
     }
 }
 
