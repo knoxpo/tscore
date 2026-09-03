@@ -68,12 +68,16 @@ const R_LANE: u32 = 23;
 /// the mod was enough to lose it), and then the lane pays to keep the
 /// intermediate in sync without ever collecting the saving. A function
 /// takes whichever of the two it can use, never both.
-const R_ITMP: u32 = 22;
+const R_ITMP: u32 = 21;
 const R_SLOTS: u32 = 25;
 const R_SENTINEL: u32 = 27;
 const R_TAGLIM: u32 = 28;
 const R_STARTPC: u32 = 15; // stashed x5, still live at the entry guards
-const R_ICS: u32 = 21; // per-pc IC table base (callee-saved, survives helpers)
+// x21 was the IC table base. Every read of it sits on a generic fallback
+// path that a warmed, baked IC never takes, so materialising the address
+// as an immediate there costs nothing and buys the third callee-saved
+// register — which is what lets the integer lane and the array-base
+// cache stop competing.
 const SAFEPOINT_INTERVAL: u16 = 1024;
 /// vregs 0..LOW live in d(8+i).
 const LOW: u8 = 8;
@@ -348,7 +352,7 @@ impl C {
     /// emitted blr must zero x15 — cached accesses guard with one cbz.
     fn zero_cache(&mut self) {
         self.a.movz(15, 0, 0);
-        if self.acache_on && !self.in_lane_now {
+        if self.acache_on {
             self.a.movz(R_ACACHE, 0, 0);
         }
     }
@@ -486,10 +490,6 @@ pub fn compile(
     // prologue: tier1 frame + only the d-pairs this fn actually uses as
     // vreg homes (small leaf functions push/pop far less)
     let d_pairs = c.n_low.div_ceil(2) as u32;
-    let has_field_ops = pbody
-        .code
-        .iter()
-        .any(|i| matches!(i.op, Op::GetField | Op::SetField));
     c.a.stp_pre(29, 30, SP, -16);
     c.a.stp_pre(19, 20, SP, -16);
     c.a.stp_pre(21, 22, SP, -16);
@@ -519,9 +519,7 @@ pub fn compile(
     c.a.mov_imm64(R_SENTINEL, JIT_ERR_SENTINEL);
     c.a.movz(R_TAGLIM, 0xFFF9, 0);
     c.a.movz(R_POLL, SAFEPOINT_INTERVAL, 0);
-    if has_field_ops {
-        c.a.mov_imm64(R_ICS, ics_base);
-    }
+
     c.a.mov(R_STARTPC, 5); // stash start_pc across the slots init
     if let Some(o) = c.offsets {
         // inline slots init: R_SLOTS = realm.stack.ptr + base_bytes
@@ -662,10 +660,10 @@ pub fn compile(
                 .map(|(p2, _)| p2)
                 .max()
                 .unwrap_or(*h);
-            // A loop that also indexes arrays keeps x22 for the base
-            // cache: losing that costs more there (27% on a loop with
-            // three array reads) than the lane wins. Loops split cleanly
-            // in practice — longrun's arithmetic loop touches no arrays.
+            // The lane and the array-base cache each want a register per
+            // loop. A loop that indexes arrays keeps it for the cache:
+            // losing that measured 12.8% on a three-read array loop,
+            // against what the lane wins there.
             if pbody.code[*h..=end]
                 .iter()
                 .any(|i| matches!(i.op, Op::Len | Op::GetIndex))
@@ -728,10 +726,6 @@ pub fn compile(
             c.a.mov_imm64(1, pc as u64);
             c.a.b(c.deopt_exit);
             c.a.bind(pass);
-        }
-        c.in_lane_now = in_lane[pc];
-        if in_lane[pc] {
-            acache = None; // x22 is the integer intermediate here
         }
         let l = c.pc_labels[pc];
         c.a.bind(l);
@@ -1949,12 +1943,8 @@ fn emit_op(
                         c.a.b_cond(Cond::Ne, full);
                         c.a.ldr_imm(8, 15, o.obj_inline + slot * 8);
                     } else {
-                        if pc < 4096 {
-                            c.a.ldr_imm(14, R_ICS, (pc as u32) * 8);
-                        } else {
-                            c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
+                        c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
                             c.a.ldr_imm(14, 13, 0);
-                        }
                         c.a.lsr_imm(13, 14, 32);
                         c.a.cmp_reg(13, 16);
                         c.a.b_cond(Cond::Ne, full);
@@ -2012,12 +2002,8 @@ fn emit_op(
                 c.index_addr(10, 10, 9, o.obj_size);
                 c.a.ldr_imm(11, 10, o.obj_shape_arc);
                 c.a.ldr_w_imm(12, 11, o.shape_id_delta);
-                if pc < 4096 {
-                    c.a.ldr_imm(14, R_ICS, (pc as u32) * 8);
-                } else {
-                    c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
+                c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
                     c.a.ldr_imm(14, 13, 0);
-                }
                 c.a.lsr_imm(13, 14, 32);
                 c.a.cmp_reg(13, 12);
                 c.a.b_cond(Cond::Ne, slow);
@@ -2077,12 +2063,8 @@ fn emit_op(
                         c.a.b_cond(Cond::Ne, full);
                         c.a.str_imm(9, 15, o.obj_inline + slot * 8);
                     } else {
-                        if pc < 4096 {
-                            c.a.ldr_imm(14, R_ICS, (pc as u32) * 8);
-                        } else {
-                            c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
+                        c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
                             c.a.ldr_imm(14, 13, 0);
-                        }
                         c.a.lsr_imm(13, 14, 32);
                         c.a.cmp_reg(13, 16);
                         c.a.b_cond(Cond::Ne, full);
@@ -2139,12 +2121,8 @@ fn emit_op(
                 c.index_addr(10, 10, 12, o.obj_size);
                 c.a.ldr_imm(11, 10, o.obj_shape_arc);
                 c.a.ldr_w_imm(12, 11, o.shape_id_delta);
-                if pc < 4096 {
-                    c.a.ldr_imm(14, R_ICS, (pc as u32) * 8);
-                } else {
-                    c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
+                c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
                     c.a.ldr_imm(14, 13, 0);
-                }
                 c.a.lsr_imm(13, 14, 32);
                 c.a.cmp_reg(13, 12);
                 c.a.b_cond(Cond::Ne, slow); // empty IC or shape miss
@@ -2182,7 +2160,7 @@ fn emit_op(
                 c.fetch_x(ins.c, 9);
                 c.guard_number(9, slow);
                 let reuse = *acache == Some(ins.b) && c.int_lane;
-                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, c.acache_on && !in_lane);
+                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, c.acache_on);
                 *acache = Some(ins.b);
                 c.a.fmov_dx(0, 9);
                 c.a.fcvtzs(13, 0);
@@ -2221,7 +2199,7 @@ fn emit_op(
             let done = c.a.new_label();
             if let Some(o) = c.offsets {
                 let reuse = *acache == Some(ins.b) && c.int_lane;
-                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, c.acache_on && !in_lane);
+                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, c.acache_on);
                 *acache = Some(ins.b);
                 c.a.ldr_imm(14, 10, o.vec_len);
                 c.a.scvtf(0, 14);
