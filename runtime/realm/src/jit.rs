@@ -83,6 +83,7 @@ pub(crate) fn set_field_add(
     if !tic.is_null() {
         let e = unsafe { &*(tic as *const TransIc) };
         if e.old_sid == sid {
+            e.shape.absorb(obj.shape);
             obj.shape = e.shape;
             obj.push_val(v);
             return;
@@ -95,6 +96,7 @@ pub(crate) fn set_field_add(
             drop(unsafe { Box::from_raw(b as *mut TransIc) });
         }
     }
+    ns.absorb(obj.shape);
     obj.shape = ns;
     obj.push_val(v);
 }
@@ -735,7 +737,7 @@ extern "C" fn h_get_field(
     // IC fast path (same per-pc caches the interpreter fills)
     if let Some(o) = obj.as_object() {
         let objref = r.heap.obj(o);
-        let sid = objref.shape.id;
+        let sid = objref.shape.id();
         let ic = pr.jit.ic_load(pr.body().code.len(), pc as usize);
         let v = if ic != 0 && (ic >> 32) as u32 == sid {
             objref.val((ic & 0xFFFF_FFFF) as usize - 1)
@@ -786,16 +788,16 @@ extern "C" fn h_set_field(
         Some(o) => {
             r.heap.barrier_obj(o);
             let obj = r.heap.obj_mut(o);
-            let sid = obj.shape.id;
+            let sid = obj.shape.id();
             let ic = pr.jit.ic_load(pr.body().code.len(), pc as usize);
             if ic != 0 && (ic >> 32) as u32 == sid {
-                obj.set_val((ic & 0xFFFF_FFFF) as usize - 1, v);
+                obj.store((ic & 0xFFFF_FFFF) as usize - 1, v);
             } else {
                 let name = name_const(pr, cidx as usize);
                 match obj.shape.slot_of(name) {
                     Some(i) => {
                         pr.jit.ic_store(pr.body().code.len(), pc as usize, sid, i);
-                        obj.set_val(i, v);
+                        obj.store(i, v);
                     }
                     None => set_field_add(pr, pc as usize, obj, sid, || {
                         match &pr.body().consts[cidx as usize] {
@@ -1485,19 +1487,6 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
     if !tier2_enabled() {
         return None;
     }
-    let typed = tsc_types::analyze(proto);
-    if !typed.tier2_ok {
-        return None;
-    }
-    let jumpif: Vec<tsr_jit::tier2::JCond> = typed
-        .jumpif
-        .iter()
-        .map(|c| match c {
-            tsc_types::CondFact::Num => tsr_jit::tier2::JCond::Num,
-            tsc_types::CondFact::Bool => tsr_jit::tier2::JCond::Bool,
-            tsc_types::CondFact::Other => tsr_jit::tier2::JCond::Other,
-        })
-        .collect();
     // warmed ICs baked as immediates (shape id, slot) — the site still
     // guards on shape, so a later polymorphic object just takes the
     // generic path
@@ -1513,6 +1502,35 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
             }
             let ic = proto.jit.ic_load(n_code, pc);
             (ic != 0).then(|| ((ic >> 32) as u32, (ic & 0xFFFF_FFFF) as u32 - 1))
+        })
+        .collect();
+    // what the baked shape vouches for at each field site: the type
+    // analysis reads it as the GetField result, the compiler as the
+    // store check. Only inline slots — the generic path is untyped.
+    let no_repr = std::env::var_os("TSC_NO_FIELD_REPR").is_some();
+    let field_repr: Vec<u8> = ic_baked
+        .iter()
+        .map(|e| match e {
+            _ if no_repr => tsc_types::REPR_ANY,
+            Some((sid, slot)) if (*slot as usize) < tsr_memory::OBJ_INLINE => {
+                tsr_memory::shape_by_id(*sid)
+                    .map(|s| s.repr(*slot as usize) as u8)
+                    .unwrap_or(tsc_types::REPR_ANY)
+            }
+            _ => tsc_types::REPR_ANY,
+        })
+        .collect();
+    let typed = tsc_types::analyze(proto, &field_repr);
+    if !typed.tier2_ok {
+        return None;
+    }
+    let jumpif: Vec<tsr_jit::tier2::JCond> = typed
+        .jumpif
+        .iter()
+        .map(|c| match c {
+            tsc_types::CondFact::Num => tsr_jit::tier2::JCond::Num,
+            tsc_types::CondFact::Bool => tsr_jit::tier2::JCond::Bool,
+            tsc_types::CondFact::Other => tsr_jit::tier2::JCond::Other,
         })
         .collect();
     // TSC_INT_SPEC=1 dumps the integer-lane candidates per compiled
@@ -1531,6 +1549,9 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
         ic_baked: &ic_baked,
         loop_spec: &typed.loop_spec,
         int_spec: &typed.int_spec,
+        field_repr: &field_repr,
+        int_facts: &typed.int_facts,
+        lit_vals: &typed.lit_vals,
     };
     let ics = proto.jit.ics_base(proto.body().code.len()) as u64;
     let tics = proto.jit.tics_base(proto.body().code.len()) as u64;
@@ -1544,6 +1565,13 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
         .map(|(pc, i)| {
             if i.op == Op::NewObjectLit {
                 let s = lit_shape(proto, pc, i.c as usize);
+                // a value the analysis cannot type is stored unchecked by
+                // the template, so the field must already allow anything
+                for (j, &cls) in typed.lit_vals.get(pc).map(|v| v.as_slice()).unwrap_or(&[]).iter().enumerate() {
+                    if cls == 2 {
+                        s.widen(j, tsr_memory::Repr::Any);
+                    }
+                }
                 (s as *const _ as u64, s.fields.len() as u32)
             } else {
                 (0, 0)

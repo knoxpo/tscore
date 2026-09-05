@@ -883,7 +883,7 @@ fn run_frame(
                 let obj = reg!(realm, base + ins.b as usize);
                 if let Some(o) = obj.as_object() {
                     let objref = realm.heap.obj(o);
-                    let sid = objref.shape.id;
+                    let sid = objref.shape.id();
                     let ic = proto.jit.ic_load(pbody.code.len(), pc);
                     let v = if ic != 0 && (ic >> 32) as u32 == sid {
                         objref.val((ic & 0xFFFF_FFFF) as usize - 1)
@@ -921,16 +921,16 @@ fn run_frame(
                     Some(r) => {
                         realm.heap.barrier_obj(r);
                         let objref = realm.heap.obj_mut(r);
-                        let sid = objref.shape.id;
+                        let sid = objref.shape.id();
                         let ic = proto.jit.ic_load(pbody.code.len(), pc);
                         if ic != 0 && (ic >> 32) as u32 == sid {
-                            objref.set_val((ic & 0xFFFF_FFFF) as usize - 1, v);
+                            objref.store((ic & 0xFFFF_FFFF) as usize - 1, v);
                         } else {
                             let name = const_str(proto, ins.b as usize);
                             match objref.shape.slot_of(name) {
                                 Some(i) => {
                                     proto.jit.ic_store(pbody.code.len(), pc, sid, i);
-                                    objref.set_val(i, v);
+                                    objref.store(i, v);
                                 }
                                 None => crate::jit::set_field_add(
                                     proto,

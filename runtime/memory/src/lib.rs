@@ -295,13 +295,73 @@ pub struct Closure {
 #[repr(C)]
 #[derive(Debug)]
 pub struct ShapeData {
-    pub id: u32,
+    /// Identity the inline caches and every baked shape guard compare.
+    /// Bumped in place when a field representation widens, so all code
+    /// that assumed the narrower representation misses its guard.
+    id: std::sync::atomic::AtomicU32,
     /// Field names in slot order.
     pub fields: Vec<Arc<str>>,
+    /// Per-field representation, 2 bits per slot for the first 32 fields
+    /// (later ones are Any). Only ever widens: Int32 -> Number -> Any.
+    reprs: std::sync::atomic::AtomicU64,
     transitions: std::sync::RwLock<Vec<(Arc<str>, &'static ShapeData)>>,
 }
 
 static SHAPE_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+static SHAPE_BY_ID: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<u32, &'static ShapeData>>,
+> = std::sync::OnceLock::new();
+
+fn register_shape(id: u32, s: &'static ShapeData) {
+    SHAPE_BY_ID
+        .get_or_init(Default::default)
+        .write()
+        .unwrap()
+        .insert(id, s);
+}
+
+/// The shape currently carrying `id` (compile-time lookups only).
+pub fn shape_by_id(id: u32) -> Option<&'static ShapeData> {
+    SHAPE_BY_ID.get_or_init(Default::default).read().unwrap().get(&id).copied()
+}
+
+/// What a field's values are known to be. Compiled code reading a field
+/// of a guarded shape may rely on this without a guard of its own: a
+/// store that would violate it widens the shape, which changes the id
+/// every such guard compares.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[repr(u8)]
+pub enum Repr {
+    /// A number with an exact i32 value (and not -0).
+    Int32 = 0,
+    Number = 1,
+    Any = 2,
+}
+
+impl Repr {
+    pub fn of(v: Value) -> Repr {
+        if !v.is_number() {
+            return Repr::Any;
+        }
+        let n = v.as_number();
+        if n.fract() == 0.0
+            && n >= i32::MIN as f64
+            && n <= i32::MAX as f64
+            && v.bits() != (-0.0f64).to_bits()
+        {
+            Repr::Int32
+        } else {
+            Repr::Number
+        }
+    }
+    fn from_bits(b: u64) -> Repr {
+        match b & 3 {
+            0 => Repr::Int32,
+            1 => Repr::Number,
+            _ => Repr::Any,
+        }
+    }
+}
 
 /// Shapes are immutable, process-global, and bounded by the program's
 /// distinct field sequences — leaked (`&'static`) so the hot paths
@@ -310,15 +370,67 @@ static SHAPE_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 pub fn empty_shape() -> &'static ShapeData {
     static EMPTY: std::sync::OnceLock<&'static ShapeData> = std::sync::OnceLock::new();
     EMPTY.get_or_init(|| {
-        Box::leak(Box::new(ShapeData {
-            id: 0,
+        let s: &'static ShapeData = Box::leak(Box::new(ShapeData {
+            id: std::sync::atomic::AtomicU32::new(0),
             fields: Vec::new(),
+            reprs: std::sync::atomic::AtomicU64::new(0),
             transitions: std::sync::RwLock::new(Vec::new()),
-        }))
+        }));
+        register_shape(0, s);
+        s
     })
 }
 
 impl ShapeData {
+    #[inline(always)]
+    pub fn id(&self) -> u32 {
+        self.id.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn repr(&self, slot: usize) -> Repr {
+        if slot >= 32 {
+            return Repr::Any;
+        }
+        Repr::from_bits(self.reprs.load(std::sync::atomic::Ordering::Relaxed) >> (2 * slot))
+    }
+
+    /// Widen `slot` to cover `r`. A change takes a fresh id so every
+    /// cache and compiled guard keyed on the old one misses.
+    pub fn widen(&'static self, slot: usize, r: Repr) {
+        if slot >= 32 || r == Repr::Int32 {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        loop {
+            let cur = self.reprs.load(Relaxed);
+            if Repr::from_bits(cur >> (2 * slot)) >= r {
+                return;
+            }
+            let next = (cur & !(3u64 << (2 * slot))) | ((r as u64) << (2 * slot));
+            if self.reprs.compare_exchange(cur, next, Relaxed, Relaxed).is_ok() {
+                let id = SHAPE_IDS.fetch_add(1, Relaxed);
+                self.id.store(id, Relaxed);
+                register_shape(id, self);
+                return;
+            }
+        }
+    }
+
+    /// An object moving from `prev` to this shape keeps its values, so
+    /// this shape must cover everything `prev` allowed for shared slots.
+    pub fn absorb(&'static self, prev: &ShapeData) {
+        let pr = prev.reprs.load(std::sync::atomic::Ordering::Relaxed);
+        if pr == 0 {
+            return;
+        }
+        for slot in 0..prev.fields.len().min(32) {
+            let r = Repr::from_bits(pr >> (2 * slot));
+            if r != Repr::Int32 {
+                self.widen(slot, r);
+            }
+        }
+    }
+
     pub fn slot_of(&self, name: &str) -> Option<usize> {
         self.fields.iter().position(|f| &**f == name)
     }
@@ -339,11 +451,17 @@ impl ShapeData {
         }
         let mut fields = self.fields.clone();
         fields.push(name.clone());
+        let id = SHAPE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // the new slot starts narrowest; its first value widens it
         let next: &'static ShapeData = Box::leak(Box::new(ShapeData {
-            id: SHAPE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: std::sync::atomic::AtomicU32::new(id),
             fields,
+            reprs: std::sync::atomic::AtomicU64::new(
+                self.reprs.load(std::sync::atomic::Ordering::Relaxed),
+            ),
             transitions: std::sync::RwLock::new(Vec::new()),
         }));
+        register_shape(id, next);
         tr.push((name, next));
         next
     }
@@ -400,9 +518,18 @@ impl Obj {
             self.overflow[i - OBJ_INLINE] = v;
         }
     }
+    /// Field store that keeps the shape's representation honest. Every
+    /// mutator-side write goes through here; `set_val` is for the GC,
+    /// which only moves values.
+    #[inline(always)]
+    pub fn store(&mut self, i: usize, v: Value) {
+        self.shape.widen(i, Repr::of(v));
+        self.set_val(i, v);
+    }
     #[inline(always)]
     pub fn push_val(&mut self, v: Value) {
         let i = self.vlen as usize;
+        self.shape.widen(i, Repr::of(v));
         if i < OBJ_INLINE {
             self.inline[i] = v;
         } else {
@@ -412,6 +539,9 @@ impl Obj {
     }
     #[inline(always)]
     pub fn extend_vals(&mut self, vals: &[Value]) {
+        for (k, &v) in vals.iter().enumerate() {
+            self.shape.widen(self.vlen as usize + k, Repr::of(v));
+        }
         let n_inline = vals.len().min(OBJ_INLINE);
         self.inline[..n_inline].copy_from_slice(&vals[..n_inline]);
         if vals.len() > OBJ_INLINE {
@@ -430,9 +560,11 @@ impl Obj {
     }
     pub fn set(&mut self, name: Arc<str>, v: Value) {
         match self.shape.slot_of(&name) {
-            Some(i) => self.set_val(i, v),
+            Some(i) => self.store(i, v),
             None => {
+                let prev = self.shape;
                 self.shape = self.shape.with_field(name);
+                self.shape.absorb(prev);
                 self.push_val(v);
             }
         }
@@ -1268,7 +1400,6 @@ impl Heap {
     /// Re-derive the JIT's arena base-pair tables. MUST be called after
     /// any operation that can move an objs/arrs data pointer (Vec growth,
     /// nursery take/restore) — compiled code reads these words directly.
-    #[inline(always)]
     /// Allocate into the nursery? Off entirely (TSC_NO_NURSERY) or
     /// temporarily while pretenuring.
     #[inline(always)]
@@ -1276,6 +1407,7 @@ impl Heap {
         self.nursery_on && self.pretenure == 0
     }
 
+    #[inline(always)]
     pub fn refresh_bases(&mut self) {
         self.obj_bases = [
             self.objs.as_ptr() as usize,

@@ -110,6 +110,14 @@ pub struct Facts<'a> {
     /// Non-empty means this function pays for the extra frame slot that
     /// frees x23; empty means its frame is untouched.
     pub int_spec: &'a [(usize, Vec<u8>)],
+    /// per-pc field representation at warm GetField/SetField sites
+    /// (tsc_types::REPR_*): a typed read deopts on a shape miss instead
+    /// of taking the generic path, since what follows relies on it
+    pub field_repr: &'a [u8],
+    /// per-pc, per-operand: proven i32 integer
+    pub int_facts: &'a [[bool; 3]],
+    /// per NewObjectLit pc: value classes (0 int, 1 num, 2 unknown)
+    pub lit_vals: &'a [Vec<u8>],
 }
 
 struct C {
@@ -347,16 +355,48 @@ impl C {
         }
     }
 
+    /// Deopt to the interpreter at `pc`, which re-runs the instruction
+    /// from the (still intact) register homes.
+    fn deopt_at(&mut self, pc: usize) {
+        self.spill_low();
+        self.a.movz(0, 2, 0);
+        self.a.mov_imm64(1, pc as u64);
+        self.a.b(self.deopt_exit);
+    }
+
+    /// The boxed number in `xv` has an exact i32 value and is not -0 —
+    /// what an Int32 field may hold. Clobbers d0, d1, x11, x12 only —
+    /// the literal template holds its object address in x13.
+    fn int32_check(&mut self, xv: u32, fail: Label) {
+        self.a.fmov_dx(0, xv);
+        self.a.fcvtzs(11, 0);
+        self.a.scvtf(1, 11);
+        self.a.fcmp(1, 0);
+        self.a.b_cond(Cond::Ne, fail);
+        self.a.sxtw(12, 11);
+        self.a.cmp_reg(12, 11);
+        self.a.b_cond(Cond::Ne, fail);
+        self.a.mov_imm64(12, (-0.0f64).to_bits());
+        self.a.cmp_reg(xv, 12);
+        self.a.b_cond(Cond::Eq, fail);
+    }
+
     /// Write a literal Obj at the address in `at` (x13): shape, vlen,
     /// the first `sn` values from their homes, undefined pads, and an
     /// empty overflow Vec. Shared by the nursery and old-space templates.
-    fn store_obj_lit(&mut self, at: u32, shape_ptr: u64, sn: u8, first: u8, o: HeapOffsets) {
+    /// `checks[i]` asks for an Int32 check on value i (the shape's field
+    /// is Int32 but the value is only proven a number) — a miss takes
+    /// `slow`, whose helper widens the shape.
+    fn store_obj_lit(&mut self, at: u32, shape_ptr: u64, sn: u8, first: u8, checks: &[bool], slow: Label, o: HeapOffsets) {
         self.a.mov_imm64(14, shape_ptr);
         self.a.str_imm(14, at, 0);
         self.a.mov_imm64(14, sn as u64);
         self.a.str_imm(14, at, o.obj_vlen);
         for i in 0..sn {
             self.fetch_x(first + i, 9);
+            if checks.get(i as usize).copied().unwrap_or(false) {
+                self.int32_check(9, slow);
+            }
             self.a.str_imm(9, at, o.obj_inline + i as u32 * 8);
         }
         if (sn as usize) < 3 {
@@ -544,7 +584,7 @@ pub fn compile(
             !pbody.code[*h..=end]
                 .iter()
                 .any(|_| false) // array loops allowed: x21 is the intermediate now, x22 stays the array cache
-                && lane_pick(pbody, facts, *h, vs).is_some()
+                && lane_here(pbody, facts, *h, vs).is_some()
         });
         let int_lane = acache_on || lane_on;
         let bail = a.new_label();
@@ -714,7 +754,7 @@ pub fn compile(
     let mut in_lane = vec![false; pbody.code.len() + 2];
     if c.lane_on {
         for (h, vs) in facts.int_spec.iter() {
-            if lane_pick(pbody, facts, *h, vs).is_none() {
+            if lane_here(pbody, facts, *h, vs).is_none() {
                 continue;
             }
             let end = pbody
@@ -752,6 +792,14 @@ pub fn compile(
             fcache = None;
             acache = None;
         }
+        // The lane ends with its loop. Left set, a later loop sharing the
+        // vreg would read a register nothing reloaded: two consecutive
+        // loops on one counter ran the second from the first's final
+        // value (found the day array loops became eligible).
+        if !in_lane[pc] {
+            c.lane = None;
+            c.itmp = None;
+        }
         // loop-header speculation: guard the fall-in path (back-edges jump
         // to the label BELOW these guards and are already proven)
         // integer lane: at a loop header, take one int_spec vreg into a
@@ -761,7 +809,7 @@ pub fn compile(
         // per iteration.
         if c.lane_on {
             if let Some((_, vs)) = facts.int_spec.iter().find(|(h, _)| *h == pc) {
-                let laned = lane_pick(pbody, facts, pc, vs);
+                let laned = lane_here(pbody, facts, pc, vs);
                 if laned.is_some() {
                     let ok = c.a.new_label();
                     let fail = c.a.new_label();
@@ -972,6 +1020,30 @@ fn emit_lane_guard(c: &mut C, vs: &[u8], laned: Option<u8>, fail: Label) {
 
 /// The laned vreg for a header, if any: the first speculated vreg whose
 /// every in-loop write goes through an arm that maintains the register.
+/// The lane a loop takes, if any: its own pick, unless an inner loop
+/// inside its range has a pick of its own. There is one lane register,
+/// and the inner loop is the hot one, so the outer stays boxed rather
+/// than sharing x23 and reading the inner counter after the inner loop
+/// exits (which is what happened once array loops became eligible).
+fn lane_here(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> Option<u8> {
+    let pick = lane_pick(pbody, facts, h, vs)?;
+    let end = pbody
+        .code
+        .iter()
+        .enumerate()
+        .filter(|(p2, i)| {
+            i.op == Op::Jump && i.sbx() < 0 && (*p2 as i64 + i.sbx() as i64 + 1) as usize == h
+        })
+        .map(|(p2, _)| p2)
+        .max()
+        .unwrap_or(h);
+    let inner_laned = facts
+        .int_spec
+        .iter()
+        .any(|(h2, vs2)| *h2 > h && *h2 <= end && lane_pick(pbody, facts, *h2, vs2).is_some());
+    (!inner_laned).then_some(pick)
+}
+
 fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> Option<u8> {
     let end = pbody
         .code
@@ -988,6 +1060,14 @@ fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> O
     // or a bitwise op. In a loop whose Mod divisor is a variable — primes'
     // `n % d` — there is nothing to remove and the per-write syncs are
     // pure cost, measured at 23%.
+    // An await leaves compiled code mid-loop and resumes without passing
+    // the header, so nothing would re-establish the lane register: the
+    // promises benchmark summed from a stale x23 the day array loops
+    // became eligible. There is no integer chain worth keeping across a
+    // suspension anyway.
+    if pbody.code[h..=end].iter().any(|i| i.op == Op::Await) {
+        return None;
+    }
     let converts = pbody.code[h..=end].iter().enumerate().any(|(off, i)| match i.op {
         Op::Mod => facts
             .const_ops
@@ -1572,9 +1652,10 @@ fn emit_op(
             if num_bc {
                 let db = c.fetch(ins.b, 0);
                 if let Some(d) = const_div {
-                    let int_in = (c.lane_on
+                    let int_in = ((c.lane_on
                         && in_lane
                         && (c.lane == Some(ins.b) || c.itmp == Some(ins.b)))
+                        || facts.int_facts.get(pc).is_some_and(|f| f[1]))
                         .then(|| c.int_src(ins.b, 10));
                     emit_mod_const(c, ins.a, db, d, fmod_addr, int_in);
                     return;
@@ -2040,11 +2121,18 @@ fn emit_op(
                     .filter(|&(_, slot)| (slot as usize) < o.obj_inline_n as usize)
                 {
                     let generic = c.a.new_label();
+                    // a typed read (the analysis took this field's Int32 /
+                    // Number representation as the result type) must not
+                    // fall to the generic path on a miss: what follows
+                    // relies on the type. Deopt and let the interpreter
+                    // re-run it; ten of those re-tier the function.
+                    let typed = facts.field_repr.get(pc).copied().unwrap_or(2) != 2;
+                    let miss = if typed { c.a.new_label() } else { generic };
                     c.fetch_x(ins.b, 8);
                     c.a.lsr_imm(10, 8, 48);
                     c.a.movz(11, 0xFFFB, 0); // TAG_OBJ
                     c.a.cmp_reg(10, 11);
-                    c.a.b_cond(Cond::Ne, generic);
+                    c.a.b_cond(Cond::Ne, miss);
                     c.a.orr_reg32(9, 31, 8);
                     c.arena_base(10, 9, o.obj_bases_off);
                     c.index_addr(10, 10, 9, o.obj_size);
@@ -2052,12 +2140,16 @@ fn emit_op(
                     c.a.ldr_w_imm(12, 11, o.shape_id_delta);
                     c.a.mov_imm64(13, sid as u64);
                     c.a.cmp_reg(12, 13);
-                    c.a.b_cond(Cond::Ne, generic);
+                    c.a.b_cond(Cond::Ne, miss);
                     c.a.mov(15, 10); // CSE cache: validated address
                     c.a.mov(16, 12); //            + shape id
                     c.a.ldr_imm(8, 10, o.obj_inline + slot * 8);
                     c.put_x(ins.a, 8);
                     c.a.b(done);
+                    if typed {
+                        c.a.bind(miss);
+                        c.deopt_at(pc);
+                    }
                     c.a.bind(generic);
                 }
                 // inline IC'd property load (reads only, no GC)
@@ -2109,6 +2201,13 @@ fn emit_op(
             let done = c.a.new_label();
             let full = c.a.new_label();
             if let Some(o) = c.offsets {
+                // an Int32 field takes only exact i32 values: a store of a
+                // number not proven integral is checked inline, and a
+                // miss goes to the helper, which widens the shape
+                let int32_field = facts.field_repr.get(pc).copied().unwrap_or(2) == 0
+                    && !facts.int_facts.get(pc).is_some_and(|f| f[2])
+                    && c.lane != Some(ins.c)
+                    && c.itmp != Some(ins.c);
                 if *fcache == Some(ins.a) {
                     // CSE'd store: cached validated address in x15, shape
                     // id in x16 — only this pc's IC + number-value guard.
@@ -2126,6 +2225,9 @@ fn emit_op(
                     c.a.cbz(15, full);
                     c.fetch_x(ins.c, 9);
                     c.guard_number(9, full);
+                    if int32_field {
+                        c.int32_check(9, full);
+                    }
                     if let Some((sid, slot)) = baked {
                         c.a.mov_imm64(13, sid as u64);
                         c.a.cmp_reg(16, 13);
@@ -2161,6 +2263,9 @@ fn emit_op(
                     c.a.b_cond(Cond::Ne, generic);
                     c.fetch_x(ins.c, 9);
                     c.guard_number(9, generic); // heap values -> helper
+                    if int32_field {
+                        c.int32_check(9, generic);
+                    }
                     c.a.orr_reg32(12, 31, 8);
                     c.arena_base(10, 12, o.obj_bases_off);
                     c.index_addr(10, 10, 12, o.obj_size);
@@ -2519,6 +2624,19 @@ fn emit_op(
                 c.thin(c.helpers.new_array_lit);
                 c.a.bind(done);
             } else if let Some(&(shape_ptr, sn)) = lit_shapes.get(pc).filter(|&&(sp, _)| sp != 0) {
+                // which literal values need an Int32 check: the field is
+                // Int32 (as of now — widening later only relaxes it) and
+                // the value is a number not proven integral
+                let lit_checks: Vec<bool> = {
+                    let shape = unsafe { &*(shape_ptr as *const tsr_memory::ShapeData) };
+                    let classes = facts.lit_vals.get(pc).map(|v| v.as_slice()).unwrap_or(&[]);
+                    (0..sn as usize)
+                        .map(|j| {
+                            classes.get(j).copied().unwrap_or(2) == 1
+                                && shape.repr(j) == tsr_memory::Repr::Int32
+                        })
+                        .collect()
+                };
                 if bump {
                     // inline nursery bump: len<cap -> write the 64-byte Obj
                     // at the tail, bump len+bytes, result = len|YOUNG_BIT.
@@ -2535,7 +2653,7 @@ fn emit_op(
                     c.a.b_cond(Cond::Hs, slow); // full -> helper (realloc)
                     c.a.ldr_imm(12, R_REALM, o.nursery_objs_ptr);
                     c.a.add_reg_lsl(13, 12, 10, 6); // + len * 64
-                    c.store_obj_lit(13, shape_ptr, sn as u8, ins.b, o);
+                    c.store_obj_lit(13, shape_ptr, sn as u8, ins.b, &lit_checks, slow, o);
                     c.a.add_imm(14, 10, 1);
                     c.a.str_imm(14, R_REALM, o.nursery_objs_len);
                     c.a.ldr_imm(14, R_REALM, o.nursery_bytes_off);
@@ -2560,9 +2678,11 @@ fn emit_op(
                     c.a.b_cond(Cond::Hs, slow);
                     c.a.ldr_imm(13, R_REALM, o.realm_objs_ptr);
                     c.a.add_reg_lsl(13, 13, 10, 6);
-                    c.store_obj_lit(13, shape_ptr, sn as u8, ins.b, o);
+                    c.store_obj_lit(13, shape_ptr, sn as u8, ins.b, &lit_checks, slow, o);
                     c.a.add_imm(14, 10, 1);
                     c.a.str_imm(14, R_REALM, o.objs_len);
+                    // x12 (young-log len) does not survive the Int32 checks
+                    c.a.ldr_imm(12, R_REALM, o.objs_young_len);
                     c.old_alloc_log(o.objs_young_ptr, o.objs_young_len, o);
                     c.a.mov_imm64(9, 0xFFFBu64 << 48);
                     c.a.orr_reg(9, 9, 10);

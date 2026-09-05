@@ -145,7 +145,7 @@ pub fn discover() -> Option<HeapLayout> {
     for i in 0..3 {
         o.set(Arc::from(format!("probe{i}").as_str()), Value::number(i as f64));
     }
-    debug_assert!(o.shape.id as usize != o.shape.fields.len());
+    debug_assert!(o.shape.id() as usize != o.shape.fields.len());
     let obj_words = as_words(&o);
     let shape_ref: &tsr_memory::ShapeData = &o.shape;
     // the stored word is the ArcInner pointer; &*arc points at the data
@@ -171,7 +171,7 @@ pub fn discover() -> Option<HeapLayout> {
     let id_hits: Vec<(usize, u64)> = sd_words
         .iter()
         .enumerate()
-        .filter(|(_, &w)| (w as u32) == shape_ref.id || (w >> 32) as u32 == shape_ref.id)
+        .filter(|(_, &w)| (w as u32) == shape_ref.id() || (w >> 32) as u32 == shape_ref.id())
         .map(|(i, &w)| (i, w))
         .collect();
     if id_hits.len() != 1 {
@@ -181,7 +181,7 @@ pub fn discover() -> Option<HeapLayout> {
         return None;
     }
     let id_word = id_hits[0];
-    let id_off_in_sd = if (id_word.1 & 0xFFFF_FFFF) as u32 == shape_ref.id {
+    let id_off_in_sd = if (id_word.1 & 0xFFFF_FFFF) as u32 == shape_ref.id() {
         (id_word.0 * 8) as u32
     } else {
         (id_word.0 * 8 + 4) as u32
@@ -492,13 +492,13 @@ fn verify(realm: &Realm, l: &HeapLayout) -> bool {
             eprintln!(
                 "[layout] vlen={vlen} v0={v0:x} want={:x} sid={sid} want={} alen={alen} a0={a0:x} want={:x}",
                 Value::number(2.0).bits(),
-                realm.heap.objs[2].shape.id,
+                realm.heap.objs[2].shape.id(),
                 Value::number(1.0).bits()
             );
         }
         vlen == 1
             && v0 == Value::number(2.0).bits()
-            && sid == realm.heap.objs[2].shape.id
+            && sid == realm.heap.objs[2].shape.id()
             && alen == 3
             && a0 == Value::number(1.0).bits()
     }

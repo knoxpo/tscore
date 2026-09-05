@@ -49,7 +49,20 @@ pub struct TypedProto {
     /// call, a field read — leaves it out. Being numeric is not enough to
     /// unbox, so the compiler owes an int32 guard at the header.
     pub int_spec: Vec<(usize, Vec<u8>)>,
+    /// Per-pc, per-operand (a,b,c): operand is a proven integer in i32
+    /// range (a constant, or a field read whose shape says Int32).
+    pub int_facts: Vec<[bool; 3]>,
+    /// Per NewObjectLit pc: class of each literal value in order —
+    /// 0 proven i32 integer, 1 proven number, 2 unknown.
+    pub lit_vals: Vec<Vec<u8>>,
 }
+
+/// Field representation as the caller reports it per pc, for GetField
+/// and SetField sites with a warm monomorphic cache: 0 Int32, 1 Number,
+/// 2 Any / unknown.
+pub const REPR_INT32: u8 = 0;
+pub const REPR_NUMBER: u8 = 1;
+pub const REPR_ANY: u8 = 2;
 
 /// Ops whose result stays an integer when their inputs are integers,
 /// assuming the overflow check the compiler emits alongside them.
@@ -81,6 +94,10 @@ enum T {
     /// A known integer constant (refines Num; enables constant-divisor
     /// codegen for Mod/Div).
     Int(i64),
+    /// An integer of unknown value in i32 range: a field read the shape
+    /// vouches for, or the join of two such constants. Not closed under
+    /// arithmetic — that is the lane's business.
+    IntV,
     Num,
     Bool,
     Top,
@@ -88,7 +105,14 @@ enum T {
 
 impl T {
     fn is_num(self) -> bool {
-        matches!(self, T::Num | T::Int(_))
+        matches!(self, T::Num | T::Int(_) | T::IntV)
+    }
+    fn is_int(self) -> bool {
+        match self {
+            T::Int(v) => v >= i32::MIN as i64 && v <= i32::MAX as i64,
+            T::IntV => true,
+            _ => false,
+        }
     }
 }
 
@@ -96,13 +120,16 @@ fn join(a: T, b: T) -> T {
     if a == b {
         return a;
     }
+    if a.is_int() && b.is_int() {
+        return T::IntV;
+    }
     if a.is_num() && b.is_num() {
         return T::Num; // two different constants: still numeric
     }
     T::Top
 }
 
-pub fn analyze(proto: &FunctionProto) -> TypedProto {
+pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
     let reject = |reason: &'static str| TypedProto {
         tier2_ok: false,
         reason,
@@ -112,7 +139,10 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         arg_guard: Vec::new(),
         loop_spec: Vec::new(),
         int_spec: Vec::new(),
+        int_facts: Vec::new(),
+        lit_vals: Vec::new(),
     };
+    let repr_at = |pc: usize| field_repr.get(pc).copied().unwrap_or(REPR_ANY);
     if proto.arity > 8 {
         return reject("arity > 8 (unprofiled)");
     }
@@ -395,6 +425,15 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
                 next = vec![pc + 1, (pc as i64 + ins.sbx() as i64 + 1) as usize];
             }
             Op::Len => s[a] = T::Num,
+            // a warm monomorphic field read: the shape's representation
+            // for that slot is the result type (the site deopts on a miss)
+            Op::GetField => {
+                s[a] = match repr_at(pc) {
+                    REPR_INT32 => T::IntV,
+                    REPR_NUMBER => T::Num,
+                    _ => T::Top,
+                }
+            }
             Op::Return | Op::Halt => next = vec![],
             Op::Await => s[a] = T::Top,
             _ => {
@@ -474,6 +513,8 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
                         Some(Const::Number(n)) if n.fract() == 0.0 && n.abs() < 2147483648.0
                     ),
                     Op::Move | Op::Neg | Op::BitNot => int_operand(i.b, 0),
+                    // a field the shape vouches for as Int32
+                    Op::GetField => repr_at(pc2) == REPR_INT32,
                     _ if keeps_int(i.op) => {
                         int_operand(i.b, 0) && int_operand(i.c, 1)
                     }
@@ -498,6 +539,27 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         }
     }
 
+    // integer facts per operand and literal value classes, from the
+    // final per-pc states
+    let mut int_facts = vec![[false; 3]; n];
+    let mut lit_vals: Vec<Vec<u8>> = vec![Vec::new(); n];
+    for (pc, ins) in body.code.iter().enumerate() {
+        let Some(s) = &states[pc] else { continue };
+        let f = |r: u8| s.get(r as usize).copied().is_some_and(|t| t.is_int());
+        int_facts[pc] = [f(ins.a), f(ins.b), f(ins.c)];
+        if ins.op == Op::NewObjectLit {
+            if let Some(Const::Keys(k)) = body.consts.get(ins.c as usize) {
+                lit_vals[pc] = (0..k.len())
+                    .map(|j| match s.get(ins.b as usize + j).copied() {
+                        Some(t) if t.is_int() => 0,
+                        Some(t) if t.is_num() => 1,
+                        _ => 2,
+                    })
+                    .collect();
+            }
+        }
+    }
+
     TypedProto {
         tier2_ok: true,
         reason: "",
@@ -507,6 +569,8 @@ pub fn analyze(proto: &FunctionProto) -> TypedProto {
         arg_guard,
         loop_spec,
         int_spec,
+        int_facts,
+        lit_vals,
     }
 }
 
@@ -581,7 +645,7 @@ mod tests {
                 Instr::abc(Op::Return, 1, 0, 0),
             ],
         );
-        let t = analyze(&p);
+        let t = analyze(&p, &[]);
         assert!(t.tier2_ok);
         assert!(t.arg_guard[0]);
         assert!(t.num_facts[1][1] && t.num_facts[1][2]);
@@ -597,7 +661,7 @@ mod tests {
                 Instr::abc(Op::Return, 1, 0, 0),
             ],
         );
-        let t = analyze(&p);
+        let t = analyze(&p, &[]);
         assert!(t.tier2_ok);
         assert!(!t.arg_guard[0]);
         assert!(!t.num_facts[1][1]); // NewObject result not Num
@@ -642,7 +706,7 @@ mod int_lane {
             Instr::asbx(Op::Jump, 0, -6),
             Instr::abc(Op::Return, 2, 0, 0),
         ]);
-        let t = analyze(&p);
+        let t = analyze(&p, &[]);
         let vs = &t.int_spec.first().expect("a loop was speculated").1;
         assert!(vs.contains(&1), "counter should be unboxed: {vs:?}");
         assert!(vs.contains(&2), "accumulator should be unboxed: {vs:?}");
@@ -663,7 +727,7 @@ mod int_lane {
             Instr::asbx(Op::Jump, 0, -6),
             Instr::abc(Op::Return, 2, 0, 0),
         ]);
-        let t = analyze(&p);
+        let t = analyze(&p, &[]);
         let vs = t.int_spec.first().map(|(_, v)| v.clone()).unwrap_or_default();
         assert!(!vs.contains(&2), "divided value must stay boxed: {vs:?}");
     }
@@ -681,7 +745,7 @@ mod int_lane {
             Instr::asbx(Op::Jump, 0, -4),
             Instr::abc(Op::Return, 1, 0, 0),
         ]);
-        let t = analyze(&p);
+        let t = analyze(&p, &[]);
         let vs = &t.int_spec.first().expect("a loop was found").1;
         assert!(vs.contains(&1), "counter should be unboxed: {vs:?}");
         assert!(!vs.contains(&0), "the parameter is never written: {vs:?}");
