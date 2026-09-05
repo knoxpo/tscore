@@ -1,0 +1,122 @@
+---
+title: "Program lifecycle"
+description: "What happens between `tscore run file.ts` and the exit code."
+---
+
+One `tscore run`, start to finish. Every box below is a real function in the repository; file references are given so you can read the code next to the picture.
+
+## The process
+
+<Mermaid chart={`flowchart TD
+  A[parse argv] --> B[read file]
+  B --> C{looks_like_module?}
+  C -- import/export found --> D[tsc_modules::compile_graph]
+  C -- plain script --> E[tsc_parser::compile]
+  D --> F{--dump-bytecode?}
+  E --> F
+  F -- yes --> G[print disassembly, exit 0]
+  F -- no --> H[tss_parallel::configure workers]
+  H --> I[StatsExport thread: $TMPDIR/tscore-stats-pid.txt every 500 ms]
+  I --> J[spawn tscore-main thread, 64 MB stack]
+  J --> K[Realm::new + install natives]
+  K --> L{module graph?}
+  L -- yes --> M[tsr_modules::run_program]
+  L -- no --> N[interp::run_main]
+  M --> O[join]
+  N --> O
+  O --> P{--stats?}
+  P -- yes --> Q[print summary to stderr]
+  P -- no --> R{result}
+  Q --> R
+  R -- Ok --> S[exit 0]
+  R -- Err --> T[file:line:col: runtime error, exit 1]`} />
+
+Notes on the steps (`cli/src/main.rs`):
+
+1. **Module detection is textual.** A word-boundary scan for `import`/`export` picks the graph compiler; nothing else about the file is inspected first.
+2. **Worker count is fixed before any thread exists.** `configure(workers)` is first-call-wins. If an observer thread reached the pool first it would lock in the machine's CPU count and `--workers` would be ignored, so the CLI does it up front.
+3. **The program runs on its own thread.** 64 MB of stack gives the interpreter about 10,000 nested calls. The main OS thread only waits and prints the summary.
+4. **Natives are installed in a fixed order** into the realm's globals: `console`/`Math`/`Date`/`performance`/`sleep`, then `parallel` + `runtime.{cpu,gc,stats}`, `actor`, `task` + `Runtime`, `Channel`, module support, `runtime.fs`/`bytes`, `runtime.net`/`http`. A scratch realm or actor realm installs a subset of the same list.
+5. **Runtime errors are attributed** to the module they came from, not the entry file, using the span and source carried on the error.
+
+## Compilation is lazy
+
+At startup the whole file is parsed (so syntax errors are always immediate) and the resolver builds scopes, capture sets and mutation sets. But only the top level and function **signatures** are emitted to bytecode. A function's body is a `FunctionProto` header with an empty slot until the first call.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> Header: startup emit, arity + upvalue table + source span
+  Header --> Filled: first call, re-parse the snippet, emit with capture table
+  Header --> Filled: about to cross a realm, force fill in clone_out
+  Filled --> Filled: every later call, one Acquire load`} />
+
+Filling re-parses the retained source slice for that one function, injects its capture table as an outer scope, runs the emitter and optimizer, and stores the body in a `OnceLock`. Nested functions inside a filled body are emitted eagerly within that fill, so laziness is one level deep per call, the same policy JavaScriptCore uses. `TSC_NO_LAZY=1` fills everything at startup.
+
+For large files made of top-level functions, the **parallel frontend** parses a copy of the file with every body blanked to spaces (spans stay valid) on the main thread while workers parse the real bodies. Any top-level `let`/`const`/`class` or scanner doubt falls back to the serial path. Measured: a 50k-line file goes from read to first instruction in about 7 ms.
+
+## Execution: the event loop
+
+The entry file is compiled as an async function, so `run_main` starts it as a coroutine and then **drives** the realm's event loop until the main promise settles (`runtime/realm/src/interp.rs`, `drive_inner`).
+
+<Mermaid chart={`flowchart TD
+  A[drain microtasks: resume ready coroutines] --> B[drain wake channel: timers, chunks, actor replies, channels, I/O]
+  B --> C{microtasks refilled?}
+  C -- yes --> A
+  C -- no --> D{main promise}
+  D -- fulfilled --> E[return Ok]
+  D -- rejected --> F[return Err]
+  D -- pending --> G{external_pending == 0?}
+  G -- yes --> H[error: deadlock, pending promises that nothing can settle]
+  G -- no --> I{pool busy and idle_helper set?}
+  I -- yes --> J[help_until wake channel non-empty: run pool jobs inline]
+  I -- no --> K[block on wake_rx.recv]
+  J --> A
+  K --> A`} />
+
+Key facts:
+
+- **A wake is a cross-thread completion.** Every promise that will be settled from another thread (timer, chunk, actor reply, channel hand-off, I/O) is created with `Realm::promise_pair()`, which hands out a `Completer` and bumps `external_pending`. When the completer settles, a `Wake { promise, result }` goes down a crossbeam channel to the owning realm; `process_wake` rehydrates the portable result, settles the promise and unpins it.
+- **Deadlock is detected, not waited out.** If nothing is runnable and no completer is outstanding, the program fails instead of hanging.
+- **The main thread helps.** With work in the pool and nothing else to do, the realm thread executes pool jobs itself. At `--workers 1` the pool has zero threads, so this is how parallel work runs at all.
+- **Every realm has its own loop.** Parallel chunks, scope children and actors run the same `drive` on their own realm, which is how an `async` callback inside `parallel.map` completes.
+
+## Execution: safepoints
+
+Two places in the interpreter call `Realm::safepoint()`: a backward `Jump` (a loop back-edge) and a `Call` whose callee is a closure (`interp.rs`). Everything that must interrupt the program happens there, and only there:
+
+<Mermaid chart={`flowchart LR
+  A[safepoint] --> B{cancel flag set?}
+  B -- yes --> C[raise task cancelled]
+  B -- no --> D{heap.needs_gc?}
+  D -- yes --> E[maybe_gc: minor or major]
+  D -- no --> F{OOM pending?}
+  E --> F
+  F -- yes --> G[raise memory limit error]
+  F -- no --> H[continue]`} />
+
+`needs_gc` is true when the allocation counter passes the threshold (256k allocation events, raised to half the live set after a major) or the nursery passes its byte limit (16 MB). Straight-line code between safepoints is never interrupted, which is also the moving-GC invariant: no object reference may live in a Rust local across a safepoint.
+
+## Execution: JIT tiers
+
+Compiled code is per `FunctionProto` and shared by every realm that runs it (`runtime/realm/src/jit.rs`).
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> COLD
+  COLD --> COLD: call, record argument types
+  COLD --> COMPILING: 50th call, TSC_JIT_THRESHOLD
+  COMPILING --> OPT: Tier-2, type analysis proved numeric
+  COMPILING --> BASELINE: Tier-1 templates
+  COMPILING --> REJECTED: not compilable
+  OPT --> BASELINE: 10 deopts, recompile down
+  OPT --> OPT: entry guard fails, deopt to interpreter at pc 0
+  BASELINE --> BASELINE: helper call for anything not inlined`} />
+
+- **Tier-up** is a call counter on the proto. When it hits the threshold, a compare-and-swap moves the proto to `COMPILING` and the caller compiles synchronously. Tier-2 is tried first (`tsc-types` must prove the numeric dataflow, and the function must be free of async, upvalues, string/object ops and calls); otherwise Tier-1; otherwise `REJECTED` and the function stays interpreted forever.
+- **OSR** (on-stack replacement) fires at the 10,000th back-edge of a loop still running in the interpreter (`TSC_OSR_THRESHOLD`). Tier-1 keeps every register in its stack slot, so any loop header is a valid entry point. A failed OSR compile disables OSR for that proto permanently.
+- **Deopt** returns control to the interpreter at a given pc with the stack intact. Ten deopts from Tier-2 demote the function to Tier-1.
+- **Async functions never compile.** Their frames must be snapshotted on `await`.
+
+See [Type annotations and the JIT](/docs/language/type-annotations-and-jit) for how to write code that reaches Tier-2.
+
+## Exit
+
+When the main promise settles, `run_main` publishes the realm's GC and heap counters to the stats hub, the thread returns, and the CLI prints the `--stats` summary if asked. The stats-export file is removed by its `Drop`. Actor threads that are still running are not waited for: a program that never calls `stop()` exits when main finishes.

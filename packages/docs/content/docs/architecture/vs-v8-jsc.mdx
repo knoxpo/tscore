@@ -1,0 +1,201 @@
+---
+title: "Compared to V8 and JSC"
+description: "Execution tiers, values, heaps, GC, threading and type information, side by side with the engines in Node and Bun, then measured."
+---
+
+V8 (Node) and JavaScriptCore (Bun, Safari) are twenty-year-old engines with concurrent collectors, four-tier JITs and full ECMAScript. TypeScript Core is a research runtime that gives up most of that to make one bet: **parallelism is a language-level primitive, and the runtime owns the heaps.** This page lays the three designs side by side, says plainly where tscore is behind, and ends with measurements.
+
+Engine facts for V8 and JSC come from their public design documentation (the V8 blog and docs; the WebKit blog for JSC) and describe the versions on the benchmark board: Node 24.17 and Bun 1.4.0. tscore facts come from this repository.
+
+## Execution model
+
+<Mermaid chart={`flowchart LR
+  subgraph V8
+    v1[Ignition interpreter] --> v2[Sparkplug baseline] --> v3[Maglev mid-tier] --> v4[TurboFan optimizing]
+  end
+  subgraph JSC
+    j1[LLInt interpreter] --> j2[Baseline JIT] --> j3[DFG] --> j4[FTL via B3]
+  end
+  subgraph tscore
+    t1[register interpreter] --> t2[Tier-1 templates] --> t3[Tier-2 typed, unboxed]
+  end`} />
+
+| | V8 | JSC | tscore |
+|---|---|---|---|
+| Interpreter | Ignition, register-based bytecode | LLInt, offline-assembled | Register machine, Lua-style 32-bit ops |
+| Tiers above it | 3 | 3 | 2 |
+| What drives tier-up | invocation + loop counters, feedback vectors | execution counters | call counter (50) and back-edge counter (10,000) per function |
+| Speculation source | runtime type feedback | runtime type feedback | TypeScript annotations seed a forward dataflow; feedback only guards entry |
+| OSR | into every tier | into every tier | into Tier-1 only |
+| Deopt | to interpreter, feedback updated | to lower tier | to interpreter at the guarded pc; 10 deopts demotes to Tier-1 |
+| Async functions | compiled like anything else | compiled like anything else | interpreted, never compiled |
+| Calls in optimized code | inlined, direct | inlined, direct | Tier-2 excludes calls; Tier-1 excludes calls inside loops |
+| Target ISAs | x64, ARM64, and more | x64, ARM64, and more | ARM64 only, hand-rolled encoder |
+
+The honest reading: V8 and JSC will beat tscore per core on any code that is object-heavy, call-heavy or polymorphic, because they have inlining, escape analysis, broad inline caches and years of tuning. tscore's typed tier matches or beats them on annotated `f64` leaf kernels, and that is the only per-core claim it makes. See [Type annotations and the JIT](/docs/language/type-annotations-and-jit).
+
+## Value representation
+
+| | V8 | JSC | tscore |
+|---|---|---|---|
+| Scheme | pointer tagging: Smi (31/32-bit int) or tagged heap pointer; doubles boxed unless unboxed by the optimizer | NaN-boxing: doubles inline, 32-bit ints inline, pointers in the NaN space | NaN-boxing: doubles inline; everything else is a 16-bit tag + 32-bit arena index |
+| Pointer size | 32-bit compressed pointers inside a 4 GB cage | 64-bit | 32-bit arena index (`Ref`), not a pointer |
+| Heap reference validity | anywhere in the isolate | anywhere in the VM | **only inside the owning realm** |
+
+Because a tscore `Ref` is an index, not an address, arenas can be reallocated and the nursery can be evacuated without patching pointers scattered through native frames; compiled code reads the arena base from a per-realm table. It also means a reference is meaningless in another realm, which is enforced by construction rather than by a rule. Details: [Heap and values](/docs/memory/heap).
+
+## Heap model and threads
+
+<Mermaid chart={`flowchart TD
+  subgraph N[V8 in Node / JSC in Bun]
+    I1[isolate: one heap] --- T1[main thread + event loop]
+    I2[worker isolate: own heap] --- T2[worker thread]
+    I1 -. postMessage: structured clone .- I2
+    I1 -. SharedArrayBuffer + Atomics: the only shared memory .- I2
+  end
+  subgraph S[tscore]
+    M[main realm heap] --- MT[tscore-main thread]
+    C1[scratch realm, no GC] --- P[pool worker]
+    C2[scratch realm, no GC] --- P2[pool worker]
+    A1[actor realm] --- AT[actor thread]
+    M -. PortableValue clone, automatic .- C1
+    M -. PortableValue clone, automatic .- C2
+    M -. PortableValue clone via mailbox .- A1
+  end`} />
+
+| | V8 / Node | JSC / Bun | tscore |
+|---|---|---|---|
+| Heaps per process | one per isolate; workers are isolates | one per VM; workers are VMs | one per **realm**; a realm is a task, a chunk, or an actor |
+| Who creates threads | you (`new Worker`) | you (`new Worker`) | the runtime; `parallel.map` never exposes a thread |
+| Heap lifetime | isolate lifetime | VM lifetime | scratch realms live for one task and are dropped whole |
+| Shared memory | `SharedArrayBuffer` + `Atomics` | same | none; channels and sockets share a core through a handle, not memory |
+| Data crossing | `postMessage` structured clone, or transfer | same | `PortableValue` structured clone, applied by the runtime at every boundary |
+| Event loop | libuv, one per isolate | own loop per VM | one per realm, including inside chunks and actors |
+| Cancellation | none; terminate the worker | none | cooperative flag checked at safepoints, cascades through scopes |
+
+The design difference is where the boundary sits. Node and Bun draw it around a whole worker that you manage; tscore draws it around every unit of work and manages it for you. The price is a clone at every crossing, and the measurements below show what that costs.
+
+## Garbage collection
+
+| | V8 (Orinoco) | JSC (Riptide) | tscore |
+|---|---|---|---|
+| Generational | yes: semi-space young generation (Scavenger), old generation | yes: **sticky mark bits**, no separate young space | yes: **sticky mark bits** for the old generation plus a **copying nursery** |
+| Moving | young: copying; old: mark-compact | non-moving | old: non-moving; nursery: evacuated on minor |
+| Concurrency | concurrent marking, parallel scavenge and compaction, incremental marking | fully concurrent marking on a collector thread with a retreating wavefront | **none**: stop-the-realm; but realms collect independently and scratch realms never collect |
+| Stack scanning | precise | conservative | precise (interpreter registers are the roots) |
+| Write barrier | generational + incremental marking barriers | generational + concurrent-marking barrier | generational only: `if old && !dirty { remember }` on container stores |
+| Minor trigger | semi-space full (1–8 MB, adaptive) | allocation bytes since last collection | nursery bytes ≥ 16 MB, or 256k allocation events |
+| Major trigger | heap growth heuristics | allocation bytes and heap growth | promoted slots/bytes since last major exceed half the live set (with an anti-thrash multiplier), or remembered set > 32k |
+| Memory limit | `--max-old-space-size`, OOM aborts the process | per-VM limits | `--max-heap` per realm, raises a catchable-by-isolation runtime error at a safepoint |
+
+The family resemblance to JSC is real: both use sticky mark bits so that "old" is a bit on the object rather than a separate space. tscore adds a copying nursery on top so that short-lived garbage is never even swept. What tscore lacks is any concurrent phase; a big main-realm major pauses that realm. What makes that tolerable is the realm model: the pause never touches an actor or a parallel chunk, and the hot parallel path allocates in scratch realms that are freed by dropping them. See [Garbage collection](/docs/memory/gc).
+
+## Parallelism model
+
+| | V8 / Node | JSC / Bun | tscore |
+|---|---|---|---|
+| Primitive | `worker_threads`, `postMessage` | `Worker`, `postMessage` | `parallel.map`, `task.scope`, `actor`, `Channel` |
+| Scheduling | you build a pool; the OS schedules threads | same | work-stealing pool, one pinned thread per core, LIFO deques, global injector |
+| Unit of work | a worker script | a worker script | a chunk of an array (8 × workers chunks), a scope child, a message |
+| Partitioning | manual | manual | automatic, with stealing to absorb skew |
+| Determinism | up to you | up to you | guaranteed for `parallel.map`: identical output at any worker count |
+| Backpressure | none built in | none built in | bounded actor mailboxes and channels block the sender |
+| Structured concurrency | none | none | scopes cannot exit with children running; errors cancel siblings |
+
+V8 and JSC are not slow at message passing; the measurements below show their per-message cost is competitive at small payloads. What they lack is a runtime that partitions, schedules, steals and clones for you, so in practice most Node and Bun programs never use their other cores. See [How parallelism works](/docs/architecture/parallelism).
+
+## Type information
+
+| | V8 / JSC | tscore |
+|---|---|---|
+| Source of types | observed at runtime through inline caches and feedback vectors | TypeScript annotations, stripped for semantics but kept as facts for the JIT |
+| Trust | speculative, guarded everywhere, deoptimise on surprise | proved by dataflow from annotated parameters; guarded only at function entry |
+| TypeScript itself | erased before the engine sees it | parsed by the runtime's own front end (oxc) |
+
+This is the one place where tscore has information the big engines do not. A `function f(x: number)` is a contract the runtime can check once at entry and then compile without tag checks. V8 and JSC must discover the same fact by running the function and watching.
+
+## What tscore does not have
+
+Listed so the comparison is not read as a claim of parity:
+
+- Full ECMAScript. A defined [subset](/docs/language/supported-subset): no classes, no exceptions, no `Map`/`Set`, no destructuring.
+- Concurrent or incremental GC. Majors are stop-the-realm.
+- Heap compaction. Fragmentation is handled by free lists, not by moving.
+- Inlining, escape analysis, or a mid-tier. Two tiers, calls excluded from the top one.
+- x64 or any target other than ARM64.
+- A standard library, npm, or Node API compatibility.
+- Twenty years of security hardening. Do not run untrusted code on it.
+
+## Measured
+
+Three probes written for this page, each isolating one architectural question, plus the relevant rows from the main board. Apple M5 Max (6P + 12E), tscore 0.1.0, Node 24.17.0, Bun 1.4.0, run 2026-09-06. Median of 5 runs after a discarded warm-up; pools and workers created and warmed before timing. The Node and Bun variants use `worker_threads` and `postMessage`, which is the idiomatic way to reach other cores there. Sources and runner: `benchmarks/compare/arch/`; raw board: [RESULTS.md](https://github.com/knoxpo/typescript-core/blob/main/benchmarks/compare/arch/RESULTS.md).
+
+### Fan-out: what it costs to hand work to other cores
+
+N trivial items (`x + 1`) dispatched and collected. tscore: `parallel.map`. Node/Bun: a warmed pool of 18 workers, one `postMessage` round trip per item. Milliseconds per batch.
+
+| items | tscore | node | bun |
+|---|---|---|---|
+| 8 | 0.19 | **0.13** | **0.09** |
+| 64 | **0.25** | 0.48 | 0.33 |
+| 512 | **0.44** | 2.5 | 1.8 |
+| 4,096 | **0.52** | 19.4 | 12.7 |
+
+Reading: Node and Bun pay per message (about 5 µs and 3 µs each), so cost grows linearly with items. tscore pays per **chunk** (at most 8 × workers chunks regardless of N), so cost is flat. At 8 items tscore is slower: it is creating up to 8 scratch realms for 8 additions. The crossover is around a few dozen items. Neither engine's per-message cost is bad; the difference is that tscore's runtime batches for you.
+
+### Pause detector: how long the program stops under allocation pressure
+
+Same file on all three engines. Build a 1M-object live set, then allocate an object, an array and a string per iteration for 5 seconds, timestamping every 1,000 iterations. The largest gap is the longest stop for any reason.
+
+| | tscore | node | bun |
+|---|---|---|---|
+| longest stall | **4.0 ms** | 11.5 ms | 4.8 ms |
+| p99 gap | 0.10 ms | 0.10 ms | 0.10 ms |
+| p99.9 gap | 2.4 ms | **0.10 ms** | 0.40 ms |
+| iterations completed in 5 s | 130 M | **1,109 M** | 726 M |
+
+Reading, and it cuts both ways:
+
+- tscore's **worst** pause is the shortest: no compaction, no full-heap marking on the young path, and minors are O(live young). Node's worst case is a mark-compact of the old generation.
+- tscore pauses **more often**: the p99.9 row shows a 16 MB nursery evacuating roughly every 2.4 ms of this workload, while V8's concurrent marking keeps almost every gap under the timer resolution.
+- tscore ran this loop **8.5× slower** than V8 per core. The loop is object + array + template-string allocation in Tier-1 code, which is exactly the object-heavy profile the main board already shows tscore losing on. A shorter worst-case pause is not a substitute for throughput; on this workload V8 does more work between its pauses than tscore does in total.
+
+### Payload: what crossing a heap boundary costs by size
+
+One nested object (`{ id, name, tags: [3 numbers] }` × N) sent to another realm or thread and echoed back. Milliseconds per round trip.
+
+| items (≈ bytes) | tscore | node | bun |
+|---|---|---|---|
+| 10 (≈ 1 KB) | 0.057 | **0.026** | **0.026** |
+| 1,000 (≈ 100 KB) | **0.39** | 0.81 | 0.65 |
+| 100,000 (≈ 10 MB) | **41** | 84 | 93 |
+
+Reading: per-crossing overhead favours V8 and JSC (a scratch realm costs more to set up than a `postMessage`), per-byte cost favours tscore's `PortableValue` clone by about 2× in both directions. Above roughly 10 KB the runtime's clone is the cheaper way to move data between cores.
+
+### From the main board
+
+Rows from [Results](/docs/benchmarks/results) that bear on the same questions, same machine, board of 2026-09-06:
+
+| | tscore | node | bun |
+|---|---|---|---|
+| startup, hello world | **2.1 ms** | 43.2 ms | 5.8 ms |
+| channel, 100k messages (vs worker `postMessage`) | **5.3 ms** | 36.8 ms | 30.2 ms |
+| mandelbrot, 8 workers (`parallel.map` vs `worker_threads`) | **4.1 ms** | 23.9 ms | 17.5 ms |
+| primes, 8 workers | **12.4 ms** | 27.2 ms | 15.4 ms |
+| objects, single core, shared source | 109.3 ms | 25.7 ms | **24.2 ms** |
+| gc_churn, single core, shared source | 213.7 ms | 58.3 ms | **46.4 ms** |
+
+### Summary
+
+| Question | Answer from the data |
+|---|---|
+| Per-core speed on object-heavy code | V8 and JSC, by 3–5×. |
+| Per-core speed on annotated numeric leaf kernels | tscore matches Node; see [the real-world example](/docs/getting-started/real-world). |
+| Cost to use other cores at all | tscore, by 10–40× at realistic fan-out sizes, and with no code to write. |
+| Cost per byte crossing a heap boundary | tscore, by about 2×; V8/JSC win on tiny payloads. |
+| Worst-case pause | tscore, by 3× over V8, roughly even with JSC. |
+| Pause frequency and allocation throughput | V8, clearly. |
+| Startup | tscore, by 20× over Node. |
+
+The honest one-line version: tscore is the runtime you want when the work is parallel, numeric, or latency-bound; it is not yet the runtime you want for a single-threaded object-heavy program.
+

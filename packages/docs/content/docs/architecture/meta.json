@@ -1,1 +1,1 @@
-{ "title": "Architecture", "pages": ["overview", "crates", "embedding"] }
+{ "title": "Architecture", "pages": ["overview", "lifecycle", "parallelism", "crates", "embedding", "vs-v8-jsc"] }

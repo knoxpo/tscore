@@ -57,6 +57,18 @@ const store = actor(() => {
 });
 ```
 
+<Mermaid chart={`sequenceDiagram
+  participant C as caller
+  participant A as actor thread
+  C->>A: actor(setup): clone setup, spawn thread, wait for ready
+  C->>A: post: Deliver(msg, none)
+  C->>A: send: Deliver(msg, completer)
+  A->>A: one message at a time: rehydrate, dispatch on type, run handler
+  A-->>C: send reply settles the promise, post errors go to stderr
+  C->>A: stop`} />
+
+Mechanism in depth: [How parallelism works](/docs/architecture/parallelism#actors-a-realm-with-a-mailbox).
+
 ## What an actor can use
 
 Actor realms have the full API: `parallel.*`, `task.scope`, `Channel`, `sleep`, `runtime.*`, and `actor` itself, so actors can spawn actors.

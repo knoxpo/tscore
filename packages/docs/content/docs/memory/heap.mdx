@@ -1,0 +1,108 @@
+---
+title: "Heap and values"
+description: "NaN-boxed values, arena heaps per realm, and the PortableValue that moves data between them."
+---
+
+## A value is 64 bits
+
+Every value in the interpreter, in JIT registers and in the heap is one `u64`, NaN-boxed (`runtime/memory/src/lib.rs`). A number is stored as its own IEEE-754 bits; everything else lives in the space of quiet NaNs, selected by the top 16 bits.
+
+| Top 16 bits | Kind | Low 32 bits (payload) |
+|---|---|---|
+| `< 0xFFF9` | number | the `f64` itself; NaN is canonicalised to `0x7FF8…` |
+| `0xFFF9` | special | `0` null, `1` undefined, `2` false, `3` true, `4`–`7` JIT sentinels (error, await, TDZ), `≥ 8` foreign ref + 8 |
+| `0xFFFA` | string | `Ref` into the string arena |
+| `0xFFFB` | object | `Ref` into the object arena |
+| `0xFFFC` | array | `Ref` into the array arena |
+| `0xFFFD` | closure | `Ref` into the closure arena |
+| `0xFFFE` | cell | `Ref` into the cell arena (captured mutable variable) |
+| `0xFFFF` | native | index into the realm's native-function table |
+
+Consequences:
+
+- A number's `Value` bits **are** its `f64` bits, so Tier-2 can hold a value in a `d` register and do arithmetic on it with no unboxing.
+- A `Ref` is a `u32` index into one arena of one realm. It does not encode its kind (the tag does) and it means nothing in any other realm.
+- Bit 31 of a `Ref` is the **young bit**: set when the object lives in the nursery. Only objects, arrays and strings can be young; closures, cells and foreigns are always allocated old because raw references to them sit in JIT registers and cross-thread completers, where a moving collector could not update them.
+
+## A realm's heap
+
+<Mermaid chart={`flowchart LR
+  subgraph OLD[old generation, non-moving arenas]
+    S[strs]
+    O[objs]
+    A[arrs]
+    C[closures]
+    L[cells]
+    F[foreigns]
+  end
+  subgraph META[per-arena GenState]
+    B1[old bitmap]
+    B2[dirty bitmap]
+    B3[young log]
+  end
+  subgraph N[nursery, bump-allocated, 16 MB]
+    NO[objs]
+    NA[arrs]
+    NS[strs]
+  end
+  FL[free lists per arena] --> OLD
+  RS[remembered set: old containers with a dirty bit] --> OLD
+  RP[rope side-arena for string concatenation] --> S
+  JB[JIT base pairs: old ptr, nursery ptr] --> O
+  JB --> A
+  N -- minor GC evacuates survivors --> OLD
+  OLD --- META`} />
+
+- **Six arenas**, each a `Vec` of its kind plus a free list. Slot indices are stable for the life of the object; the old generation never moves anything.
+- **Nursery.** New objects, arrays and strings are pushed onto the nursery's own `Vec`s; allocation is a push and a byte counter. When the counter passes `TSC_NURSERY_BYTES` (16 MB default) a minor collection evacuates survivors into the old arenas and truncates the nursery. Backing buffers of dead nursery slots are salvaged into a pool for reuse.
+- **Generation bits.** Each arena has an `old` bitmap (survived a collection), a `dirty` bitmap (already in the remembered set) and a young log. The write barrier is `if old && !dirty { mark dirty; push to remembered }`, executed only on container stores. Arithmetic never pays for it.
+- **Ropes.** Concatenation above `TSC_ROPE_LIMIT` builds a rope node in a side arena instead of copying; ropes are flattened at the start of every collection.
+- **JIT base pairs.** Inline field and index reads in compiled code select the old or nursery arena base with one shifted load from a two-entry table, refreshed whenever the arenas move in memory.
+
+### Objects
+
+An `Obj` is a pointer to a shared **shape** (the ordered field list, interned) plus three inline value slots and an overflow `Vec`. Objects that share a literal site share a shape, which is what the Tier-1 inline cache compares against. Module namespace objects carry three hidden pad fields so their exports live in overflow slots, keeping the live-binding indirection out of the inline fast path.
+
+### Arrays and strings
+
+Arrays are `Vec<Value>` with JavaScript index semantics enforced at access (`arr[-1]` and `arr[1.5]` read `undefined`). Strings are immutable UTF-8 with field names interned per realm. `charCodeAt` is the only string method; comparison and concatenation are operators.
+
+### Foreigns
+
+Promises, coroutines (suspended async frames) and shared handles (channels, sockets, byte buffers) live in the foreign arena, referenced from the special tag. A shared handle is an `Arc` to a core that several realms may hold at once; this is how a channel is "portable" without copying.
+
+## Realm kinds and memory limits
+
+| Realm | Collected | Limit |
+|---|---|---|
+| main | yes | `--max-heap MB` |
+| actor | yes | `actor(setup, { maxHeap: bytes })` |
+| scratch (parallel chunk, scope child) | no; dropped whole | none |
+
+Live bytes are estimated during a major collection: string bytes + 24, object 72 + 8 per overflow field, array 32 + 8 per element, closure 32 + 8 per upvalue, cell 8, foreign 96. Crossing the limit raises a runtime error at the next safepoint.
+
+## PortableValue: how data leaves a realm
+
+The only path between heaps is `clone_out` into a realm-independent tree and `rehydrate` into the destination (`runtime/task/src/portable.rs`).
+
+```rust
+enum PortableValue {
+    Number(f64), Bool(bool), Null, Undefined,
+    Str(Arc<str>),
+    Array(Vec<PortableValue>),
+    Object(Vec<(Arc<str>, PortableValue)>),
+    Closure { proto: Arc<FunctionProto>, upvals: Vec<PortableValue> },
+    Handle(&'static str, Arc<dyn Any + Send + Sync>),
+}
+```
+
+Rules enforced by `clone_out`:
+
+- **Deep copy, cycles rejected.** A per-path visiting set keyed by `(kind, ref)` catches cycles with `cannot capture cyclic data across realms`. Shared sub-trees (a DAG) are allowed and duplicated.
+- **Closures carry their environment.** Captured cells are dereferenced to their current value; the proto's body is force-filled so the destination thread never compiles. Code is `Arc`-shared, never copied.
+- **Handles travel by core.** An object whose `__`-prefixed field points at a shared handle becomes `Handle(kind, arc)` and rehydrates as a fresh wrapper around the same core. Channels, sockets and byte buffers cross this way.
+- **Rejected:** bare cells, promises, coroutines, freed foreigns, native functions, actor and scope handles. The error names the offending value.
+
+`rehydrate` allocates realm-local copies; captured values are re-wrapped in cells except where the proto's upvalue table says Tier-2 reads them by value.
+
+This is the same shape as the structured clone that `postMessage` performs in a browser or Node worker, made the single mechanism for every boundary. See [How parallelism works](/docs/architecture/parallelism) for where it is invoked and the [comparison page](/docs/architecture/vs-v8-jsc#measured) for what it costs at various payload sizes.

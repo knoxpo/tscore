@@ -22,6 +22,16 @@ Consequences you can rely on:
 - **No shared mutation.** Assigning to a captured object inside `fn` changes the chunk's private copy. It never leaks to the caller or to other chunks. If you need to accumulate, return values and reduce them after, or send through a [Channel](/docs/concurrency/channels).
 - **Cost model.** Cloning is proportional to captured data plus the chunk. Keep captures small; pass big data as `items`.
 
+<Mermaid chart={`sequenceDiagram
+  participant M as caller realm
+  participant W as pool worker
+  M->>M: clone captures + items
+  M->>W: chunk jobs (8 × workers)
+  W->>W: scratch realm, rehydrate, run, clone results
+  W-->>M: last chunk settles the promise`} />
+
+Full walkthrough with the scheduler: [How parallelism works](/docs/architecture/parallelism).
+
 ## Partitioning
 
 The input is split statically into 8 × workers chunks; work stealing absorbs skew. There is no minimum chunk size because per-chunk overhead is microseconds. If you see a worker starving on extremely skewed inputs, split the items yourself into more, smaller units.

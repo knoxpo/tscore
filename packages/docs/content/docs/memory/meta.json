@@ -1,1 +1,1 @@
-{ "title": "Memory", "pages": ["gc"] }
+{ "title": "Memory", "pages": ["heap", "gc"] }

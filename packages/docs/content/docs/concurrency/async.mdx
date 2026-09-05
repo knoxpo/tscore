@@ -46,6 +46,15 @@ Every realm (main, each parallel chunk, each scope child, each actor) runs its o
 3. If the realm's main promise has settled, finish.
 4. Otherwise, if no external completion is outstanding, fail with a **deadlock error**. If one is, help the work-stealing pool while waiting.
 
+<Mermaid chart={`flowchart TD
+  A[drain microtasks] --> B[drain wake channel]
+  B --> C{main settled?}
+  C -- yes --> D[done]
+  C -- no --> E{nothing external pending?}
+  E -- yes --> F[deadlock error]
+  E -- no --> G[help the pool, or block on the wake channel]
+  G --> A`} />
+
 Because chunk and actor realms run their own loops, an `async` callback in `parallel.map` or an `async` actor handler drives itself to completion locally.
 
 ## Timer precision

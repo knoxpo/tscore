@@ -1,0 +1,110 @@
+---
+title: "How parallelism works"
+description: "The mechanism under parallel.map, task.scope and actor: realms, clone at spawn, work stealing, mailboxes."
+---
+
+The API surface is small: `parallel.map`, `task.scope`, `actor`, `Channel`. Under it is one idea applied three ways: **a unit of work owns its heap, and data enters or leaves that heap only by structured clone.** No shared JavaScript heap exists anywhere in the runtime, so there are no locks in the memory system, no write-barrier traffic between threads, and no way for a callback to observe another core's mutations.
+
+## Three kinds of realm
+
+| Realm | Created by | Heap | GC | Thread |
+|---|---|---|---|---|
+| **Main** | `tscore run` | full | generational, described in [GC](/docs/memory/gc) | `tscore-main`, 64 MB stack |
+| **Scratch** | each `parallel.map` chunk, each `scope.spawn` child | bump-allocated | **off**; the whole arena is dropped when the task ends | whichever pool worker picked the task up |
+| **Actor** | each `actor()` call | full | generational, independent of main | dedicated `tscore-actor` thread, 32 MB stack |
+
+A scratch realm is the cheapest possible heap: allocate by pushing, never collect, free everything in one `drop`. This is why the hot parallel path never runs GC at all.
+
+## parallel.map, step by step
+
+<Mermaid chart={`sequenceDiagram
+  participant M as Main realm
+  participant P as Pool (injector + deques)
+  participant W as Worker thread
+  M->>M: clone_out(callback captures), clone_out(each item)
+  M->>M: chunk = ceil(n / (8 × workers))
+  M->>P: submit one job per chunk into a Batch
+  M->>M: return promise, back to event loop
+  P->>W: worker pops or steals a job
+  W->>W: Realm::new, gc off, inherit cancel flag
+  W->>W: install console/Math/Channel/parallel
+  W->>W: rehydrate callback + items
+  W->>W: call_value(fn, item, index) per item
+  W->>W: settle_if_promise: drive this realm's loop if fn was async
+  W->>W: clone_out(result) into shared results Vec
+  W-->>M: last chunk to finish settles the Completer
+  M->>M: wake arrives, results rehydrated in input order, promise fulfilled`} />
+
+Source: `std/parallel/src/lib.rs` (`run_parallel`, `run_chunk`).
+
+What that buys and costs:
+
+- **Determinism.** Results land by index, chunks cannot see each other, and every chunk starts from an identical clone of the captures. Output is byte-identical at any worker count; the golden tests assert it at 1 and 4 workers.
+- **Clone cost is proportional to captures + items + results.** A callback that closes over a 10 MB table pays for 10 MB per chunk. Pass large data as items, or restructure so each chunk gets its slice.
+- **No minimum chunk size.** Scratch-realm setup and a clone are microseconds, so over-chunking is cheaper than starving a worker. 8 × workers chunks with stealing absorbs moderate skew.
+- **Errors.** The first chunk error is recorded, a `failed` flag stops the others at their next safepoint, and the promise rejects with that error.
+- **Cancellation.** Chunks inherit the parent task's cancel flag and check it at safepoints, so cancelling a scope child cancels the parallel work inside it.
+
+## The work-stealing pool
+
+`Pool::new(n)` spawns **n − 1** OS threads; the caller of a batch is the n-th executor, which is why `--workers 1` is truly serial and spawns nothing. Each worker owns a Chase-Lev deque (crossbeam), there is one global injector, and stealers for every deque are shared. Workers are pinned to performance cores on macOS through the platform layer's QoS hints. (`runtime/scheduler/src/lib.rs`)
+
+<Mermaid chart={`flowchart TD
+  A[find_job] --> B{own deque pop, LIFO}
+  B -- job --> R[run it]
+  B -- empty --> C{global injector steal}
+  C -- job --> R
+  C -- empty --> D{steal from other deques, round-robin from self×31+7}
+  D -- job --> R
+  D -- empty --> E[park on condvar, 100 ms timeout, recheck on notify]
+  E --> A
+  R --> A`} />
+
+- **LIFO locally, FIFO when stolen.** The owner pops the job it most recently pushed (cache-warm); thieves take the oldest (largest remaining work).
+- **Parking is cheap to skip.** `notify()` only takes the lock when the sleeper count is non-zero, so a saturated pool never touches the condvar.
+- **The realm thread helps.** `help_until(done)` runs jobs inline and parks only 200 µs at a time, so a `join()` or a busy event loop keeps a core working.
+- **Nested parallelism shares the pool.** A `parallel.map` inside a chunk pushes into the running worker's own deque; there is one pool per process.
+
+Counters (`runtime.stats()` and `tscore run --stats`): `tasksExecuted`, `steals`, `submits`, `parks`.
+
+## Structured concurrency on the same pool
+
+`scope.spawn(fn)` is a single-item version of a chunk: clone `fn`, submit one job, return a handle. `handle.join()` calls `help_until(child done)`, so joining a child is never idle waiting. The scope holds a `Batch` and cannot return until the batch count reaches zero; the first failure records the error, sets every child's cancel flag, and the scope re-raises after the children have stopped. Details on the user-facing page: [Structured concurrency](/docs/concurrency/structured-concurrency).
+
+## Actors: a realm with a mailbox
+
+An actor is not on the pool. It is a realm on its own OS thread that drains a bounded channel. (`runtime/actor/src/lib.rs`)
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Caller realm
+  participant T as Actor thread
+  C->>C: clone_out(setup closure)
+  C->>T: spawn tscore-actor, 32 MB stack, bounded mailbox (1024)
+  T->>T: Realm::new, install console/actor/Channel/parallel/task
+  T->>T: rehydrate setup, run it, root the handler object
+  T-->>C: ready (or setup error)
+  C->>T: post: Deliver(msg, None)
+  C->>T: send: Deliver(msg, Some(completer))
+  loop one message at a time, in order
+    T->>T: rehydrate msg, pick handler by msg.type, call
+    T->>T: settle_if_promise if the handler is async
+    T-->>C: send: completer.settle(clone_out(result)) or the error
+    T->>T: post: error logged to stderr, actor continues
+  end
+  C->>T: stop: Msg::Stop
+  T->>T: drain, drop realm, thread exits`} />
+
+- **Sequential per actor, parallel across actors.** The drain loop is a blocking `recv()`; nothing about an actor is shared with any other thread except the channel.
+- **Backpressure.** A full mailbox blocks `post`/`send` in the caller.
+- **Isolation of failure.** A handler error becomes the reply to `send` (so it re-raises at the caller's `await`) or a log line for `post`. The actor thread never dies from a handler error.
+- **Handles are realm-local.** The `send`/`post`/`stop` natives capture the channel sender; they cannot be cloned into another realm. Use a [Channel](/docs/concurrency/channels), whose handle carries a shared core through the clone, when two realms must talk.
+
+## Why not a shared heap
+
+Every mainstream engine shares one heap per isolate and forbids other threads from touching it; parallelism means separate isolates plus message passing. TypeScript Core makes the same choice at a finer grain and makes the runtime, not the programmer, do the copying:
+
+- Pool workers and scratch realms are created and destroyed by `parallel.map`; you never see a thread.
+- Structured clone is the single serialisation format (`PortableValue`, see [Heap and values](/docs/memory/heap)); it is also what lets a channel or a network connection cross realms by sharing a core instead of copying.
+- With no shared heap there is nothing for the GC to coordinate across threads, which is why a scratch realm can skip collection entirely and why minor collections are per realm.
+
+The cost is that data crossing a boundary is copied, and the measured size of that cost is on the [comparison page](/docs/architecture/vs-v8-jsc#measured).

@@ -3,31 +3,24 @@ title: Overview
 description: "From TypeScript source to native code, and how work reaches the cores."
 ---
 
-```text
-TypeScript source
-      │
-      ▼
-oxc parse + type-strip ──► resolver (scopes, captures, subset gate)
-      │
-      ▼
-bytecode  (tsc-ir: FunctionProto / Chunk)         ← the compiler↔runtime contract
-      │
-      ├──► optimizer passes (emit-time, once per function)
-      ▼
-register-machine interpreter (tsr-realm)
-      │        │
-      │        └──► Tier-1 / Tier-2 ARM64 JIT (tsr-jit), hot functions + OSR
-      ▼
-work-stealing scheduler (tsr-scheduler)
-      │
- ┌────┴─────┬─────────┐
- ▼          ▼         ▼
-worker 0  worker 1 … worker N        one pinned OS thread per core
- │          │         │
-per-realm arena heaps (isolated: main / scratch / actor)
-      │
-PortableValue structured clone        ← the only way data crosses realms
-```
+<Mermaid chart={`flowchart TD
+  SRC[TypeScript source] --> OXC[oxc parse + type strip]
+  OXC --> RES[resolver: scopes, captures, subset gate]
+  RES --> IR[bytecode: FunctionProto / Chunk]
+  IR --> OPT[optimizer passes, once per function]
+  OPT --> INT[register-machine interpreter]
+  INT <--> JIT[Tier-1 / Tier-2 ARM64 JIT]
+  INT --> SCHED[work-stealing scheduler]
+  SCHED --> W0[worker 0]
+  SCHED --> W1[worker 1]
+  SCHED --> WN[worker N]
+  W0 --> H0[realm heap]
+  W1 --> H1[realm heap]
+  WN --> HN[realm heap]
+  H0 -. PortableValue clone .- H1
+  H1 -. PortableValue clone .- HN`} />
+
+Each box is a crate boundary or a thread boundary; the dotted edges are the **only** way data moves between heaps. The rest of this section walks the pipeline top to bottom; [Program lifecycle](/docs/architecture/lifecycle) follows one `tscore run` through it, and [How parallelism works](/docs/architecture/parallelism) follows one `parallel.map`.
 
 ## Front end
 

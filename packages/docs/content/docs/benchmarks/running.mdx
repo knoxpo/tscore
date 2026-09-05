@@ -23,6 +23,14 @@ Writes `benchmarks/compare/RESULTS.md`: startup and parse time via hyperfine, st
 
 Shared benchmarks are written in the tscore subset, so Node and Bun run non-idiomatic code (no `Array.map`, no classes). This compares engines on identical programs, not idiomatic programs per engine.
 
+## Architecture probes
+
+```bash
+RUNS=5 ./benchmarks/compare/arch/run_arch.sh
+```
+
+Three probes (fan-out cost, pause detector, payload crossing cost) against Node and Bun `worker_threads`, written for the [comparison page](/docs/architecture/vs-v8-jsc#measured). Writes `benchmarks/compare/arch/RESULTS.md`. Separate from the main board; no lock, no gates.
+
 ## HTTP
 
 ```bash
