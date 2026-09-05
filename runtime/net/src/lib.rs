@@ -11,12 +11,12 @@
 //! core.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{mpsc, Arc, Mutex};
 use tsr_memory::{Foreign, Obj, PromiseError, Value};
 use tsr_realm::{Completer, NativeArgs, Realm, RtError};
-use tsr_task::{portable::clone_out, PortableValue};
+use tsr_task::PortableValue;
 
 const LISTENER_KIND: &str = "netListener";
 const CONN_KIND: &str = "netConn";
@@ -92,7 +92,6 @@ mod reactor {
         Register(u64, TcpStream),
         Read(u64, usize, Completer),
         Write(u64, Vec<u8>, Completer),
-        Connect(u64, TcpStream, Completer),
         Close(u64),
     }
 
@@ -100,7 +99,6 @@ mod reactor {
         stream: TcpStream,
         reads: VecDeque<(usize, Completer)>,
         writes: VecDeque<(Vec<u8>, usize, Completer)>,
-        connecting: Option<Completer>,
     }
 
     struct Shared {
@@ -216,7 +214,6 @@ mod reactor {
                             stream,
                             reads: VecDeque::new(),
                             writes: VecDeque::new(),
-                            connecting: None,
                         });
                     }
                     Cmd::Read(id, max, c) => {
@@ -234,16 +231,6 @@ mod reactor {
                         } else {
                             fail(c, "net.write: connection closed".into());
                         }
-                    }
-                    Cmd::Connect(id, stream, c) => {
-                        let fd = stream.as_raw_fd();
-                        conns.insert(id, Conn {
-                            stream,
-                            reads: VecDeque::new(),
-                            writes: VecDeque::new(),
-                            connecting: Some(c),
-                        });
-                        arm(kq, fd, libc::EVFILT_WRITE, id);
                     }
                     Cmd::Close(id) => {
                         conns.remove(&id); // drop closes the fd
@@ -270,28 +257,6 @@ mod reactor {
                 if ev.filter == libc::EVFILT_READ {
                     pump_read(kq, id, conn);
                 } else if ev.filter == libc::EVFILT_WRITE {
-                    if let Some(c) = conn.connecting.take() {
-                        // connect completion: check SO_ERROR
-                        let fd = conn.stream.as_raw_fd();
-                        let mut err: libc::c_int = 0;
-                        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-                        unsafe {
-                            libc::getsockopt(
-                                fd,
-                                libc::SOL_SOCKET,
-                                libc::SO_ERROR,
-                                &mut err as *mut _ as *mut libc::c_void,
-                                &mut len,
-                            );
-                        }
-                        if err == 0 {
-                            c.settle(Ok(PortableValue::Number(id as f64)));
-                        } else {
-                            fail(c, format!("net.connect: errno {err}"));
-                            conns.remove(&id);
-                            continue;
-                        }
-                    }
                     pump_write(kq, id, conn);
                 }
             }
@@ -560,12 +525,6 @@ impl BodyRef {
                 std::str::from_utf8(&buf[*s..*e]).unwrap_or("")
             }
             BodyRef::Owned(s) => s,
-        }
-    }
-    fn len(&self, _buf: &[u8]) -> usize {
-        match self {
-            BodyRef::Slice((s, e)) => e - s,
-            BodyRef::Owned(s) => s.len(),
         }
     }
 }

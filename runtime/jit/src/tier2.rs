@@ -145,7 +145,6 @@ struct C {
     lane_on: bool,
     /// currently emitting inside a loop that took the lane, so x22 holds
     /// the integer intermediate and must not be blanked as a stale cache
-    in_lane_now: bool,
     /// vregs the current loop header proved to hold an i32. Converting one
     /// needs no verification; anything outside this set does, because a
     /// bare `fcvtzs` would silently truncate a fraction.
@@ -592,7 +591,7 @@ pub fn compile(
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, ics_base, tics_base, n_low, int_lane, lane: None, itmp: None, acache_on, lane_on, in_lane_now: false, int_ok: Vec::new() }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, ics_base, tics_base, n_low, int_lane, lane: None, itmp: None, acache_on, lane_on, int_ok: Vec::new() }
     };
     let out = c.a.new_label();
 

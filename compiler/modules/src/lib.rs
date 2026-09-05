@@ -158,7 +158,6 @@ pub fn looks_like_module(source: &str) -> bool {
 }
 
 struct Discovered {
-    id: Arc<str>,
     source: String,
     /// specifier -> canonical dep id, in first-appearance order
     deps: Vec<(String, Arc<str>)>,
@@ -392,7 +391,7 @@ fn discover_one(path: &Path, cfg: &ResolveConfig) -> Result<Discovered, ModuleEr
     let mut deps: Vec<(String, Arc<str>)> = Vec::new();
     let mut exports: Vec<ExportMeta> = Vec::new();
     let mut imports = Vec::new();
-    let mut add_dep = |spec: &str, span: u32,
+    let add_dep = |spec: &str, span: u32,
                        deps: &mut Vec<(String, Arc<str>)>|
      -> Result<Arc<str>, ModuleError> {
         if let Some((_, id)) = deps.iter().find(|(s, _)| s == spec) {
@@ -516,5 +515,5 @@ fn discover_one(path: &Path, cfg: &ResolveConfig) -> Result<Discovered, ModuleEr
             _ => {}
         }
     }
-    Ok(Discovered { id, source, deps, exports, imports })
+    Ok(Discovered { source, deps, exports, imports })
 }
