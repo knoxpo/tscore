@@ -105,6 +105,13 @@ pub struct HeapOffsets {
     pub nursery_objs_len: u32,
     pub nursery_objs_cap: u32,
     pub nursery_bytes_off: u32,
+    /// nursery.arrs len/cap and the array-buffer pool Vec words (inline
+    /// array literals pop a pooled buffer and bump a nursery slot).
+    pub nursery_arrs_len: u32,
+    pub nursery_arrs_cap: u32,
+    pub pool_arr_ptr: u32,
+    pub pool_arr_len: u32,
+    pub pool_arr_cap: u32,
     pub empty_vec_words: [u64; 3],
     pub obj_vlen: u32,
     pub obj_overflow: u32,

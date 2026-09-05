@@ -31,6 +31,13 @@ pub struct HeapLayout {
     pub nursery_objs_len: u32,
     pub nursery_objs_cap: u32,
     pub nursery_bytes_off: u32,
+    /// nursery.arrs len/cap and the array-buffer pool's Vec words, for the
+    /// JIT's inline array-literal path (pop a pooled buffer, bump a slot).
+    pub nursery_arrs_len: u32,
+    pub nursery_arrs_cap: u32,
+    pub pool_arr_ptr: u32,
+    pub pool_arr_len: u32,
+    pub pool_arr_cap: u32,
     /// The three raw words of an empty Vec<Value> (written into a freshly
     /// bumped Obj's overflow field).
     pub empty_vec_words: [u64; 3],
@@ -312,6 +319,22 @@ pub fn discover() -> Option<HeapLayout> {
     let nursery_vec_base = nursery_objs_ptr - vec_ptr;
     let nursery_objs_len = nursery_vec_base + vec_len;
     let nursery_objs_cap = nursery_vec_base + vec_cap_off;
+    let nursery_arrs_base = nursery_arrs_ptr - vec_ptr;
+    let nursery_arrs_len = nursery_arrs_base + vec_len;
+    let nursery_arrs_cap = nursery_arrs_base + vec_cap_off;
+    // the pool starts empty — a dangling data pointer would false-match —
+    // so give it storage first
+    realm.heap.pool_arr_bufs.reserve(16);
+    let pool_arr_ptr = probe_vec_ptr!(
+        "pool_arr_ptr",
+        |r: &Realm| r.heap.pool_arr_bufs.as_ptr(),
+        |r: &mut Realm| {
+            let c = r.heap.pool_arr_bufs.capacity();
+            r.heap.pool_arr_bufs.reserve(c + 8);
+        }
+    );
+    let pool_arr_len = pool_arr_ptr - vec_ptr + vec_len;
+    let pool_arr_cap = pool_arr_ptr - vec_ptr + vec_cap_off;
     // nursery.bytes: sentinel probe
     realm.heap.nursery.bytes = 0xB0BA_0003_0001;
     let nursery_bytes_off = probe!(
@@ -338,6 +361,11 @@ pub fn discover() -> Option<HeapLayout> {
         nursery_objs_len,
         nursery_objs_cap,
         nursery_bytes_off,
+        nursery_arrs_len,
+        nursery_arrs_cap,
+        pool_arr_ptr,
+        pool_arr_len,
+        pool_arr_cap,
         empty_vec_words,
         obj_vlen,
         obj_overflow,

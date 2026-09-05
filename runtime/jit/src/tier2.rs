@@ -2359,7 +2359,10 @@ fn emit_op(
                 && lit_shapes
                     .get(pc)
                     .is_some_and(|&(sp, sn)| sp != 0 && (sn as usize) <= 3);
-            if !bump {
+            let arr_bump = ins.op == Op::NewArrayLit
+                && n <= 8
+                && c.offsets.filter(|o| o.bump_alloc).is_some();
+            if !bump && !arr_bump {
                 // helper reads values from slots — flush the ones living in
                 // d-registers (allocation never GCs, no reload needed)
                 for v in ins.b..ins.b + n as u8 {
@@ -2369,11 +2372,71 @@ fn emit_op(
                 }
             }
             if ins.op == Op::NewArrayLit {
+                let slow = c.a.new_label();
+                let done = c.a.new_label();
+                if arr_bump {
+                    // Inline array literal: the helper's whole job is a
+                    // pooled buffer + a nursery slot, and both are Vec
+                    // words the layout probes already located. Fast path
+                    // needs nursery.arrs to have room (no realloc, so the
+                    // base tables stay valid) and a pooled buffer on top
+                    // with capacity >= n; anything else takes the helper,
+                    // which also does the pop-until-fits walk.
+                    let o = c.offsets.unwrap();
+                    c.a.ldr_imm(10, R_REALM, o.nursery_arrs_len);
+                    c.a.ldr_imm(11, R_REALM, o.nursery_arrs_cap);
+                    c.a.cmp_reg(10, 11);
+                    c.a.b_cond(Cond::Hs, slow);
+                    c.a.ldr_imm(12, R_REALM, o.pool_arr_len);
+                    c.a.cbz(12, slow);
+                    c.a.sub_imm(12, 12, 1);
+                    c.a.ldr_imm(13, R_REALM, o.pool_arr_ptr);
+                    c.a.mov_imm64(14, o.arr_size as u64);
+                    c.a.mul(14, 12, 14);
+                    c.a.add_reg(13, 13, 14); // &pool[len-1]
+                    c.a.ldr_imm(14, 13, o.vec_cap);
+                    c.a.cmp_imm(14, n as u32);
+                    c.a.b_cond(Cond::Lo, slow);
+                    c.a.str_imm(12, R_REALM, o.pool_arr_len); // pop
+                    c.a.ldr_imm(17, 13, o.vec_ptr);
+                    for i in 0..n {
+                        c.fetch_x(ins.b + i as u8, 9);
+                        c.a.str_imm(9, 17, i as u32 * 8);
+                    }
+                    // nursery.arrs[len] = Vec { ptr, cap, len: n }
+                    c.a.ldr_imm(11, R_REALM, o.nursery_arrs_ptr);
+                    c.a.mov_imm64(9, o.arr_size as u64);
+                    c.a.mul(9, 10, 9);
+                    c.a.add_reg(11, 11, 9);
+                    c.a.str_imm(17, 11, o.vec_ptr);
+                    c.a.str_imm(14, 11, o.vec_cap);
+                    c.a.mov_imm64(9, n as u64);
+                    c.a.str_imm(9, 11, o.vec_len);
+                    c.a.add_imm(9, 10, 1);
+                    c.a.str_imm(9, R_REALM, o.nursery_arrs_len);
+                    // nursery.bytes += 32 + cap * 8 (what young_arr counts)
+                    c.a.ldr_imm(9, R_REALM, o.nursery_bytes_off);
+                    c.a.add_imm(9, 9, 32);
+                    c.a.add_reg_lsl(9, 9, 14, 3);
+                    c.a.str_imm(9, R_REALM, o.nursery_bytes_off);
+                    // result: TAG_ARR | YOUNG_BIT | index
+                    // in x0: the arm's shared put_x(ins.a, 0) below stores it
+                    c.a.mov_imm64(9, (0xFFFCu64 << 48) | 0x8000_0000);
+                    c.a.orr_reg(0, 9, 10);
+                    c.a.b(done);
+                    c.a.bind(slow);
+                    for v in ins.b..ins.b + n as u8 {
+                        if v < LOW {
+                            c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
+                        }
+                    }
+                }
                 c.a.mov(0, R_REALM);
                 c.a.mov(1, R_BASE);
                 c.a.mov_imm64(2, ins.b as u64);
                 c.a.mov_imm64(3, n as u64);
                 c.thin(c.helpers.new_array_lit);
+                c.a.bind(done);
             } else if let Some(&(shape_ptr, sn)) = lit_shapes.get(pc).filter(|&&(sp, _)| sp != 0) {
                 if bump {
                     // inline nursery bump: len<cap -> write the 64-byte Obj
