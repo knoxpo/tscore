@@ -1388,15 +1388,21 @@ impl Heap {
     }
 
     /// Recycled Vec for a young array (pool from evacuation harvest).
+    /// A recycled backing buffer with room for `cap` values.
+    ///
+    /// Pops until one is actually big enough. Putting a too-small buffer
+    /// back and allocating instead — which is what this did — leaves that
+    /// buffer at the top of the pool, so it is drawn and rejected again on
+    /// every call and the pool never makes progress: one undersized entry
+    /// sends every array literal to the allocator. Same shape as the
+    /// string pool, which had the same defect.
     fn young_arr_buf(&mut self, cap: usize) -> Vec<Value> {
-        match self.pool_arr_bufs.pop() {
-            Some(b) if b.capacity() >= cap => b,
-            Some(b) => {
-                self.pool_arr_bufs.push(b);
-                Vec::with_capacity(cap)
+        while let Some(b) = self.pool_arr_bufs.pop() {
+            if b.capacity() >= cap {
+                return b;
             }
-            None => Vec::with_capacity(cap),
         }
+        Vec::with_capacity(cap.max(4))
     }
 
     // ---- promotion: evacuation target in the old arenas. Sets the old
