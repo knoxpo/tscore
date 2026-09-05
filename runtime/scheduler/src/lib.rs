@@ -66,8 +66,16 @@ pub struct PoolStats {
 impl Shared {
     fn notify(&self) {
         if self.sleepers.load(Ordering::SeqCst) > 0 {
+            // Take the mutex so a parker between its recheck and wait_for
+            // cannot miss this wakeup (it holds the lock across both).
+            let _g = self.sleep_m.lock();
             self.sleep_cv.notify_all();
         }
+    }
+
+    /// Any job a parked worker could pick up right now.
+    fn stealable(&self) -> bool {
+        !self.injector.is_empty() || self.stealers.iter().any(|s| !s.is_empty())
     }
 
     fn park(&self, timeout: Duration, recheck: impl Fn() -> bool) {
@@ -282,11 +290,11 @@ fn worker_loop(w: Worker<JobUnit>, idx: usize, shared: &Shared) {
                 if shared.shutdown.load(Ordering::SeqCst) {
                     return;
                 }
-                // ponytail: timed park instead of Rayon's sleep/wake
-                // protocol; bounded 1ms staleness, upgrade if profiles show
-                // idle burn
-                shared.park(Duration::from_millis(1), || {
-                    shared.shutdown.load(Ordering::SeqCst)
+                // Wakeups are exact (notify holds the mutex, recheck sees
+                // stealable work); the timeout is only a safety net. 17
+                // idle threads at 1ms cost 10% of a core on http workers:1.
+                shared.park(Duration::from_millis(100), || {
+                    shared.shutdown.load(Ordering::SeqCst) || shared.stealable()
                 });
             }
         }
