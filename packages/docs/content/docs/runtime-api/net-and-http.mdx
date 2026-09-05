@@ -55,9 +55,9 @@ Measured with `benchmarks/compare/http_bench.py` on Apple M5 Max, hello-world ha
 
 | Configuration | req/s | cores used | req/s per core |
 |---|---|---|---|
-| tscore `workers: 1` | 197k | 1.1 | 186k |
-| tscore `workers: 8` | 224k | 2.0 | 115k |
-| bun ×1 | 191k | 1.0 | 185k |
-| node ×1 | 134k | 1.0 | 134k |
+| tscore `workers: 1` | 183k | 1.0 | 191k |
+| tscore `workers: 8` | 227k | 1.9 | 122k |
+| bun ×1 | 165k | 1.0 | 162k |
+| node ×1 | 118k | 1.0 | 119k |
 
 The machine's loopback stack caps total throughput regardless of engine, so read the per-core column. Leave `workers` at 1 unless the network path, not the CPU, is the bottleneck on your hardware.

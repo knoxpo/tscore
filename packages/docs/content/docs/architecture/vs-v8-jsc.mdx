@@ -178,12 +178,12 @@ Rows from [Results](/docs/benchmarks/results) that bear on the same questions, s
 
 | | tscore | node | bun |
 |---|---|---|---|
-| startup, hello world | **2.1 ms** | 43.2 ms | 5.8 ms |
-| channel, 100k messages (vs worker `postMessage`) | **5.3 ms** | 36.8 ms | 30.2 ms |
-| mandelbrot, 8 workers (`parallel.map` vs `worker_threads`) | **4.1 ms** | 23.9 ms | 17.5 ms |
-| primes, 8 workers | **12.4 ms** | 27.2 ms | 15.4 ms |
-| objects, single core, shared source | 109.3 ms | 25.7 ms | **24.2 ms** |
-| gc_churn, single core, shared source | 213.7 ms | 58.3 ms | **46.4 ms** |
+| startup, hello world | **2.1 ms** | 39.9 ms | 5.7 ms |
+| channel, 100k messages (vs worker `postMessage`) | **5.2 ms** | 37.1 ms | 30.3 ms |
+| mandelbrot, 8 workers (`parallel.map` vs `worker_threads`) | **3.9 ms** | 23.9 ms | 17.3 ms |
+| primes, 8 workers | **11.8 ms** | 26.7 ms | 15.2 ms |
+| objects, single core, shared source | 105.7 ms | 27.0 ms | **24.2 ms** |
+| gc_churn, single core, shared source | 210.5 ms | 60.3 ms | **48.4 ms** |
 
 ### Summary
 
@@ -195,7 +195,7 @@ Rows from [Results](/docs/benchmarks/results) that bear on the same questions, s
 | Cost per byte crossing a heap boundary | tscore, by about 2×; V8/JSC win on tiny payloads. |
 | Worst-case pause | tscore, by 3× over V8, roughly even with JSC. |
 | Pause frequency and allocation throughput | V8, clearly. |
-| Startup | tscore, by 20× over Node. |
+| Startup | tscore, by 19× over Node. |
 
 The honest one-line version: tscore is the runtime you want when the work is parallel, numeric, or latency-bound; it is not yet the runtime you want for a single-threaded object-heavy program.
 

@@ -3,40 +3,40 @@ title: Results
 description: "The current board, copied from benchmarks/compare/RESULTS.md."
 ---
 
-Snapshot from 2026-09-03, Apple M5 Max (18 logical CPUs, 6P + 12E), tscore 0.1.0, Node 24.17.0, Bun 1.4.0. Steady-state cells are the median of 5 runs after a discarded warm-up. Ratios are engine ÷ Node; lower is better. The live file is [benchmarks/compare/RESULTS.md](https://github.com/knoxpo/typescript-core/blob/main/benchmarks/compare/RESULTS.md).
+Snapshot from 2026-09-06, Apple M5 Max (18 logical CPUs, 6P + 12E), tscore 0.1.0, Node 24.17.0, Bun 1.4.0. Steady-state cells are the median of 5 runs after a discarded warm-up. Ratios are engine ÷ Node; lower is better. The live file is [benchmarks/compare/RESULTS.md](https://github.com/knoxpo/typescript-core/blob/main/benchmarks/compare/RESULTS.md).
 
 ## Startup and parse
 
 | benchmark | tscore | node | bun |
 |---|---|---|---|
-| startup (hello.ts) | **1.6 ms** (0.04×) | 36.6 ms | 4.3 ms (0.12×) |
-| parse + compile (~50k LOC) | **7.4 ms** (0.08×) | 97.4 ms | 11.2 ms (0.11×) |
+| startup (hello.ts) | **2.1 ms** (0.05×) | 39.9 ms | 5.7 ms (0.14×) |
+| parse + compile (~50k LOC) | **8.3 ms** (0.08×) | 104.5 ms | 13.1 ms (0.13×) |
 
 ## Steady state, shared sources
 
 | benchmark | tscore | node | bun |
 |---|---|---|---|
-| objects | 111.0 (4.65×) | 23.9 | **23.1** (0.97×) |
-| closures | 103.3 (3.07×) | **33.6** | 49.4 (1.47×) |
-| alloc | 132.5 (3.10×) | **42.7** | 48.6 (1.14×) |
-| gc_churn | 192.3 (3.83×) | 50.2 | **42.0** (0.84×) |
-| promises | 62.4 (0.99×) | 63.0 | **58.1** (0.92×) |
+| objects | 105.7 (3.91×) | 27.0 | **24.2** (0.89×) |
+| closures | 107.6 (2.77×) | **38.8** | 51.0 (1.31×) |
+| alloc | 118.0 (2.66×) | **44.4** | 48.9 (1.10×) |
+| gc_churn | 210.5 (3.49×) | 60.3 | **48.4** (0.80×) |
+| promises | 65.0 (0.96×) | 67.6 | **63.5** (0.94×) |
 
-Single-core object-heavy code is where the interpreter and Tier-1 still lose to a mature JIT. This is the known wall; see the [architecture](/docs/architecture/overview) for what the JIT does and does not yet do.
+Single-core object-heavy code is where the interpreter and Tier-1 still lose to a mature JIT. This is the known wall; see [Compared to V8 and JSC](/docs/architecture/vs-v8-jsc) for what the JIT does and does not yet do.
 
 ## Async
 
 | benchmark | tscore | node | bun |
 |---|---|---|---|
-| timer storm (2000 × sleep 1 ms) | **11.7** (0.88×) | 13.3 | 12.0 (0.91×) |
-| channel, 100k messages (vs worker `postMessage`) | **5.0** (0.15×) | 33.5 | 28.5 (0.85×) |
+| timer storm (2000 × sleep 1 ms) | **11.5** (0.87×) | 13.1 | 11.8 (0.90×) |
+| channel, 100k messages (vs worker `postMessage`) | **5.2** (0.14×) | 37.1 | 30.3 (0.81×) |
 
 ## Long-running (30 s mixed compute + alloc)
 
 | metric | tscore | node | bun |
 |---|---|---|---|
-| throughput (ops/s) | 594k (0.58×) | **1018k** | 781k (0.77×) |
-| stability (last/first decile) | 0.993 | 1.027 | 1.042 |
+| throughput (ops/s) | 731k (0.74×) | **987k** | 725k (0.73×) |
+| stability (last/first decile) | 1.013 | 1.013 | 0.889 |
 
 ## Multicore: `parallel.map` vs `worker_threads`
 
@@ -44,19 +44,19 @@ Single-core object-heavy code is where the interpreter and Tier-1 still lose to 
 
 | workers | tscore | node | bun |
 |---|---|---|---|
-| 1 | 74.5 | 59.8 | **34.8** |
-| 2 | 39.5 | 42.7 | **24.3** |
-| 4 | 20.3 | 30.9 | **16.4** |
-| 8 | **11.9** | 25.4 | 14.5 |
+| 1 | 77.3 | 64.0 | **35.9** |
+| 2 | 40.7 | 46.0 | **24.8** |
+| 4 | 21.1 | 32.5 | **17.8** |
+| 8 | **11.8** | 26.7 | 15.2 |
 
 **mandelbrot**
 
 | workers | tscore | node | bun |
 |---|---|---|---|
-| 1 | **24.7** | 33.2 | 29.8 |
-| 2 | **12.7** | 24.9 | 20.2 |
-| 4 | **6.8** | 22.5 | 18.2 |
-| 8 | **4.0** | 21.8 | 16.2 |
+| 1 | **25.2** | 35.1 | 31.3 |
+| 2 | **12.9** | 24.7 | 20.6 |
+| 4 | **6.9** | 23.9 | 19.0 |
+| 8 | **3.9** | 23.9 | 17.3 |
 
 Node and Bun rows spawn workers per run and pay the clone through `postMessage`; tscore's scratch realms and structured clone are the same mechanism, just cheaper.
 
@@ -82,11 +82,11 @@ Output is bit-identical at every worker count.
 
 | engine | req/s | cores | req/s per core |
 |---|---|---|---|
-| tscore `workers:1` | 197k | 1.1 | **186k** |
-| bun ×8 reusePort | 194k | 1.0 | 185k |
-| bun ×1 | 191k | 1.0 | 185k |
-| node ×1 | 134k | 1.0 | 134k |
-| tscore `workers:8` | 224k | 2.0 | 115k |
-| node cluster ×8 | 181k | 3.9 | 46k |
+| tscore `workers:1` | 183k | 1.0 | **191k** |
+| bun ×8 reusePort | 169k | 1.0 | 164k |
+| bun ×1 | 165k | 1.0 | 162k |
+| tscore `workers:8` | 227k | 1.9 | 122k |
+| node ×1 | 118k | 1.0 | 119k |
+| node cluster ×8 | 162k | 3.8 | 42k |
 
 Total throughput is capped by the loopback stack, not the engine. Compare the per-core column.
