@@ -15,6 +15,8 @@ MODES=(
     "TSC_NO_NURSERY=1 TSC_OSR_THRESHOLD=10 TSC_JIT_THRESHOLD=1"
     "TSC_NURSERY_BYTES=1"                             # GC stress: minor per safepoint
     "TSC_NURSERY_BYTES=1 TSC_OSR_THRESHOLD=10 TSC_JIT_THRESHOLD=1"
+    "TSC_PRETENURE=1"                                 # pretenure pinned on
+    "TSC_PRETENURE=1 TSC_OSR_THRESHOLD=10 TSC_JIT_THRESHOLD=1"
 )
 
 fail=0

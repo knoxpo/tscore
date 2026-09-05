@@ -38,6 +38,24 @@ pub struct HeapLayout {
     pub pool_arr_ptr: u32,
     pub pool_arr_len: u32,
     pub pool_arr_cap: u32,
+    /// heap.pretenure word: nonzero sends the inline literal templates to
+    /// the helper (old-space allocation).
+    pub pretenure_off: u32,
+    /// Old-space allocation (pretenure mode): arena len/cap, free-list
+    /// lengths, young-log Vec words, and the allocation counter.
+    pub objs_len: u32,
+    pub objs_cap: u32,
+    pub arrs_len: u32,
+    pub arrs_cap: u32,
+    pub free_objs_len: u32,
+    pub free_arrs_len: u32,
+    pub objs_young_ptr: u32,
+    pub objs_young_len: u32,
+    pub objs_young_cap: u32,
+    pub arrs_young_ptr: u32,
+    pub arrs_young_len: u32,
+    pub arrs_young_cap: u32,
+    pub allocs_since_gc_off: u32,
     /// The three raw words of an empty Vec<Value> (written into a freshly
     /// bumped Obj's overflow field).
     pub empty_vec_words: [u64; 3],
@@ -342,6 +360,55 @@ pub fn discover() -> Option<HeapLayout> {
         find_word(as_words(&realm), 0xB0BA_0003_0001)
     );
     realm.heap.nursery.bytes = 0;
+    let saved = realm.heap.pretenure;
+    realm.heap.pretenure = 0xB0BA_0004_0001;
+    let pretenure_off = probe!(
+        "pretenure",
+        find_word(as_words(&realm), 0xB0BA_0004_0001)
+    );
+    realm.heap.pretenure = saved;
+    let objs_len = realm_objs_ptr - vec_ptr + vec_len;
+    let objs_cap = realm_objs_ptr - vec_ptr + vec_cap_off;
+    let arrs_len = realm_arrs_ptr - vec_ptr + vec_len;
+    let arrs_cap = realm_arrs_ptr - vec_ptr + vec_cap_off;
+    // vectors that start empty get storage first (dangling ptr false-match)
+    realm.heap.free_objs.reserve(16);
+    realm.heap.free_arrs.reserve(16);
+    realm.heap.gen_objs.young.reserve(16);
+    realm.heap.gen_arrs.young.reserve(16);
+    macro_rules! vec_words {
+        ($name:literal, $get:expr, $grow:expr) => {{
+            let p = probe_vec_ptr!($name, $get, $grow);
+            (p, p - vec_ptr + vec_len, p - vec_ptr + vec_cap_off)
+        }};
+    }
+    let (_, free_objs_len, _) = vec_words!(
+        "free_objs",
+        |r: &Realm| r.heap.free_objs.as_ptr(),
+        |r: &mut Realm| { let c = r.heap.free_objs.capacity(); r.heap.free_objs.reserve(c + 8); }
+    );
+    let (_, free_arrs_len, _) = vec_words!(
+        "free_arrs",
+        |r: &Realm| r.heap.free_arrs.as_ptr(),
+        |r: &mut Realm| { let c = r.heap.free_arrs.capacity(); r.heap.free_arrs.reserve(c + 8); }
+    );
+    let (objs_young_ptr, objs_young_len, objs_young_cap) = vec_words!(
+        "objs_young",
+        |r: &Realm| r.heap.gen_objs.young.as_ptr(),
+        |r: &mut Realm| { let c = r.heap.gen_objs.young.capacity(); r.heap.gen_objs.young.reserve(c + 8); }
+    );
+    let (arrs_young_ptr, arrs_young_len, arrs_young_cap) = vec_words!(
+        "arrs_young",
+        |r: &Realm| r.heap.gen_arrs.young.as_ptr(),
+        |r: &mut Realm| { let c = r.heap.gen_arrs.young.capacity(); r.heap.gen_arrs.young.reserve(c + 8); }
+    );
+    let saved = realm.heap.allocs_since_gc;
+    realm.heap.allocs_since_gc = 0xB0BA_0005_0001;
+    let allocs_since_gc_off = probe!(
+        "allocs_since_gc",
+        find_word(as_words(&realm), 0xB0BA_0005_0001)
+    );
+    realm.heap.allocs_since_gc = saved;
     let empty_vec_words: [u64; 3] = {
         let ev: Vec<Value> = Vec::new();
         let w = as_words(&ev);
@@ -366,6 +433,20 @@ pub fn discover() -> Option<HeapLayout> {
         pool_arr_ptr,
         pool_arr_len,
         pool_arr_cap,
+        pretenure_off,
+        objs_len,
+        objs_cap,
+        arrs_len,
+        arrs_cap,
+        free_objs_len,
+        free_arrs_len,
+        objs_young_ptr,
+        objs_young_len,
+        objs_young_cap,
+        arrs_young_ptr,
+        arrs_young_len,
+        arrs_young_cap,
+        allocs_since_gc_off,
         empty_vec_words,
         obj_vlen,
         obj_overflow,

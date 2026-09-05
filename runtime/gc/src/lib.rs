@@ -219,7 +219,8 @@ pub fn collect<'a>(
     heap.gc_scratch = m;
     if std::env::var_os("TSC_GC_DEBUG").is_some() {
         eprintln!(
-            "[gc] MAJOR freed={} live={} arena={} free_objs={} free_arrs={}",
+            "[gc] MAJOR us={} freed={} live={} arena={} free_objs={} free_arrs={}",
+            t0.elapsed().as_micros(),
             stats.last_freed,
             stats.last_live,
             heap.objs.len() + heap.arrs.len(),
@@ -458,13 +459,14 @@ pub fn collect_minor<'a>(
     let mut promoted = 0usize;
     let mut promoted_bytes = 0usize;
     macro_rules! sweep_young {
-        ($gen:ident, $marks:expr, $free:ident, $clear:expr) => {{
+        ($gen:ident, $marks:expr, $free:ident, $bytes:expr, $clear:expr) => {{
             let young = std::mem::take(&mut heap.$gen.young);
+            let bytes: &dyn Fn(&Heap, tsr_memory::Ref) -> usize = &$bytes;
             for r in young {
                 if $marks.get(r) {
                     heap.$gen.old.set(r);
                     promoted += 1;
-                    promoted_bytes += slot_bytes(heap, stringify!($gen), r);
+                    promoted_bytes += bytes(heap, r);
                 } else {
                     let clear: &mut dyn FnMut(&mut Heap, tsr_memory::Ref) = &mut $clear;
                     clear(heap, r);
@@ -474,7 +476,7 @@ pub fn collect_minor<'a>(
             }
         }};
     }
-    sweep_young!(gen_strs, m.ystrs, free_strs, |h: &mut Heap, r| {
+    sweep_young!(gen_strs, m.ystrs, free_strs, |h: &Heap, r| 24 + h.strs[r as usize].byte_len(), |h: &mut Heap, r| {
         if !matches!(h.strs[r as usize], tsr_memory::HStr::Buf(_)) {
             h.strs[r as usize] = tsr_memory::HStr::Buf(String::new());
         } else if let tsr_memory::HStr::Buf(b) = &mut h.strs[r as usize] {
@@ -484,22 +486,22 @@ pub fn collect_minor<'a>(
             }
         }
     });
-    sweep_young!(gen_objs, m.yobjs, free_objs, |h: &mut Heap, r| {
+    sweep_young!(gen_objs, m.yobjs, free_objs, |h: &Heap, r| 72 + h.objs[r as usize].overflow.len() * 8, |h: &mut Heap, r| {
         let o = &mut h.objs[r as usize];
         o.shape = tsr_memory::empty_shape();
         o.clear_vals();
     });
-    sweep_young!(gen_arrs, m.yarrs, free_arrs, |h: &mut Heap, r| {
+    sweep_young!(gen_arrs, m.yarrs, free_arrs, |h: &Heap, r| 32 + h.arrs[r as usize].len() * 8, |h: &mut Heap, r| {
         let v = &mut h.arrs[r as usize];
         v.clear();
         if v.capacity() > 1024 {
             v.shrink_to(64);
         }
     });
-    sweep_young!(gen_closures, m.yclosures, free_closures, |h: &mut Heap, r| {
+    sweep_young!(gen_closures, m.yclosures, free_closures, |h: &Heap, r| 32 + h.closures[r as usize].upvals.len() * 8, |h: &mut Heap, r| {
         h.closures[r as usize].upvals.clear();
     });
-    sweep_young!(gen_cells, m.ycells, free_cells, |h: &mut Heap, r| {
+    sweep_young!(gen_cells, m.ycells, free_cells, |_h: &Heap, _r| 8, |h: &mut Heap, r| {
         h.cells[r as usize] = Value::UNDEFINED;
     });
     {
@@ -515,7 +517,7 @@ pub fn collect_minor<'a>(
             if m.yforeigns.get(r) {
                 heap.gen_foreigns.old.set(r);
                 promoted += 1;
-                promoted_bytes += slot_bytes(heap, "gen_foreigns", r);
+                promoted_bytes += 96;
             } else {
                 if let Foreign::Promise(p) = &heap.foreigns[r as usize] {
                     if let PromiseState::Rejected(e) = &p.state {
@@ -583,8 +585,25 @@ pub fn collect_minor<'a>(
             }
         }
     }
-    let nursery_dead =
-        nur.objs.len() + nur.arrs.len() + nur.strs.len() - evacuated;
+    let nursery_total = nur.objs.len() + nur.arrs.len() + nur.strs.len();
+    let nursery_dead = nursery_total - evacuated;
+    // Pretenure policy. Evacuating a nursery that mostly survives is pure
+    // copying; marking the same objects in place through the young log
+    // measured 2.5x cheaper. Flip on when >= 3/4 of a real nursery
+    // survived, back off when < 1/2 of the young log did — decided here,
+    // with the nursery empty, so allocation never mixes modes mid-cycle.
+    if heap.nursery_on && !heap.pretenure_fixed {
+        if heap.pretenure == 0 {
+            if nursery_total >= 4096 && evacuated * 4 >= nursery_total * 3 {
+                heap.pretenure = 1;
+            }
+        } else {
+            let swept = promoted + freed;
+            if swept >= 4096 && promoted * 2 < swept {
+                heap.pretenure = 0;
+            }
+        }
+    }
     freed += nursery_dead;
     nur.objs.clear();
     nur.arrs.clear();
@@ -609,25 +628,14 @@ pub fn collect_minor<'a>(
     stats.last_freed = freed;
     if std::env::var_os("TSC_GC_DEBUG").is_some() {
         eprintln!(
-            "[gc] minor freed={freed} promoted={promoted} evac={evacuated} arena={} free_objs={} free_arrs={}",
+            "[gc] minor us={} freed={freed} promoted={promoted} evac={evacuated} arena={} free_objs={} free_arrs={}",
+            t0.elapsed().as_micros(),
             heap.objs.len() + heap.arrs.len(),
             heap.free_objs.len(),
             heap.free_arrs.len()
         );
     }
     stats.record_pause(t0);
-}
-
-fn slot_bytes(heap: &Heap, arena: &str, r: tsr_memory::Ref) -> usize {
-    let i = r as usize;
-    match arena {
-        "gen_strs" => 24 + heap.strs[i].byte_len(),
-        "gen_objs" => 72 + heap.objs[i].overflow.len() * 8,
-        "gen_arrs" => 32 + heap.arrs[i].len() * 8,
-        "gen_closures" => 32 + heap.closures[i].upvals.len() * 8,
-        "gen_cells" => 8,
-        _ => 96,
-    }
 }
 
 fn stats_remembered_peak(heap: &mut Heap, n: usize) {

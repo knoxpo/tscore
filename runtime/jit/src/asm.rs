@@ -262,6 +262,10 @@ impl Asm {
         debug_assert!(imm % 8 == 0 && imm / 8 < 4096);
         self.push(0xF940_0000 | (imm / 8) << 10 | rn << 5 | rt);
     }
+    pub fn str_w_imm(&mut self, rt: Reg, rn: Reg, imm: u32) {
+        debug_assert!(imm % 4 == 0 && imm / 4 < 4096);
+        self.push(0xB900_0000 | (imm / 4) << 10 | rn << 5 | rt);
+    }
     pub fn str_imm(&mut self, rt: Reg, rn: Reg, imm: u32) {
         debug_assert!(imm % 8 == 0 && imm / 8 < 4096);
         self.push(0xF900_0000 | (imm / 8) << 10 | rn << 5 | rt);

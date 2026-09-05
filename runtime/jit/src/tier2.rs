@@ -347,6 +347,75 @@ impl C {
         }
     }
 
+    /// Write a literal Obj at the address in `at` (x13): shape, vlen,
+    /// the first `sn` values from their homes, undefined pads, and an
+    /// empty overflow Vec. Shared by the nursery and old-space templates.
+    fn store_obj_lit(&mut self, at: u32, shape_ptr: u64, sn: u8, first: u8, o: HeapOffsets) {
+        self.a.mov_imm64(14, shape_ptr);
+        self.a.str_imm(14, at, 0);
+        self.a.mov_imm64(14, sn as u64);
+        self.a.str_imm(14, at, o.obj_vlen);
+        for i in 0..sn {
+            self.fetch_x(first + i, 9);
+            self.a.str_imm(9, at, o.obj_inline + i as u32 * 8);
+        }
+        if (sn as usize) < 3 {
+            self.a.mov_imm64(9, Value::UNDEFINED.bits());
+            for i in sn..3 {
+                self.a.str_imm(9, at, o.obj_inline + i as u32 * 8);
+            }
+        }
+        for (i, &w) in o.empty_vec_words.iter().enumerate() {
+            self.a.mov_imm64(9, w);
+            self.a.str_imm(9, at, o.obj_overflow + i as u32 * 8);
+        }
+    }
+
+    /// Array literal body: pop a pooled buffer with capacity >= n (else
+    /// `slow`), fill it from the value homes, and write the 24-byte Vec
+    /// slot at index x10 of the arena whose data pointer sits at
+    /// `arena_ptr_off`. Leaves the buffer capacity in x14.
+    fn store_arr_lit(&mut self, arena_ptr_off: u32, n: usize, first: u8, slow: Label, o: HeapOffsets) {
+        self.a.ldr_imm(12, R_REALM, o.pool_arr_len);
+        self.a.cbz(12, slow);
+        self.a.sub_imm(12, 12, 1);
+        self.a.ldr_imm(13, R_REALM, o.pool_arr_ptr);
+        self.a.mov_imm64(14, o.arr_size as u64);
+        self.a.mul(14, 12, 14);
+        self.a.add_reg(13, 13, 14); // &pool[len-1]
+        self.a.ldr_imm(14, 13, o.vec_cap);
+        self.a.cmp_imm(14, n as u32);
+        self.a.b_cond(Cond::Lo, slow);
+        self.a.str_imm(12, R_REALM, o.pool_arr_len); // pop
+        self.a.ldr_imm(17, 13, o.vec_ptr);
+        for i in 0..n {
+            self.fetch_x(first + i as u8, 9);
+            self.a.str_imm(9, 17, i as u32 * 8);
+        }
+        self.a.ldr_imm(11, R_REALM, arena_ptr_off);
+        self.a.mov_imm64(9, o.arr_size as u64);
+        self.a.mul(9, 10, 9);
+        self.a.add_reg(11, 11, 9);
+        self.a.str_imm(17, 11, o.vec_ptr);
+        self.a.str_imm(14, 11, o.vec_cap);
+        self.a.mov_imm64(9, n as u64);
+        self.a.str_imm(9, 11, o.vec_len);
+    }
+
+    /// Old-space bookkeeping after an inline arena push at index x10:
+    /// young-log push (x12 = its len, x13 = its data ptr) and the
+    /// allocation counter the minor-GC trigger reads.
+    fn old_alloc_log(&mut self, young_ptr: u32, young_len: u32, o: HeapOffsets) {
+        self.a.ldr_imm(13, R_REALM, young_ptr);
+        self.a.add_reg_lsl(13, 13, 12, 2);
+        self.a.str_w_imm(10, 13, 0);
+        self.a.add_imm(12, 12, 1);
+        self.a.str_imm(12, R_REALM, young_len);
+        self.a.ldr_imm(14, R_REALM, o.allocs_since_gc_off);
+        self.a.add_imm(14, 14, 1);
+        self.a.str_imm(14, R_REALM, o.allocs_since_gc_off);
+    }
+
     /// The field-access CSE cache lives in x15 (validated obj address;
     /// 0 = invalid) and x16 (its shape id). Both are caller-saved, so any
     /// emitted blr must zero x15 — cached accesses guard with one cbz.
@@ -2383,35 +2452,14 @@ fn emit_op(
                     // with capacity >= n; anything else takes the helper,
                     // which also does the pop-until-fits walk.
                     let o = c.offsets.unwrap();
+                    let old = c.a.new_label();
+                    c.a.ldr_imm(9, R_REALM, o.pretenure_off);
+                    c.a.cbnz(9, old);
                     c.a.ldr_imm(10, R_REALM, o.nursery_arrs_len);
                     c.a.ldr_imm(11, R_REALM, o.nursery_arrs_cap);
                     c.a.cmp_reg(10, 11);
                     c.a.b_cond(Cond::Hs, slow);
-                    c.a.ldr_imm(12, R_REALM, o.pool_arr_len);
-                    c.a.cbz(12, slow);
-                    c.a.sub_imm(12, 12, 1);
-                    c.a.ldr_imm(13, R_REALM, o.pool_arr_ptr);
-                    c.a.mov_imm64(14, o.arr_size as u64);
-                    c.a.mul(14, 12, 14);
-                    c.a.add_reg(13, 13, 14); // &pool[len-1]
-                    c.a.ldr_imm(14, 13, o.vec_cap);
-                    c.a.cmp_imm(14, n as u32);
-                    c.a.b_cond(Cond::Lo, slow);
-                    c.a.str_imm(12, R_REALM, o.pool_arr_len); // pop
-                    c.a.ldr_imm(17, 13, o.vec_ptr);
-                    for i in 0..n {
-                        c.fetch_x(ins.b + i as u8, 9);
-                        c.a.str_imm(9, 17, i as u32 * 8);
-                    }
-                    // nursery.arrs[len] = Vec { ptr, cap, len: n }
-                    c.a.ldr_imm(11, R_REALM, o.nursery_arrs_ptr);
-                    c.a.mov_imm64(9, o.arr_size as u64);
-                    c.a.mul(9, 10, 9);
-                    c.a.add_reg(11, 11, 9);
-                    c.a.str_imm(17, 11, o.vec_ptr);
-                    c.a.str_imm(14, 11, o.vec_cap);
-                    c.a.mov_imm64(9, n as u64);
-                    c.a.str_imm(9, 11, o.vec_len);
+                    c.store_arr_lit(o.nursery_arrs_ptr, n, ins.b, slow, o);
                     c.a.add_imm(9, 10, 1);
                     c.a.str_imm(9, R_REALM, o.nursery_arrs_len);
                     // nursery.bytes += 32 + cap * 8 (what young_arr counts)
@@ -2422,6 +2470,28 @@ fn emit_op(
                     // result: TAG_ARR | YOUNG_BIT | index
                     // in x0: the arm's shared put_x(ins.a, 0) below stores it
                     c.a.mov_imm64(9, (0xFFFCu64 << 48) | 0x8000_0000);
+                    c.a.orr_reg(0, 9, 10);
+                    c.a.b(done);
+                    // Pretenure mode: straight into the old arena. Needs an
+                    // empty free list (slot reuse is the helper's job) and
+                    // room in both the arena and its young log.
+                    c.a.bind(old);
+                    c.a.ldr_imm(9, R_REALM, o.free_arrs_len);
+                    c.a.cbnz(9, slow);
+                    c.a.ldr_imm(10, R_REALM, o.arrs_len);
+                    c.a.ldr_imm(11, R_REALM, o.arrs_cap);
+                    c.a.cmp_reg(10, 11);
+                    c.a.b_cond(Cond::Hs, slow);
+                    c.a.ldr_imm(9, R_REALM, o.arrs_young_len);
+                    c.a.ldr_imm(11, R_REALM, o.arrs_young_cap);
+                    c.a.cmp_reg(9, 11);
+                    c.a.b_cond(Cond::Hs, slow);
+                    c.store_arr_lit(o.realm_arrs_ptr, n, ins.b, slow, o);
+                    c.a.add_imm(9, 10, 1);
+                    c.a.str_imm(9, R_REALM, o.arrs_len);
+                    c.a.ldr_imm(12, R_REALM, o.arrs_young_len);
+                    c.old_alloc_log(o.arrs_young_ptr, o.arrs_young_len, o);
+                    c.a.mov_imm64(9, 0xFFFCu64 << 48);
                     c.a.orr_reg(0, 9, 10);
                     c.a.b(done);
                     c.a.bind(slow);
@@ -2445,31 +2515,16 @@ fn emit_op(
                     let o = c.offsets.unwrap();
                     let slow = c.a.new_label();
                     let done = c.a.new_label();
+                    let old = c.a.new_label();
+                    c.a.ldr_imm(9, R_REALM, o.pretenure_off);
+                    c.a.cbnz(9, old);
                     c.a.ldr_imm(10, R_REALM, o.nursery_objs_len);
                     c.a.ldr_imm(11, R_REALM, o.nursery_objs_cap);
                     c.a.cmp_reg(10, 11);
                     c.a.b_cond(Cond::Hs, slow); // full -> helper (realloc)
                     c.a.ldr_imm(12, R_REALM, o.nursery_objs_ptr);
                     c.a.add_reg_lsl(13, 12, 10, 6); // + len * 64
-                    c.a.mov_imm64(14, shape_ptr);
-                    c.a.str_imm(14, 13, 0); // shape
-                    // vlen (u32 + padding: 64-bit store covers both)
-                    c.a.mov_imm64(14, sn as u64);
-                    c.a.str_imm(14, 13, o.obj_vlen);
-                    for i in 0..sn as u8 {
-                        c.fetch_x(ins.b + i, 9);
-                        c.a.str_imm(9, 13, o.obj_inline + i as u32 * 8);
-                    }
-                    if (sn as usize) < 3 {
-                        c.a.mov_imm64(9, Value::UNDEFINED.bits());
-                        for i in sn as u8..3 {
-                            c.a.str_imm(9, 13, o.obj_inline + i as u32 * 8);
-                        }
-                    }
-                    for (i, &w) in o.empty_vec_words.iter().enumerate() {
-                        c.a.mov_imm64(9, w);
-                        c.a.str_imm(9, 13, o.obj_overflow + i as u32 * 8);
-                    }
+                    c.store_obj_lit(13, shape_ptr, sn as u8, ins.b, o);
                     c.a.add_imm(14, 10, 1);
                     c.a.str_imm(14, R_REALM, o.nursery_objs_len);
                     c.a.ldr_imm(14, R_REALM, o.nursery_bytes_off);
@@ -2477,6 +2532,28 @@ fn emit_op(
                     c.a.str_imm(14, R_REALM, o.nursery_bytes_off);
                     // result: TAG_OBJ | YOUNG_BIT | index
                     c.a.mov_imm64(9, (0xFFFBu64 << 48) | 0x8000_0000);
+                    c.a.orr_reg(9, 9, 10);
+                    c.put_x(ins.a, 9);
+                    c.a.b(done);
+                    // Pretenure mode: old arena directly (see NewArrayLit).
+                    c.a.bind(old);
+                    c.a.ldr_imm(9, R_REALM, o.free_objs_len);
+                    c.a.cbnz(9, slow);
+                    c.a.ldr_imm(10, R_REALM, o.objs_len);
+                    c.a.ldr_imm(11, R_REALM, o.objs_cap);
+                    c.a.cmp_reg(10, 11);
+                    c.a.b_cond(Cond::Hs, slow);
+                    c.a.ldr_imm(12, R_REALM, o.objs_young_len);
+                    c.a.ldr_imm(11, R_REALM, o.objs_young_cap);
+                    c.a.cmp_reg(12, 11);
+                    c.a.b_cond(Cond::Hs, slow);
+                    c.a.ldr_imm(13, R_REALM, o.realm_objs_ptr);
+                    c.a.add_reg_lsl(13, 13, 10, 6);
+                    c.store_obj_lit(13, shape_ptr, sn as u8, ins.b, o);
+                    c.a.add_imm(14, 10, 1);
+                    c.a.str_imm(14, R_REALM, o.objs_len);
+                    c.old_alloc_log(o.objs_young_ptr, o.objs_young_len, o);
+                    c.a.mov_imm64(9, 0xFFFBu64 << 48);
                     c.a.orr_reg(9, 9, 10);
                     c.put_x(ins.a, 9);
                     c.a.b(done);

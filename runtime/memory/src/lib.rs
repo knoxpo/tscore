@@ -715,6 +715,14 @@ pub struct Heap {
     /// Young allocation enabled (TSC_NURSERY=1; N3 flips the default once
     /// the JIT templates understand YOUNG_BIT).
     pub nursery_on: bool,
+    /// Pretenure mode (a word so the JIT can probe and test it): when the
+    /// last minor showed survivors are the rule, allocate straight into
+    /// the old arenas and let the young log mark them in place instead of
+    /// copying every one of them out of the nursery. Flipped only at the
+    /// end of a minor, when the nursery is empty, so no young ref exists
+    /// while allocation goes old. TSC_PRETENURE=1 pins it on.
+    pub pretenure: usize,
+    pub pretenure_fixed: bool,
     /// [old data ptr, nursery data ptr] — contiguous so the JIT selects
     /// an arena base with one shifted load on the young bit. Refreshed by
     /// `refresh_bases()` at every point a data pointer can move.
@@ -762,6 +770,8 @@ impl Default for Heap {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(16 << 20), // 16MB: churn live-sets die in-nursery (measured)
             nursery_on: std::env::var_os("TSC_NO_NURSERY").is_none(),
+            pretenure: std::env::var_os("TSC_PRETENURE").is_some() as usize,
+            pretenure_fixed: std::env::var_os("TSC_PRETENURE").is_some(),
             obj_bases: [0; 2],
             arr_bases: [0; 2],
             pool_arr_bufs: Vec::new(),
@@ -891,7 +901,7 @@ impl Heap {
         if let Some(h) = HStr::inline(s) {
             return self.alloc_str_slot_pub(h);
         }
-        if self.nursery_on {
+        if self.young_on() {
             let mut b = self.pool_str_bufs.pop().unwrap_or_default();
             b.push_str(s);
             return self.young_str(HStr::Buf(b));
@@ -1159,14 +1169,14 @@ impl Heap {
     /// Store an already-built String (reuses a freed slot's allocation
     /// when the sweep left one).
     pub fn alloc_str_owned(&mut self, s: String) -> Ref {
-        if self.nursery_on {
+        if self.young_on() {
             return self.young_str(HStr::Buf(s));
         }
         self.alloc_str_slot_pub(HStr::Buf(s))
     }
 
     fn alloc_str_slot_pub(&mut self, h: HStr) -> Ref {
-        if self.nursery_on {
+        if self.young_on() {
             return self.young_str(h);
         }
         self.allocs_since_gc += 1;
@@ -1259,6 +1269,13 @@ impl Heap {
     /// any operation that can move an objs/arrs data pointer (Vec growth,
     /// nursery take/restore) — compiled code reads these words directly.
     #[inline(always)]
+    /// Allocate into the nursery? Off entirely (TSC_NO_NURSERY) or
+    /// temporarily while pretenuring.
+    #[inline(always)]
+    pub fn young_on(&self) -> bool {
+        self.nursery_on && self.pretenure == 0
+    }
+
     pub fn refresh_bases(&mut self) {
         self.obj_bases = [
             self.objs.as_ptr() as usize,
@@ -1278,7 +1295,7 @@ impl Heap {
     /// Allocate an empty array, reusing a freed slot's buffer when
     /// possible (churn workloads would otherwise malloc per array).
     pub fn alloc_arr_empty(&mut self, cap: usize) -> Ref {
-        if self.nursery_on {
+        if self.young_on() {
             let b = self.young_arr_buf(cap);
             return self.young_arr(b);
         }
@@ -1289,7 +1306,9 @@ impl Heap {
             self.gen_arrs.on_alloc(r);
             return r;
         }
-        self.arrs.push(Vec::with_capacity(cap));
+        // pooled buffer here too: pretenuring sends every array this way
+        let b = self.young_arr_buf(cap);
+        self.arrs.push(b);
         self.refresh_bases();
         let r = (self.arrs.len() - 1) as Ref;
         self.gen_arrs.on_alloc(r);
@@ -1298,7 +1317,7 @@ impl Heap {
 
     /// Fused object literal: final shape + all values in one allocation.
     pub fn alloc_obj_lit(&mut self, shape: &'static ShapeData, values: &[Value]) -> Ref {
-        if self.nursery_on {
+        if self.young_on() {
             let mut o = Obj { shape, ..Obj::default() };
             o.extend_vals(values);
             return self.young_obj(o);
@@ -1323,7 +1342,7 @@ impl Heap {
 
     /// Fused array literal: contents in one allocation.
     pub fn alloc_arr_lit(&mut self, values: &[Value]) -> Ref {
-        if self.nursery_on {
+        if self.young_on() {
             let mut b = self.young_arr_buf(values.len());
             b.extend_from_slice(values);
             return self.young_arr(b);
@@ -1336,7 +1355,9 @@ impl Heap {
             self.gen_arrs.on_alloc(r);
             return r;
         }
-        self.arrs.push(values.to_vec());
+        let mut b = self.young_arr_buf(values.len());
+        b.extend_from_slice(values);
+        self.arrs.push(b);
         self.refresh_bases();
         let r = (self.arrs.len() - 1) as Ref;
         self.gen_arrs.on_alloc(r);
@@ -1345,7 +1366,7 @@ impl Heap {
 
     /// Allocate an empty object, reusing a freed slot's values buffer.
     pub fn alloc_obj_empty(&mut self) -> Ref {
-        if self.nursery_on {
+        if self.young_on() {
             return self.young_obj(Obj::default());
         }
         self.allocs_since_gc += 1;
@@ -1432,9 +1453,9 @@ impl Heap {
                 r
             }
             None => {
+                // no refresh_bases: promotion only runs inside a collection,
+                // which refreshes once after the nursery is reattached
                 self.objs.push(o);
-                self.refresh_bases();
-        self.refresh_bases();
                 (self.objs.len() - 1) as Ref
             }
         };
@@ -1457,7 +1478,6 @@ impl Heap {
             }
             None => {
                 self.arrs.push(v);
-                self.refresh_bases();
                 (self.arrs.len() - 1) as Ref
             }
         };
