@@ -20,48 +20,41 @@ A sticky, in-place, generational mark-sweep with a copying nursery. The heap it 
 
 Every safepoint asks `heap.needs_gc()`; `Realm::maybe_gc` then decides minor or major (`runtime/realm/src/lib.rs`):
 
-<Mermaid chart={`flowchart TD
-  A[safepoint] --> B{allocs since GC ≥ threshold, or nursery bytes ≥ 16 MB?}
-  B -- no --> Z[continue]
-  B -- yes --> C{TSCORE_GC_MAJOR_ONLY?}
-  C -- yes --> MJ
-  C -- no --> D{promoted slots since major > max half of live, 64k × slack?}
-  D -- yes --> MJ
-  D -- no --> E{promoted bytes since major > max half of live bytes, 8 MB × slack?}
-  E -- yes --> MJ
-  E -- no --> F{remembered set > 32k containers?}
-  F -- yes --> MJ
-  F -- no --> MN[minor collection]
-  MJ[minor first, then major collection]
-  MN --> Z
-  MJ --> G{major freed < 1/5 of live?}
-  G -- yes --> H[double slack, cap 32]
-  G -- no --> I[slack = 1]
-  H --> Z
-  I --> Z`} />
+<Mermaid chart={`flowchart LR
+  SP[safepoint] --> Q{needs GC?}
+  Q -- no --> GO[continue]
+  Q -- yes --> T{major trigger?}
+  T -- no --> MN[minor]
+  T -- yes --> MJ[minor, then major]
+  MJ --> F{freed < 1/5?}
+  F -- yes --> UP[slack ×2, cap 32]
+  F -- no --> RS[slack = 1]
+  MN --> GO
+  UP --> GO
+  RS --> GO`} />
+
+`needs GC` is true when the allocation counter passes its threshold or the nursery passes 16 MB. Any one of these makes the collection a **major** (each preceded by a minor so the nursery is empty):
+
+| Major trigger | Threshold |
+|---|---|
+| `TSCORE_GC_MAJOR_ONLY` set | always |
+| slots promoted since last major | > max(half of live slots, 64k) × slack |
+| bytes promoted since last major | > max(half of live bytes, 8 MB) × slack |
+| remembered set | > 32k containers |
 
 The `slack` multiplier is the anti-thrash guard: a major that frees little raises the bar for the next one, up to 32×, and a major that frees nothing jumps straight to 32. Any major that frees a fifth or more resets it.
 
 ### Minor collection
 
 <Mermaid chart={`flowchart LR
-  A[flatten ropes] --> B[forward roots in place: stack, globals, pinned, microtasks]
-  B --> C[queue remembered old containers]
-  C --> D[Cheney drain: rewrite every edge, evacuate reachable young obj/arr/str into old arenas]
-  D --> E[sweep young logs of non-moving kinds: survivors get old bit, dead go to free lists]
-  E --> F[clear dirty bits, salvage dead nursery buffers into pools]
-  F --> G[truncate nursery, bytes = 0, refresh JIT base pairs]`} />
+  A[flatten ropes] --> B[forward roots] --> C[queue remembered set] --> D[Cheney drain, evacuate young] --> E[sweep young logs] --> F[salvage buffers] --> G[reset nursery]`} />
 
 Cost is proportional to **live** young data plus the remembered set. Dead nursery objects are never visited. Survivors are promoted in place (sticky: once old, always old) and counted toward the next major's trigger.
 
 ### Major collection
 
 <Mermaid chart={`flowchart LR
-  A[flatten ropes, nursery already empty] --> B[mark from stack + globals + pinned through every arena]
-  B --> C[fused sweep per arena: rebuild free list, clear old/dirty/young, set old on survivors, sum live bytes]
-  C --> D[warn on unobserved rejected promises being freed]
-  D --> E[reset remembered set + promotion counters]
-  E --> F[threshold = max 256k, half of live slots]`} />
+  A[flatten ropes] --> B[mark from roots] --> C[fused sweep per arena] --> D[warn unobserved rejections] --> E[reset counters] --> F[threshold = max 256k, live/2]`} />
 
 A major is stop-the-realm and non-moving. It never touches another realm's heap, so an actor collecting does not pause the main program and vice versa.
 

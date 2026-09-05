@@ -3,22 +3,15 @@ title: Overview
 description: "From TypeScript source to native code, and how work reaches the cores."
 ---
 
-<Mermaid chart={`flowchart TD
-  SRC[TypeScript source] --> OXC[oxc parse + type strip]
-  OXC --> RES[resolver: scopes, captures, subset gate]
-  RES --> IR[bytecode: FunctionProto / Chunk]
-  IR --> OPT[optimizer passes, once per function]
-  OPT --> INT[register-machine interpreter]
-  INT <--> JIT[Tier-1 / Tier-2 ARM64 JIT]
-  INT --> SCHED[work-stealing scheduler]
-  SCHED --> W0[worker 0]
-  SCHED --> W1[worker 1]
-  SCHED --> WN[worker N]
-  W0 --> H0[realm heap]
-  W1 --> H1[realm heap]
-  WN --> HN[realm heap]
-  H0 -. PortableValue clone .- H1
-  H1 -. PortableValue clone .- HN`} />
+<Mermaid chart={`flowchart LR
+  SRC[source] --> OXC[oxc parse + strip] --> RES[resolver] --> IR[bytecode] --> OPT[optimizer] --> INT[interpreter]
+  INT <--> JIT[Tier-1 / Tier-2]
+  INT --> SCHED[scheduler]
+  SCHED --> W0[worker 0 + heap]
+  SCHED --> W1[worker 1 + heap]
+  SCHED --> WN[worker N + heap]
+  W0 -. clone .- W1
+  W1 -. clone .- WN`} />
 
 Each box is a crate boundary or a thread boundary; the dotted edges are the **only** way data moves between heaps. The rest of this section walks the pipeline top to bottom; [Program lifecycle](/docs/architecture/lifecycle) follows one `tscore run` through it, and [How parallelism works](/docs/architecture/parallelism) follows one `parallel.map`.
 

@@ -7,29 +7,25 @@ One `tscore run`, start to finish. Every box below is a real function in the rep
 
 ## The process
 
-<Mermaid chart={`flowchart TD
-  A[parse argv] --> B[read file]
-  B --> C{looks_like_module?}
-  C -- import/export found --> D[tsc_modules::compile_graph]
-  C -- plain script --> E[tsc_parser::compile]
-  D --> F{--dump-bytecode?}
+The compile half:
+
+<Mermaid chart={`flowchart LR
+  A[parse argv] --> B[read file] --> C{module syntax?}
+  C -- yes --> D[compile_graph]
+  C -- no --> E[compile]
+  D --> F{dump?}
   E --> F
-  F -- yes --> G[print disassembly, exit 0]
-  F -- no --> H[tss_parallel::configure workers]
-  H --> I[StatsExport thread: $TMPDIR/tscore-stats-pid.txt every 500 ms]
-  I --> J[spawn tscore-main thread, 64 MB stack]
-  J --> K[Realm::new + install natives]
-  K --> L{module graph?}
-  L -- yes --> M[tsr_modules::run_program]
-  L -- no --> N[interp::run_main]
-  M --> O[join]
-  N --> O
-  O --> P{--stats?}
-  P -- yes --> Q[print summary to stderr]
-  P -- no --> R{result}
-  Q --> R
-  R -- Ok --> S[exit 0]
-  R -- Err --> T[file:line:col: runtime error, exit 1]`} />
+  F -- yes --> G[disassemble, exit 0]
+  F -- no --> H[configure workers]`} />
+
+Then the run half:
+
+<Mermaid chart={`flowchart LR
+  H[configure workers] --> I[stats thread] --> J[spawn main, 64 MB] --> K[realm + natives] --> L[run] --> M[join] --> N{--stats?}
+  N -- yes --> O[summary] --> P{result}
+  N -- no --> P
+  P -- Ok --> S[exit 0]
+  P -- Err --> T[exit 1]`} />
 
 Notes on the steps (`cli/src/main.rs`):
 
@@ -57,18 +53,17 @@ For large files made of top-level functions, the **parallel frontend** parses a 
 
 The entry file is compiled as an async function, so `run_main` starts it as a coroutine and then **drives** the realm's event loop until the main promise settles (`runtime/realm/src/interp.rs`, `drive_inner`).
 
-<Mermaid chart={`flowchart TD
-  A[drain microtasks: resume ready coroutines] --> B[drain wake channel: timers, chunks, actor replies, channels, I/O]
-  B --> C{microtasks refilled?}
+<Mermaid chart={`flowchart LR
+  A[drain microtasks] --> B[drain wakes] --> C{refilled?}
   C -- yes --> A
   C -- no --> D{main promise}
-  D -- fulfilled --> E[return Ok]
-  D -- rejected --> F[return Err]
-  D -- pending --> G{external_pending == 0?}
-  G -- yes --> H[error: deadlock, pending promises that nothing can settle]
-  G -- no --> I{pool busy and idle_helper set?}
-  I -- yes --> J[help_until wake channel non-empty: run pool jobs inline]
-  I -- no --> K[block on wake_rx.recv]
+  D -- fulfilled --> E[Ok]
+  D -- rejected --> F[Err]
+  D -- pending --> G{external pending?}
+  G -- none --> H[deadlock error]
+  G -- some --> I{pool busy?}
+  I -- yes --> J[help pool]
+  I -- no --> K[block on wake_rx]
   J --> A
   K --> A`} />
 
@@ -100,15 +95,13 @@ Two places in the interpreter call `Realm::safepoint()`: a backward `Jump` (a lo
 Compiled code is per `FunctionProto` and shared by every realm that runs it (`runtime/realm/src/jit.rs`).
 
 <Mermaid chart={`stateDiagram-v2
+  direction LR
   [*] --> COLD
-  COLD --> COLD: call, record argument types
-  COLD --> COMPILING: 50th call, TSC_JIT_THRESHOLD
-  COMPILING --> OPT: Tier-2, type analysis proved numeric
-  COMPILING --> BASELINE: Tier-1 templates
-  COMPILING --> REJECTED: not compilable
-  OPT --> BASELINE: 10 deopts, recompile down
-  OPT --> OPT: entry guard fails, deopt to interpreter at pc 0
-  BASELINE --> BASELINE: helper call for anything not inlined`} />
+  COLD --> COMPILING: 50th call
+  COMPILING --> OPT: Tier-2
+  COMPILING --> BASELINE: Tier-1
+  COMPILING --> REJECTED
+  OPT --> BASELINE: 10 deopts`} />
 
 - **Tier-up** is a call counter on the proto. When it hits the threshold, a compare-and-swap moves the proto to `COMPILING` and the caller compiles synchronously. Tier-2 is tried first (`tsc-types` must prove the numeric dataflow, and the function must be free of async, upvalues, string/object ops and calls); otherwise Tier-1; otherwise `REJECTED` and the function stays interpreted forever.
 - **OSR** (on-stack replacement) fires at the 10,000th back-edge of a loop still running in the interpreter (`TSC_OSR_THRESHOLD`). Tier-1 keeps every register in its stack slot, so any loop header is a valid entry point. A failed OSR compile disables OSR for that proto permanently.

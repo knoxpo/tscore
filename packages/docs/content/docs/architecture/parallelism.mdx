@@ -19,21 +19,14 @@ A scratch realm is the cheapest possible heap: allocate by pushing, never collec
 
 <Mermaid chart={`sequenceDiagram
   participant M as Main realm
-  participant P as Pool (injector + deques)
-  participant W as Worker thread
-  M->>M: clone_out(callback captures), clone_out(each item)
-  M->>M: chunk = ceil(n / (8 × workers))
-  M->>P: submit one job per chunk into a Batch
-  M->>M: return promise, back to event loop
-  P->>W: worker pops or steals a job
-  W->>W: Realm::new, gc off, inherit cancel flag
-  W->>W: install console/Math/Channel/parallel
-  W->>W: rehydrate callback + items
-  W->>W: call_value(fn, item, index) per item
-  W->>W: settle_if_promise: drive this realm's loop if fn was async
-  W->>W: clone_out(result) into shared results Vec
-  W-->>M: last chunk to finish settles the Completer
-  M->>M: wake arrives, results rehydrated in input order, promise fulfilled`} />
+  participant P as Pool
+  participant W as Worker
+  M->>M: clone_out captures + items
+  M->>P: submit ceil(n / 8×workers) chunk jobs
+  P->>W: pop or steal
+  W->>W: scratch realm, rehydrate, call, clone_out
+  W-->>M: last chunk settles completer
+  M->>M: wake, results in order, fulfil`} />
 
 Source: `std/parallel/src/lib.rs` (`run_parallel`, `run_chunk`).
 
@@ -49,14 +42,14 @@ What that buys and costs:
 
 `Pool::new(n)` spawns **n − 1** OS threads; the caller of a batch is the n-th executor, which is why `--workers 1` is truly serial and spawns nothing. Each worker owns a Chase-Lev deque (crossbeam), there is one global injector, and stealers for every deque are shared. Workers are pinned to performance cores on macOS through the platform layer's QoS hints. (`runtime/scheduler/src/lib.rs`)
 
-<Mermaid chart={`flowchart TD
-  A[find_job] --> B{own deque pop, LIFO}
-  B -- job --> R[run it]
-  B -- empty --> C{global injector steal}
+<Mermaid chart={`flowchart LR
+  A[find_job] --> B{own deque}
+  B -- job --> R[run]
+  B -- empty --> C{injector}
   C -- job --> R
-  C -- empty --> D{steal from other deques, round-robin from self×31+7}
+  C -- empty --> D{steal others}
   D -- job --> R
-  D -- empty --> E[park on condvar, 100 ms timeout, recheck on notify]
+  D -- empty --> E[park 100 ms]
   E --> A
   R --> A`} />
 
@@ -76,23 +69,16 @@ Counters (`runtime.stats()` and `tscore run --stats`): `tasksExecuted`, `steals`
 An actor is not on the pool. It is a realm on its own OS thread that drains a bounded channel. (`runtime/actor/src/lib.rs`)
 
 <Mermaid chart={`sequenceDiagram
-  participant C as Caller realm
+  participant C as Caller
   participant T as Actor thread
-  C->>C: clone_out(setup closure)
-  C->>T: spawn tscore-actor, 32 MB stack, bounded mailbox (1024)
-  T->>T: Realm::new, install console/actor/Channel/parallel/task
-  T->>T: rehydrate setup, run it, root the handler object
-  T-->>C: ready (or setup error)
-  C->>T: post: Deliver(msg, None)
-  C->>T: send: Deliver(msg, Some(completer))
-  loop one message at a time, in order
-    T->>T: rehydrate msg, pick handler by msg.type, call
-    T->>T: settle_if_promise if the handler is async
-    T-->>C: send: completer.settle(clone_out(result)) or the error
-    T->>T: post: error logged to stderr, actor continues
-  end
-  C->>T: stop: Msg::Stop
-  T->>T: drain, drop realm, thread exits`} />
+  C->>T: actor(setup): clone, spawn, mailbox 1024
+  T->>T: realm, run setup, root handlers
+  T-->>C: ready
+  C->>T: post: Deliver(msg)
+  C->>T: send: Deliver(msg, completer)
+  T->>T: one at a time: dispatch on msg.type
+  T-->>C: send: settle result or error
+  C->>T: stop`} />
 
 - **Sequential per actor, parallel across actors.** The drain loop is a blocking `recv()`; nothing about an actor is shared with any other thread except the channel.
 - **Backpressure.** A full mailbox blocks `post`/`send` in the caller.
