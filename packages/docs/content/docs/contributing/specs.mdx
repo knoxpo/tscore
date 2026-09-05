@@ -1,0 +1,42 @@
+---
+title: Specifications index
+description: "The deep-dive design documents in the repository, by topic."
+---
+
+This guide is the user-facing layer. The documents below are the engineering record: what was designed, what was measured, what was rejected and why. They live in the repository and are linked here at their canonical location.
+
+## Architecture
+
+| Document | Covers |
+|---|---|
+| [00-overview.md](https://github.com/knoxpo/typescript-core/blob/main/docs/architecture/00-overview.md) | Runtime architecture, pipeline, module map, milestone plan. |
+| [benchmark-methodology.md](https://github.com/knoxpo/typescript-core/blob/main/docs/architecture/benchmark-methodology.md) | What is claimed, how it is measured, machine-state caveats, JIT-aware profiling. |
+
+## Language and compiler
+
+| Document | Covers |
+|---|---|
+| [language-subset-m1.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/language-subset-m1.md) | The in/out list and error-reporting timing. (Its "modules: out" line predates ESM support.) |
+| [bytecode.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/bytecode.md) | Register machine, instruction encoding, NaN-boxing, opcodes. |
+| [modules.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/modules.md) | ESM model, live bindings via cells, resolution, dynamic import, deviations. |
+| [lazy-compile-m6.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/lazy-compile-m6.md) | Header/body split, capture tables, snippet re-parse, parallel frontend, measured wins. |
+| [native-compilation-m5.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/native-compilation-m5.md) | Encoder, Tier-1 templates, Tier-2 typed unboxing, inline heap reads, layout probing, OSR. |
+
+## Runtime
+
+| Document | Covers |
+|---|---|
+| [concurrency-semantics.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/concurrency-semantics.md) | Task model, scheduler contract, clone-at-spawn, partitioning. |
+| [memory-ownership.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/memory-ownership.md) | Per-realm heaps, realm kinds, PortableValue. |
+| [gc-m4.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/gc-m4.md) | Generational collector, copying nursery, barriers, limits, telemetry. |
+| [actors-m2.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/actors-m2.md) | Actor API, semantics, ceilings. |
+| [async-await-m3.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/async-await-m3.md) | Coroutines, event loop, promise surface, channels. |
+| [structured-concurrency-m3.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/structured-concurrency-m3.md) | Scopes, propagation, cancellation points, timeouts. |
+| [runtime-io.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/runtime-io.md) | `runtime.fs`, `runtime.net`, `runtime.http`, bytes. |
+
+## Process
+
+| Document | Covers |
+|---|---|
+| [rfcs/README.md](https://github.com/knoxpo/typescript-core/blob/main/docs/rfcs/README.md) | When a change needs an RFC. |
+| [benchmarks/compare/RESULTS.md](https://github.com/knoxpo/typescript-core/blob/main/benchmarks/compare/RESULTS.md) | The live cross-engine board. |

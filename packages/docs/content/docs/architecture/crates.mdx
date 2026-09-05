@@ -1,0 +1,61 @@
+---
+title: Crate map
+description: "Every crate in the Cargo workspace and what it owns."
+---
+
+The repository is a single Cargo workspace. Prefixes: `tsc-` compiler, `tsr-` runtime, `tss-` standard library, `tsp-` platform, `tsb-` benchmarks. Dependency direction is `cli → std → runtime → tsc-ir → platform`; `tsc-ir` is the only crate shared by compiler and runtime.
+
+## Compiler
+
+| Crate | Path | Owns |
+|---|---|---|
+| `tsc-ast` | `compiler/ast` | Thin wrapper over the pinned oxc parser and AST. |
+| `tsc-parser` | `compiler/parser` | Parse, resolve (scopes, captures, subset gate), emit bytecode. Lazy body fill and the parallel frontend live here. |
+| `tsc-modules` | `compiler/modules` | ES module graph: specifier resolution via `tscore.json`, BFS discovery, per-file compilation. |
+| `tsc-ir` | `compiler/ir` | `Op`, `Chunk`, `FunctionProto`, `TypeHint`, disassembler. The compiler↔runtime contract. |
+| `tsc-optimizer` | `compiler/optimizer` | Emit-time bytecode passes, run once per function before the proto is sealed. |
+| `tsc-types` | `compiler/types` | Forward type dataflow over bytecode from annotations; feeds Tier-2. |
+
+## Runtime
+
+| Crate | Path | Owns |
+|---|---|---|
+| `tsr-realm` | `runtime/realm` | Realm: heap + globals + natives; the register-machine interpreter; object layout and shapes; JIT bridge, OSR, deopt. |
+| `tsr-memory` | `runtime/memory` | NaN-boxed `Value`, per-realm arena heap, nursery, ropes. |
+| `tsr-gc` | `runtime/gc` | Sticky generational mark-sweep, nursery evacuation, write-barrier support. |
+| `tsr-jit` | `runtime/jit` | ARM64 encoder, executable-page heap (W^X), Tier-1 and Tier-2 compilers. |
+| `tsr-scheduler` | `runtime/scheduler` | Work-stealing CPU pool, batches, pool statistics. |
+| `tsr-task` | `runtime/task` | `PortableValue` structured clone: `clone_out` / `rehydrate`. |
+| `tsr-actor` | `runtime/actor` | `actor()`: thread-per-actor realms, bounded mailboxes. |
+| `tsr-channel` | `runtime/channel` | `Channel.*`: shared-core bounded queues with parking. |
+| `tsr-modules` | `runtime/modules` | Instantiate and evaluate a compiled module graph; dynamic `import()`. |
+| `tsr-io` | `runtime/io` | `console`, `Math`, `Date`, `performance`, `sleep` and the timer wheel. |
+| `tsr-fs` | `runtime/fs` | `runtime.fs` on a blocking I/O pool; `runtime.bytes`. |
+| `tsr-net` | `runtime/net` | kqueue reactor, `runtime.net` TCP, `runtime.http` server. |
+
+## Standard library
+
+| Crate | Path | Owns |
+|---|---|---|
+| `tss-parallel` | `std/parallel` | `parallel.map` / `parallel.for`, `runtime.cpu`, `runtime.gc`, `runtime.stats`, pool configuration. |
+| `tss-async` | `std/async` | `task.scope`, child handles, cancellation, timeouts, `Runtime.checkCancellation`. |
+| `tss-collections` | `std/collections` | Stub. |
+| `tss-runtime` | `std/runtime` | Stub. |
+
+## Platform
+
+| Crate | Path | Owns |
+|---|---|---|
+| `tsp-arm64` | `platform/arm64` | ARM64 support. |
+| `tsp-macos` | `platform/macos` | QoS hints (keep workers on performance cores), MAP_JIT W^X toggling, icache invalidation. |
+| `tsp-linux` | `platform/linux` | Linux layer; QoS is a no-op today. |
+| `tsp-riscv64` | `platform/riscv64` | Stub until M8. |
+
+## Binaries and tooling
+
+| Crate | Path | Owns |
+|---|---|---|
+| `tscore` | `cli` | The `tscore` binary: argument parsing, realm setup, `run`, `top`, stats export. Integration tests in `cli/tests`. |
+| `tsb-harness` | `benchmarks/harness` | Benchmark harness and speedup reporting. |
+
+External dependencies are few and pinned: `oxc_*` at an exact version, `crossbeam-deque`, `crossbeam-channel`, `parking_lot`, `libc`. No tokio, no rayon: the scheduler is the point of the project.

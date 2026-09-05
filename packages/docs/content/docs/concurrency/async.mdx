@@ -1,0 +1,53 @@
+---
+title: Async and await
+description: "Promises, the per-realm event loop, and what settles them."
+---
+
+```typescript
+async function work(label: string, ms: number): Promise<string> {
+    await sleep(ms);
+    return label;
+}
+const slow = work("slow", 60);
+const fast = work("fast", 10);
+console.log("order:", await fast, await slow);
+```
+
+## Model
+
+- **The entry file is an async function.** Top-level `await` is available everywhere, in scripts and in every module.
+- **Calling an async function runs it synchronously to the first `await`**, then returns a promise. This is JavaScript's behaviour.
+- **One coroutine per suspendable frame.** `await` only appears directly in async bodies, so suspension never crosses a synchronous frame. Sync calls remain fast native recursion; async frames snapshot their registers on suspend and restore them on resume.
+- **`await` on a non-promise is identity.** Settled and plain awaits skip the microtask tick. Without `.then` in the subset this is unobservable.
+
+## What returns a promise
+
+| API | Settles when |
+|---|---|
+| `sleep(ms)` | The timer fires. Timers live on one shared wheel thread. |
+| `parallel.map` / `parallel.for` | The last chunk finishes. |
+| `handle.send(msg)` | The actor handler returns. |
+| `Channel.send` / `Channel.recv` | The value is accepted / delivered, when it could not happen immediately. |
+| `runtime.fs.*`, `runtime.net.*` | The I/O pool or the reactor completes the operation. |
+| `import()` | The module is evaluated. |
+
+`task.scope` and `handle.join` are **blocking**; `await` passes their values through unchanged.
+
+## Errors and rejection
+
+There is no `try`/`catch`. A rejected promise re-raises the runtime error in the frame that awaits it and cascades up through promise chains to the entry, which fails the program. A rejection nobody awaits prints a warning when the promise is collected.
+
+## The event loop
+
+Every realm (main, each parallel chunk, each scope child, each actor) runs its own loop:
+
+1. Drain ready coroutines (microtasks).
+2. Drain cross-thread wake-ups from timers, pool batches, actor replies, channel hand-offs, I/O.
+3. If the realm's main promise has settled, finish.
+4. Otherwise, if no external completion is outstanding, fail with a **deadlock error**. If one is, help the work-stealing pool while waiting.
+
+Because chunk and actor realms run their own loops, an `async` callback in `parallel.map` or an `async` actor handler drives itself to completion locally.
+
+## Timer precision
+
+`sleep` waits with `kevent` on macOS and lands about 250 µs past a 1 ms deadline, on par with Node and Bun. 2000 × `sleep(1)` completes in 11.7 ms versus Node's 13.3 ms.

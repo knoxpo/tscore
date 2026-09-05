@@ -1,0 +1,49 @@
+---
+title: Running benchmarks
+description: "The scaling harness, the cross-engine board, HTTP and JIT profiling."
+---
+
+Every script builds the release binary itself. Node 24 and Bun are needed for comparison rows; the machine should be plugged in and idle. Laptop absolute times swing ±40% with thermal state, so trust ratios within one session over absolutes across sessions.
+
+## Scaling curve
+
+```bash
+./benchmarks/run.sh
+```
+
+Runs `primes`, `fnv` and `mandelbrot` from `benchmarks/programs/` at 1, 2, 4 and 8 workers, verifies the result matches the Node port, prints the speedup table and **asserts the M1 targets**: ≥ 1.7× at 2 cores, ≥ 3.0× at 4, ≥ 5.5× at 8. `RUNS=N` sets runs per cell (default 5, median, first run discarded as warm-up).
+
+## Cross-engine board
+
+```bash
+RUNS=5 ./benchmarks/compare/run_compare.sh
+```
+
+Writes `benchmarks/compare/RESULTS.md`: startup and parse time via hyperfine, steady-state rows on byte-identical sources (`benchmarks/compare/bench/*.ts`), async rows on per-engine variants of the same algorithm, a 30 s long-running row, and the multicore rows. A lock directory prevents two runs from interleaving; remove `benchmarks/compare/.lock` if a run was killed.
+
+Shared benchmarks are written in the tscore subset, so Node and Bun run non-idiomatic code (no `Array.map`, no classes). This compares engines on identical programs, not idiomatic programs per engine.
+
+## HTTP
+
+```bash
+python3 benchmarks/compare/http_bench.py [workers]
+```
+
+Needs `wrk`. Reports req/s **and** CPU consumed, because the loopback stack caps total throughput; req/s per core is the comparable number. Servers are long-lived, so this is not part of `run_compare.sh`.
+
+## JIT profiling
+
+```bash
+./benchmarks/jitprof.sh benchmarks/programs/mandelbrot.ts --workers 1
+```
+
+Runs the program with `TSC_JIT_MAP` set, samples it with macOS `sample`, and joins the two so JIT frames show as `tier1:`/`tier2:`/`osr:` plus the TypeScript function name, with the hottest offsets inside the top region. This is the starting point for any codegen change.
+
+## Measurement discipline
+
+- Build with `cargo build --release`; `profiling` profile only when you need symbols.
+- `--no-stats-export` on every timed run.
+- Interleave A/B binaries rather than running A five times then B five times.
+- Prove the change is actually in the binary before believing a number: `--dump-bytecode`, `TSC_JIT_DEBUG=1`, or a `TSC_JIT_MAP` diff.
+
+Methodology: [benchmark-methodology.md](https://github.com/knoxpo/typescript-core/blob/main/docs/architecture/benchmark-methodology.md).

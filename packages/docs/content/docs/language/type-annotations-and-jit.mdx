@@ -1,0 +1,54 @@
+---
+title: Type annotations and the JIT
+description: "Why writing \": number\" makes loops faster."
+---
+
+Annotations are never checked, but they are not ignored either. The JIT's typed tier uses them as facts.
+
+## Tiers
+
+| Tier | When | What |
+|---|---|---|
+| Interpreter | Always available; the general path | Register machine over NaN-boxed values. Async functions stay here. |
+| Tier-1 | After `TSC_JIT_THRESHOLD` calls (default 50), or via OSR at a hot loop back-edge | Baseline templates. Every bytecode register keeps its stack slot; inline fast paths for arithmetic, comparisons, branches, field and index reads; everything else calls a helper with exact interpreter semantics. |
+| Tier-2 | Function qualifies by type dataflow | Unboxed. Numeric registers live in FP registers `d8`-`d15`; arithmetic runs directly on `f64` bits with no boxing or type guards where the analysis proved the operand numeric. An integer lane handles `i32`-range loops. |
+
+Compiled code is cached on the shared function prototype, so every worker realm in a `parallel.map` shares one compilation.
+
+## How annotations feed Tier-2
+
+```typescript
+function work(n: number): number {
+    let s = 0;
+    for (let i = 0; i < n; i++) s = (s + i * i) % 1000003;
+    return s;
+}
+```
+
+`n: number` is the seed. A forward dataflow over the bytecode propagates "provably a number" from annotated parameters through arithmetic, comparisons and loop-carried variables. Where the proof holds, the emitted code has no guards. Guards exist only at function **entry**: if a caller passes a string where `: number` was promised, the function deoptimises to the interpreter at pc 0 and, after repeated violations, is demoted to Tier-1.
+
+Without the annotation, the same function still runs in Tier-1, but every arithmetic op carries a tag check.
+
+Measured on Apple M5 Max, annotated numeric loop: interpreter 495 ms, Tier-1 290 ms, Tier-2 **70 ms**, Node 66 ms.
+
+## What keeps a function out of Tier-2
+
+- `async`
+- Captured variables (upvalues)
+- String or object operations in the hot path
+- Non-numeric dataflow the analysis cannot prove
+- Calls inside the function (Tier-1 also excludes functions with calls inside loops; the helper hop per iteration loses to the interpreter's inline native-call path)
+
+Write the numeric kernel as a leaf function with annotated parameters and call it from the loop-and-glue code.
+
+## Seeing what happened
+
+```bash
+TSC_JIT_DEBUG=1 tscore run prog.ts --no-stats-export
+```
+
+Logs each compile decision, tier-up, deopt and demotion. `TSC_DEOPT_DEBUG=1` adds the reason for every deoptimisation. `benchmarks/jitprof.sh prog.ts` samples a run and attributes native time back to TypeScript function names.
+
+## Kill switches
+
+`TSC_NO_JIT=1` (interpreter only) and `TSC_NO_TIER2=1` (Tier-1 only) exist for A/B testing and are used by the differential test harness. If a program behaves differently with and without them, that is a runtime bug: file it with the program.

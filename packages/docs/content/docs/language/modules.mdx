@@ -1,0 +1,76 @@
+---
+title: Modules
+description: "ES modules, static and dynamic, with bare-specifier resolution."
+---
+
+A file containing `import` or `export` at a word boundary is compiled as a module graph. Everything else is a plain script. The two pipelines produce the same bytecode and run on the same interpreter; modules add no opcodes.
+
+## Syntax
+
+```typescript title="modules/mathx.ts"
+export function sq(x: number): number { return x * x; }
+export const LIMIT = 100;
+export let hits = 0;
+export function hit() { hits = hits + 1; }
+```
+
+```typescript title="main.ts"
+import { sq, LIMIT } from "mathx";
+import * as m from "./util.ts";
+export { sq as square } from "mathx";
+export * from "./util.ts";
+
+console.log(sq(9), LIMIT);
+```
+
+Supported forms: named imports and exports, namespace import, `export *`, re-exports with renames, `export default` is **not** in the subset (use a named export).
+
+## Live bindings
+
+Exports that are never reassigned are copied into the namespace object at initialisation. Exports that are reassigned anywhere (and every `function` declaration) live in a cell; importers always see the current value. Assigning to an import is a compile error.
+
+The mechanism costs nothing on ordinary objects: only namespace objects can hold cells, and their fields sit outside the JIT's inline slot templates.
+
+## Evaluation order
+
+1. Every namespace object in the graph is created first, so cycles are safe.
+2. Modules evaluate in post-order depth-first from the entry: dependencies before dependents.
+3. Each module body may use **top-level `await`**; it runs to completion before its importers start.
+
+Cycles are **undefined-then-live**: a binding read before its module evaluated is `undefined`, with no TDZ error. This is a documented v1 deviation.
+
+## Dynamic `import()`
+
+```typescript
+const m = await import("./lazy.ts");
+m.hit();
+console.log("hits:", m.hits);       // live binding
+const again = await import("./lazy.ts");
+console.log(again.hits === m.hits); // same namespace object, cached
+```
+
+A cache hit returns an already-fulfilled promise for the same namespace object. A miss compiles the new subgraph and grafts it onto the running registry; modules already present are not re-instantiated.
+
+## Resolution
+
+| Specifier | Tries, in order |
+|---|---|
+| `./x` or `../x` | exact path, `x.ts`, `x/index.ts` |
+| `@app/x` (prefix in `paths`) | the mapped path, then the same three steps |
+| `mathx` (bare) | `<root>/<dir>/mathx.ts`, `<root>/<dir>/mathx/index.ts` for each `dir` in `moduleDirs` |
+
+Root and `moduleDirs` come from [`tscore.json`](/docs/getting-started/project-config), found by walking up from the entry file.
+
+## Errors
+
+Compile errors name the module file, not the entry:
+
+```text
+modules/mathx.ts:3:1: not supported in M1: class declarations
+```
+
+Runtime errors carry per-module source attribution the same way.
+
+## Crossing realms
+
+Namespace objects are ordinary objects to `parallel.map`, actors and scopes, with one limit: a namespace with **mutable** exports cannot be structured-cloned, because cells do not cross realms. Pass the values you need, not the namespace.

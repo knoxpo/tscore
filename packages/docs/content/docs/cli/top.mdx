@@ -1,0 +1,36 @@
+---
+title: tscore top
+description: "Live table of every running tscore process."
+---
+
+```bash
+tscore top
+```
+
+```text
+tscore top — 2 process(es), refresh 1s, ctrl-c to quit
+
+PID    SCRIPT              UP    WRK  TASKS  STEALS  HEAP    GC m/M  PAUSE   ACTORS
+41822  parallel_primes.ts  3s    8    64     19      0.1M    0/0     0us     0
+41830  actors.ts           12s   18   0      0       2.4M    3/1     1820us  2
+```
+
+## How it works
+
+Every `tscore run` writes a key/value snapshot to `$TMPDIR/tscore-stats-<pid>.txt` every 500 ms and deletes it on exit. `tscore top` scans that directory once a second and renders a table. There is no daemon and no socket.
+
+| Column | Source |
+|---|---|
+| `UP` | Seconds since the process started. |
+| `WRK` | Worker count the pool settled on (0 until the pool starts). |
+| `TASKS` / `STEALS` | Chunks executed and chunks stolen from another worker's queue. |
+| `HEAP` | Approximate live bytes from the last major GC. |
+| `GC m/M` | Minor / major collection counts. |
+| `PAUSE` | Last GC pause in microseconds. |
+| `ACTORS` | Live actor threads. |
+
+A script whose snapshot is older than 3 s is marked `(stale)`; older than 10 s it is treated as a dead process and its file is removed.
+
+## Opting out
+
+Pass `--no-stats-export` to `tscore run` to skip the snapshot entirely. Benchmarks and the golden tests do this so the writer thread never competes with the measured work.

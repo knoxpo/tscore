@@ -1,0 +1,77 @@
+---
+title: Structured concurrency
+description: "task.scope, child tasks, cancellation and timeouts."
+---
+
+Every spawned task belongs to a scope, and a scope cannot exit while any child is running. No orphans, no detached work.
+
+```typescript
+const total = task.scope((scope) => {
+    const a = scope.spawn(() => heavyA());
+    const b = scope.spawn(() => heavyB());
+    scope.spawn(() => background());     // never joined: still awaited at exit
+    return a.join() + b.join();          // scope returns the callback's value
+}, { timeout: 5000 });
+```
+
+## API
+
+| Call | Behaviour |
+|---|---|
+| `task.scope(fn, { timeout? })` | Runs `fn(scope)` synchronously in the caller's realm, then blocks until every child completed or was cancelled. Returns `fn`'s value. `timeout` is milliseconds and must be positive. |
+| `scope.spawn(fn)` | Structured-clones `fn` (same rules as `parallel.map`) and starts it on the pool immediately. Returns a handle. |
+| `handle.join()` | Blocks, helping the pool meanwhile, until that child finishes. Returns its value cloned into the caller. Joining a cancelled child raises `task cancelled`. |
+| `handle.cancel()` | Request cooperative cancellation of that child. |
+| `scope.cancel()` | Cancel every child. |
+| `Runtime.checkCancellation()` | Explicit cancellation point: raises if the current task was cancelled. |
+
+## Error propagation
+
+The first child error, or an error in the callback itself, cancels all remaining children and re-raises in the parent after they stop:
+
+```text
+parent errors or is cancelled → children cancelled → child realms freed
+```
+
+Cancellation is not an error. A cancelled child is simply discarded.
+
+## Cancellation points
+
+Cancellation is cooperative and lands at interpreter safepoints, which are the GC's: loop back-edges and closure calls. A tight loop with no calls still stops at its next backward jump.
+
+```typescript
+const r = task.scope((scope) => {
+    const doomed = scope.spawn(() => {
+        let n = 0;
+        while (true) { n++; }       // stops at the back-edge once cancelled
+    });
+    const fine = scope.spawn(() => heavy(100000));
+    doomed.cancel();
+    return fine.join();
+});
+```
+
+Cancellation cascades: cancelling a task whose callback runs a nested scope errors that scope, which cancels its own children. `parallel.map` chunks started inside a child inherit the child's cancel flag.
+
+## Timeouts
+
+`{ timeout: ms }` arms a watchdog thread. On expiry the scope cancels all children and errors with `scope timed out after <ms>ms`.
+
+## Nesting
+
+```typescript
+const nested = scope.spawn(() => {
+    return task.scope((inner) => {
+        const x = inner.spawn(() => heavy(50000));
+        const y = inner.spawn(() => heavy(60000));
+        return x.join() + y.join();
+    });
+});
+```
+
+Child realms are scratch realms: GC off, dropped wholesale at task end, so a child that allocates heavily costs nothing to clean up.
+
+## Limits
+
+- `task.scope` and `join` block the calling thread (while helping the pool). Async scope bodies are a documented follow-up; `await` passes their results through in the meantime.
+- Scope and handle objects are realm-local natives. They cannot be captured into `parallel.map` or sent to an actor.

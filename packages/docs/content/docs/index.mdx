@@ -1,0 +1,55 @@
+---
+title: Introduction
+description: "A multicore-native TypeScript runtime, written from scratch in Rust."
+---
+
+TypeScript Core (`tscore`) is a research-prototype runtime and compiler for TypeScript. It does not sit on V8 or JavaScriptCore: it parses TypeScript with a pinned [oxc](https://oxc.rs) front end, lowers to its own bytecode, and executes on a custom register-machine interpreter with a hand-rolled ARM64 JIT.
+
+> Make parallel execution in TypeScript as natural as asynchronous execution became with `async`/`await`.
+
+```typescript
+const results = await parallel.map(records, processRecord);
+// the runtime handles partitioning, work stealing, core placement, isolation
+```
+
+You express *intent* (`parallel.map`, `actor`, `Channel`, `task.scope`). The runtime decides *execution*: placement, partitioning, stealing, memory locality, GC scheduling, backpressure.
+
+## What you get
+
+- **Multicore by default.** `parallel.map` saturates every core, deterministically: output is bit-identical at any worker count.
+- **Isolated heaps.** Every task and actor owns its own heap and GC. Data crosses realms only by structured clone.
+- **Actors, channels, structured concurrency.** Bounded mailboxes, backpressure, scopes that cannot leak children.
+- **Async/await, top-level await, ES modules.** Static and dynamic `import`, cycles, bare specifiers via `tscore.json`.
+- **Generational GC with a copying nursery.** Minor pauses are O(live young), independent of heap size.
+- **Two-tier ARM64 JIT.** Your `: number` annotations let hot loops run unboxed in FP registers.
+- **Own I/O surface.** `runtime.fs`, `runtime.net`, `runtime.http`. Promise-native, no Node compatibility layer.
+
+## What it is not
+
+- Not a drop-in Node or Bun replacement. There is no `npm`, no Node API compatibility, no full ECMAScript.
+- Not full TypeScript. A defined [language subset](/docs/language/supported-subset) is enforced by the compiler: no classes, no `try`/`catch`, no `Map`/`Set`, no destructuring.
+- Not a type checker. Annotations are parsed, stripped, and used as JIT hints. They are never checked.
+
+## Status
+
+| Milestone | Scope | State |
+|---|---|---|
+| M1 | Multicore proof: `parallel.map`, work-stealing scheduler, isolated heaps | done |
+| M2 | Actors with heap isolation, bounded mailboxes | done |
+| M3 | Structured concurrency, async/await, channels | done |
+| M4 | Generational GC, memory limits, `tscore top` telemetry | done |
+| M5 | Typed IR, two-tier ARM64 JIT | done |
+| M6 | Lazy compilation, parallel frontend, ES modules, fs/net/http | done |
+| M7+ | AI sandbox, RISC-V, bare metal, OS | planned |
+
+**Platform:** ARM64 macOS and Linux. The JIT and the network reactor are ARM64/kqueue specific; `platform/riscv64` is a stub.
+
+## Where to go
+
+<Cards>
+  <Card title="Installation" href="/docs/getting-started/installation" description="Build tscore from source with Cargo." />
+  <Card title="Hello world" href="/docs/getting-started/hello-world" description="Run your first program, then go parallel." />
+  <Card title="A real problem" href="/docs/getting-started/real-world" description="Portfolio Value-at-Risk: same file on Node and tscore, measured." />
+  <Card title="Concurrency" href="/docs/concurrency/parallel" description="parallel.map, actors, channels, scopes." />
+  <Card title="Architecture" href="/docs/architecture/overview" description="Pipeline from source to native code." />
+</Cards>

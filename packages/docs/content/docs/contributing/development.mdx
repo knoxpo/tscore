@@ -1,0 +1,67 @@
+---
+title: Development
+description: "Tests, the differential gate, and the rules for landing a change."
+---
+
+## Layout
+
+```text
+compiler/     tsc-* crates: parse, resolve, emit, modules, IR, optimizer, types
+runtime/      tsr-* crates: realm, memory, gc, jit, scheduler, task, actor, channel, io, fs, net, modules
+std/          tss-* crates: parallel, async (+ stubs)
+platform/     tsp-* crates: arm64, macos, linux, riscv64
+cli/          the tscore binary and its integration tests
+tests/        golden programs + differential.sh
+benchmarks/   run.sh, compare/, jitprof.sh, programs/
+docs/         architecture, specifications, rfcs (the deep-dive references)
+packages/docs this site
+```
+
+## Tests
+
+```bash
+cargo test
+```
+
+`cli/tests/golden.rs` runs every `tests/golden/*.ts` (and every `tests/golden/<dir>/main.ts` module fixture) at `--workers 1` and `--workers 4` and asserts stdout equals the `.out` / `expected.out` file byte for byte. `cli/tests/lazy.rs` covers lazy-compilation edge cases. Unit tests live inside the crates.
+
+To add a conformance case, drop `name.ts` and `name.out` into `tests/golden/`. Multi-file cases are a directory with `main.ts`, `expected.out` and any modules.
+
+## Differential gate
+
+```bash
+cargo build --release -p tscore
+./tests/differential.sh
+```
+
+Runs every golden program under six execution modes and requires identical stdout (and identical sorted stderr) against the `TSC_NO_JIT=1` baseline:
+
+| Mode | Environment |
+|---|---|
+| default | JIT + nursery |
+| aggressive JIT | `TSC_OSR_THRESHOLD=10 TSC_JIT_THRESHOLD=1` |
+| nursery off | `TSC_NO_NURSERY=1` |
+| nursery off + aggressive JIT | both |
+| GC stress | `TSC_NURSERY_BYTES=1` |
+| GC stress + aggressive JIT | both |
+
+A diff in any mode is a runtime bug, never a test problem. Run it before every change to the interpreter, JIT or GC.
+
+## Benchmarks are part of the review
+
+Performance changes come with numbers from `benchmarks/compare/run_compare.sh` (interleaved A/B, same session) and, for codegen, a `benchmarks/jitprof.sh` profile. A change that was not proven to be in the binary is not measured. See [Running benchmarks](/docs/benchmarks/running).
+
+## Specs and RFCs
+
+The behaviour of the runtime is written down in `docs/specifications/`. A change that alters a published spec lands first as an RFC in `docs/rfcs/NNNN-title.md` (motivation, design, alternatives, milestone impact). Small clarifications edit the spec directly.
+
+## This site
+
+```bash
+cd packages/docs
+npm install
+npm run dev      # http://localhost:3000/docs
+npm run build    # must pass before committing content
+```
+
+Pages are MDX under `packages/docs/content/docs/`; each folder's `meta.json` orders the sidebar. The site is a self-contained npm package and is not part of the Cargo workspace.

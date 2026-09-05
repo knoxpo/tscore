@@ -100,11 +100,20 @@ single-core). See [M5 spec](docs/specifications/native-compilation-m5.md).
 cargo run --release -p tscore -- run examples/parallel_primes.ts
 ```
 
+A real workload, same file on both engines (Monte Carlo portfolio VaR, 400k scenarios):
+
+```bash
+cargo run --release -p tscore -- run examples/portfolio_var.ts --workers 8   # 0.70s on M5 Max
+node examples/portfolio_var.ts                                             # 21.8s
+```
+
 ```bash
 ./benchmarks/run.sh
 ```
 
 ## Docs
+
+User guide site (Fumadocs): `cd packages/docs && npm install && npm run dev`, then open http://localhost:3000/docs.
 
 - [Architecture overview](docs/architecture/00-overview.md)
 - [M1 language subset](docs/specifications/language-subset-m1.md)

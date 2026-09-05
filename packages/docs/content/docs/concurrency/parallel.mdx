@@ -1,0 +1,59 @@
+---
+title: parallel.map and parallel.for
+description: "Data-parallel loops on the work-stealing pool."
+---
+
+```typescript
+const results = await parallel.map(items, fn);   // Promise<T[]>
+await parallel.for(items, fn);                    // Promise<undefined>, results discarded
+```
+
+`items` must be an array and `fn` a TypeScript function (a native such as `Math.sqrt` is rejected). `fn` may be `async`.
+
+## Semantics: clone at spawn
+
+1. The caller structured-clones `fn`'s captured variables and each input chunk out of its own heap into a realm-independent portable tree. Cycles or non-cloneable values (natives, actor handles, scope handles) raise `cannot capture X across realms`.
+2. Each chunk runs in a **fresh scratch realm** on a pool worker: bump-allocated heap, no GC, dropped wholesale when the chunk ends.
+3. Results are cloned back into the caller's array in input order.
+
+Consequences you can rely on:
+
+- **Deterministic.** Output at `--workers 1` and `--workers 8` is byte-identical. The golden tests assert it.
+- **No shared mutation.** Assigning to a captured object inside `fn` changes the chunk's private copy. It never leaks to the caller or to other chunks. If you need to accumulate, return values and reduce them after, or send through a [Channel](/docs/concurrency/channels).
+- **Cost model.** Cloning is proportional to captured data plus the chunk. Keep captures small; pass big data as `items`.
+
+## Partitioning
+
+The input is split statically into 8 × workers chunks; work stealing absorbs skew. There is no minimum chunk size because per-chunk overhead is microseconds. If you see a worker starving on extremely skewed inputs, split the items yourself into more, smaller units.
+
+## Async callbacks
+
+```typescript
+const doubled = await parallel.map([1, 2, 3, 4], async (x: number) => {
+    await sleep(5);
+    return x * 2;
+});
+```
+
+Every scratch realm runs its own event loop, so a chunk may `await` timers, channels, or actor replies. The map's promise settles when the last chunk finishes.
+
+## Cancellation
+
+Chunks inherit the cancel flag of the task that started them. Cancelling a [scope](/docs/concurrency/structured-concurrency) child that is inside a `parallel.map` stops the chunks at their next safepoint.
+
+## Errors
+
+A runtime error in any chunk rejects the map's promise with that error; the remaining chunks are cancelled. There is no partial result.
+
+## Worker count
+
+`--workers N` fixes the pool size for the process; the first `parallel.*` call locks it in. `runtime.cpu.count` reports the value. The calling thread is one of the N executors and helps run chunks while it waits, so `--workers 1` never spawns a thread.
+
+## Configuration and introspection
+
+| API | Returns |
+|---|---|
+| `runtime.cpu.count` | Effective worker count. |
+| `runtime.stats()` | `{ workers, tasksExecuted, steals, submits, parks, actors, gcMinor, gcMajor }`. |
+
+`tscore run --stats` prints the same counters at exit.

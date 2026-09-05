@@ -1,0 +1,4 @@
+{
+  "title": "TypeScript Core",
+  "pages": ["index", "getting-started", "cli", "language", "concurrency", "runtime-api", "memory", "architecture", "benchmarks", "contributing"]
+}

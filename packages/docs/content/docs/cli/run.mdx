@@ -1,0 +1,54 @@
+---
+title: tscore run
+description: "Execute a TypeScript file."
+---
+
+```text
+tscore run <file.ts> [--workers N] [--max-heap MB] [--stats] [--dump-bytecode] [--no-stats-export]
+tscore top
+tscore --version | -V
+```
+
+Argument parsing is hand-rolled and strict: the first non-flag argument is the file, anything else unrecognised is an error. Flags may appear in any order after `run`.
+
+## Flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--workers N` | logical CPU count | Total executors for the work-stealing pool, **including** the calling thread. `1` is fully serial. First call wins for the whole process. |
+| `--max-heap MB` | unlimited | Live-byte limit for the main realm. Measured during major GC; exceeding it raises a clean runtime error at the next safepoint. Actors have their own `maxHeap` option. |
+| `--stats` | off | Print an exit summary to stderr: workers, tasks, steals, parks, live actors, GC counts and pauses, heap size. |
+| `--dump-bytecode` | off | Disassemble the compiled program to stdout and exit **without running it**. For module entries, every module is dumped. |
+| `--no-stats-export` | export on | Disable the twice-a-second stats snapshot to `$TMPDIR/tscore-stats-<pid>.txt` that `tscore top` reads. Use in benchmarks and tests. |
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Program ran to completion (main promise settled). |
+| `1` | Could not read the file, compile error, or runtime error. The message is on stderr. |
+| `2` | Usage error: bad flag, missing file, non-numeric `--workers`/`--max-heap`. |
+
+## Error format
+
+Compile and runtime errors carry a source span when one is known:
+
+```text
+main.ts:12:5: not supported in M1: class declarations
+main.ts:7:13: runtime error: cannot capture X across realms
+```
+
+For modules the file is the module where the error originated, not the entry. Errors without a span print as `<file>: runtime error: <msg>`.
+
+## Which pipeline runs
+
+`tscore run` chooses the compilation path by a raw-text check for module syntax (`import`/`export` at a word boundary):
+
+- **Module entry** goes through the module graph compiler. The whole graph is discovered, compiled per file, then instantiated and evaluated.
+- **Plain script** takes the single-file path, including the parallel frontend for large flat files.
+
+Both paths compile lazily: inner function bodies are emitted on first call. See [Lazy compilation](/docs/language/supported-subset#error-reporting-timing).
+
+## What runs where
+
+The main program runs on a dedicated thread with a 64 MB stack, so deep recursion (10k+ interpreter frames) does not overflow. The worker pool is created lazily on first parallel use; a program that never goes parallel never spawns worker threads, apart from a pool warm-up thread that you can disable with `TSC_NO_POOL_WARM=1`.

@@ -1,0 +1,110 @@
+---
+title: Hello world
+description: "Run a script, then make it parallel."
+---
+
+## A plain script
+
+```typescript title="hello.ts"
+const greeting: string = "Hello TypeScript Core";
+console.log(greeting);
+console.log(`1 + 2 = ${1 + 2}`);
+```
+
+```bash
+tscore run hello.ts
+```
+
+Type annotations are stripped, not checked. `console.log` joins its arguments with spaces, like Node.
+
+## Going parallel
+
+This is `examples/parallel_primes.ts` from the repository. It counts primes in 200 ranges with deliberately skewed per-range cost, so work stealing has something to do:
+
+```typescript title="parallel_primes.ts"
+function countPrimes(range: { from: number, to: number }): number {
+    let count = 0;
+    for (let n = range.from; n < range.to; n++) {
+        if (n < 2) continue;
+        let isPrime = true;
+        for (let d = 2; d * d <= n; d++) {
+            if (n % d === 0) { isPrime = false; break; }
+        }
+        if (isPrime) count++;
+    }
+    return count;
+}
+
+const SPAN = 2000;
+const ranges: { from: number, to: number }[] = [];
+for (let i = 0; i < 200; i++) {
+    ranges.push({ from: i * SPAN, to: (i + 1) * SPAN });
+}
+
+const t0 = performance.now();
+const counts = await parallel.map(ranges, countPrimes);
+let total = 0;
+for (const c of counts) total += c;
+const t1 = performance.now();
+
+console.log(`workers: ${runtime.cpu.count}`);
+console.log(`primes below ${200 * SPAN}: ${total}`);
+console.log(`took ${Math.floor(t1 - t0)}ms`);
+```
+
+Run it at different worker counts and watch the time drop:
+
+```bash
+tscore run parallel_primes.ts --workers 1
+tscore run parallel_primes.ts --workers 4
+tscore run parallel_primes.ts --workers 8
+```
+
+```text
+workers: 4
+primes below 400000: 33860
+took 13ms
+```
+
+The prime count is identical at every worker count. That is a guarantee, not luck: `parallel.map` clones the callback's captures and each chunk into a fresh isolated heap, so nothing can leak between chunks. See [Parallel](/docs/concurrency/parallel).
+
+Three things to notice:
+
+- **Top-level `await` just works.** The entry file is compiled as an async function.
+- **`--workers N` counts the calling thread.** `--workers 1` is truly serial, which makes it an honest baseline.
+- **`runtime.cpu.count`** reports the worker count the runtime settled on.
+
+## Seeing what the runtime did
+
+Add `--stats` for an exit summary:
+
+```bash
+tscore run parallel_primes.ts --workers 4 --stats
+```
+
+```text
+--- tscore stats ---
+workers:        4
+tasks executed: 32
+steals:         11
+parks:          3
+actors (live):  0
+gc:             0 minor / 0 major, last pause 0us, max 0us
+heap:           412 slots, ~0.0 MB live
+```
+
+`tasks executed` is the number of chunks (the runtime splits input into 8 × workers chunks). `steals` is how often an idle worker took a chunk from another worker's queue. For a live view of every running process, open a second terminal and run `tscore top`. See the [CLI reference](/docs/cli/run).
+
+## Other examples
+
+The `examples/` directory has one file per headline feature:
+
+| File | Shows |
+|---|---|
+| `examples/fib.ts` | Recursive calls; a JIT Tier-1 workload. |
+| `examples/actors.ts` | Two actors, `post` vs `send`, a handler that fails without taking the actor down. |
+| `examples/task_scope.ts` | Nested scopes, `join`, cancelling one child while its sibling completes. |
+| `examples/parallel_primes.ts` | The program above. |
+| `examples/portfolio_var.ts` | Monte Carlo portfolio risk: a real workload, same file on Node and tscore. See [A real problem](/docs/getting-started/real-world). |
+
+`tests/golden/` is a larger corpus: every file there is a runnable program with its expected output beside it.

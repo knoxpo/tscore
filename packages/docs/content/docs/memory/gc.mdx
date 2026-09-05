@@ -1,0 +1,56 @@
+---
+title: Garbage collection
+description: "Per-realm heaps, the generational collector, memory limits and tuning."
+---
+
+## Per-realm heaps
+
+There is no shared JavaScript heap. Each realm (main program, every parallel chunk, every scope child, every actor) owns an arena heap, and a reference never escapes its realm. Data crosses realms only by structured clone. This is what makes work stealing and actors free of locks in the memory system.
+
+| Realm kind | Collection |
+|---|---|
+| Main realm and actors | Full generational GC, described below. |
+| Scratch realms (parallel chunks, scope children) | **No GC.** Bump-allocate, run, drop the whole arena at task end. |
+
+## The collector
+
+A sticky, in-place, generational mark-sweep with a copying nursery.
+
+- **Nursery.** Objects, arrays and strings are born in a bump-allocated nursery. When it reaches `TSC_NURSERY_BYTES` (default 16 MB) a **minor** collection evacuates the live young objects into the old generation and resets the nursery by truncation. Cost is O(live young), not O(allocated). Dead objects are never visited.
+- **Promotion.** Surviving one minor makes an object old, permanently ("sticky").
+- **Major.** A full mark-sweep over the old generation runs when promoted bytes since the last major exceed max(8 MB, half the live set), when the remembered set degenerates (over 32k dirty containers), or on `runtime.gc.collect()`. Every major is preceded by a nursery evacuation.
+- **Write barrier.** Container-only, one dirty bit per object: `if old && !dirty { remember }`. It fires on field, index, push, cell and upvalue stores. Arithmetic-only code executes zero barriers.
+- **Non-moving old generation.** Closures, cells and foreign handles are never moved either, so raw references may live in JIT registers and cross-thread completers.
+
+Measured on a 1M-object live set with 3M objects of churn: minor pause about 1.8 ms versus a major at 6.8 ms; at 2M live, 2.0 ms versus 10.1 ms. Minor pauses do not grow with the heap.
+
+## Safepoints
+
+Collection, cancellation and memory-limit checks all happen at the same places: loop back-edges and closure calls. Straight-line code between them is never interrupted.
+
+## Memory limits
+
+| Scope | How |
+|---|---|
+| Main realm | `tscore run --max-heap <MB>` |
+| An actor | `actor(setup, { maxHeap: <bytes> })` |
+
+Live bytes are measured during major collections (string bytes + array capacity × 8 + object fields × 24 + slot overheads). Crossing the limit raises a clean runtime error at the next safepoint rather than aborting the process. Burst between majors is bounded by the promotion trigger.
+
+## Observing
+
+- `runtime.gc.stats()` and `runtime.gc.collect()`: see [The runtime object](/docs/runtime-api/runtime-object).
+- `tscore run --stats`: exit summary with minor/major counts and pauses.
+- `tscore top`: live per-process view.
+- `TSC_GC_DEBUG=1`: one stderr line per collection.
+
+## Tuning
+
+| Variable | When |
+|---|---|
+| `TSC_NURSERY_BYTES=N` | Larger for allocation-heavy code whose working set outlives 16 MB; smaller only to reproduce bugs. 2 MB measured 37% slower on an allocation benchmark from premature evacuation. |
+| `TSC_NURSERY_BYTES=1` | GC-stress: a minor at every safepoint. Correctness testing. |
+| `TSC_NO_NURSERY=1` | Allocate straight into the old generation. A/B only. |
+| `TSCORE_GC_MAJOR_ONLY=1` | Every collection is a full mark-sweep. A/B only. |
+
+Deep dive: [gc-m4.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/gc-m4.md) and [memory-ownership.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/memory-ownership.md).

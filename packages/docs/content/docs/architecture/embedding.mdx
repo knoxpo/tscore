@@ -1,0 +1,93 @@
+---
+title: Embedding from Rust
+description: "Using the runtime crates directly, the way the CLI does."
+---
+
+<Callout type="warn">
+The Rust API is internal and unstable. It changes whenever the runtime does, without deprecation. This page documents how the `tscore` binary composes the crates so you can do the same in a fork or an experiment, not a supported SDK.
+</Callout>
+
+## What the CLI does
+
+Trimmed from `cli/src/main.rs`:
+
+```rust
+use std::sync::Arc;
+
+// compile: plain script or module graph
+let source = std::fs::read_to_string(&file)?;
+let program = if tsc_modules::looks_like_module(&source) {
+    Some(tsc_modules::compile_graph(std::path::Path::new(&file))?)
+} else {
+    None
+};
+let chunk = match program { Some(_) => None, None => Some(tsc_parser::compile(&source, &file)?) };
+
+// fix the worker count before any thread can touch the shared pool
+tss_parallel::configure(workers);
+
+// run on a big-stack thread
+std::thread::Builder::new()
+    .name("tscore-main".into())
+    .stack_size(64 << 20)
+    .spawn(move || {
+        let mut realm = tsr_realm::Realm::new();
+        realm.max_heap_bytes = max_heap_mb.map(|mb| mb * 1_000_000);
+        tsr_io::install(&mut realm);
+        tss_parallel::install(&mut realm, workers);
+        tsr_actor::install(&mut realm);
+        tss_async::install(&mut realm);
+        tsr_channel::install(&mut realm);
+        tsr_modules::install(&mut realm);
+        tsr_fs::install(&mut realm);
+        tsr_net::install(&mut realm);
+        match (&program, &chunk) {
+            (Some(p), _) => tsr_modules::run_program(&mut realm, p),
+            (None, Some(c)) => tsr_realm::interp::run_main(&mut realm, &c.main),
+            _ => unreachable!(),
+        }
+    })?
+    .join()?
+```
+
+Each `install` adds a set of globals to one realm. Leave one out and that global does not exist in the program. Actor and scratch realms are created by the runtime with their own `install` calls.
+
+## Adding a native
+
+```rust
+use tsr_memory::Value;
+use tsr_realm::{Realm, RtError};
+
+pub fn install(realm: &mut Realm) {
+    let twice = realm.add_native(|realm, args| {
+        let v = args.get(realm, 0);
+        if !v.is_number() {
+            return Err(RtError::new(format!("twice: expected number, got {}", v.type_of())));
+        }
+        Ok(Value::number(v.as_number() * 2.0))
+    });
+    realm.set_global("twice", twice);
+    // or a namespace: realm.set_global_obj("mylib", vec![("twice", twice)]);
+}
+```
+
+Rules that matter, because the nursery moves objects:
+
+- Natives receive `NativeArgs` (stack indices), not copied values. Read arguments through `args.get(realm, i)` and never hold an object/array/string `Value` in a Rust local across anything that can allocate or re-enter the interpreter.
+- To return a promise, use `realm.promise_pair()`; the `Completer` is `Send`, settles exactly once, and keeps its promise GC-pinned until processed.
+- Strings come back via `realm.alloc_string(&s)`; objects via `tsr_memory::Obj::default()` + `realm.heap.alloc_obj(o)`.
+
+## Key types
+
+| Type | Crate | Role |
+|---|---|---|
+| `Realm`, `RtError`, `NativeArgs`, `StatsHub` | `tsr-realm` | Execution context, error type, native calling convention, telemetry sink. |
+| `Value`, `Obj`, `Kind` | `tsr-memory` | NaN-boxed value and heap objects. |
+| `PortableValue`, `portable::{clone_out, rehydrate}` | `tsr-task` | Cross-realm data. |
+| `Pool`, `Batch`, `PoolStats` | `tsr-scheduler` | The work-stealing pool; `tss_parallel::shared_pool()` is the process-wide instance. |
+| `collect`, `collect_minor`, `GcStats` | `tsr-gc` | Manual collection, as `runtime.gc.collect()` does. |
+| `compile`, `compile_module`, `CompileError` | `tsc-parser` | Single-file compilation. |
+| `compile_graph`, `ResolveConfig` | `tsc-modules` | Module graph compilation. |
+| `Program`, `Chunk`, `FunctionProto`, `disassemble` | `tsc-ir` | Compiled artefacts. |
+
+Read the `//!` crate docs at the top of each `src/lib.rs`; they are current and short.

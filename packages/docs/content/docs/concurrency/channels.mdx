@@ -1,0 +1,79 @@
+---
+title: Channels
+description: "Bounded queues with backpressure that work across every realm."
+---
+
+```typescript
+const ch = Channel.create({ capacity: 2 });
+await Channel.send(ch, value);       // parks when full
+const v = await Channel.recv(ch);    // undefined once closed and drained
+Channel.close(ch);
+```
+
+## API
+
+| Call | Behaviour |
+|---|---|
+| `Channel.create({ capacity })` | New channel. `capacity: 0` is a rendezvous channel: every send waits for a receiver. |
+| `Channel.send(ch, v)` | Returns immediately if there is room or a parked receiver, otherwise a promise that settles when the value is accepted. `v` is structured-cloned. |
+| `Channel.recv(ch)` | Returns a value immediately if one is queued, otherwise a promise. Returns `undefined` once the channel is closed **and** drained. |
+| `Channel.close(ch)` | Parked receivers resolve with `undefined`; parked senders reject with `channel closed while waiting`. |
+
+Both `send` and `recv` return either a value or a promise; always `await` them.
+
+## Portable across realms
+
+A channel handle is a plain object wrapping a shared core. Structured clone carries the core, so the **same** channel works inside `parallel.map` chunks, scope children, and actors:
+
+```typescript
+const out = Channel.create({ capacity: 100 });
+await parallel.for([1, 2, 3, 4, 5, 6, 7, 8], async (x: number) => {
+    await Channel.send(out, x * x);
+});
+Channel.close(out);
+
+let total = 0;
+while (true) {
+    const v = await Channel.recv(out);
+    if (v === undefined) break;
+    total += v;
+}
+console.log("squares total:", total);   // 204
+```
+
+This is the idiom for accumulating results from parallel work when order does not matter.
+
+## Producer / consumer with backpressure
+
+```typescript
+const ch = Channel.create({ capacity: 2 });
+
+async function producer(): Promise<number> {
+    for (let i = 1; i <= 5; i++) await Channel.send(ch, i);   // blocks at 3
+    Channel.close(ch);
+    return 5;
+}
+
+async function consumer(): Promise<number> {
+    let sum = 0;
+    while (true) {
+        await sleep(10);
+        const v = await Channel.recv(ch);
+        if (v === undefined) break;
+        sum += v;
+    }
+    return sum;
+}
+
+const p = producer();
+const c = consumer();
+console.log("produced:", await p, "consumed:", await c);
+```
+
+## Deadlock detection
+
+A `recv` on a channel that nothing will ever send to counts as outstanding external work, so the program stays alive, like Node with an open handle. If the main realm has nothing runnable and **no** external completers outstanding, the runtime exits with a deadlock error instead of hanging.
+
+## Performance
+
+100k messages through a channel: 5.0 ms in tscore versus 33.5 ms for Node `worker_threads` `postMessage` (see [Results](/docs/benchmarks/results)).

@@ -1,0 +1,38 @@
+---
+title: Globals
+description: "console, Math, Date, performance and sleep."
+---
+
+The global surface is deliberately small. Everything here is a native installed into every realm, so it is available in the main program, parallel chunks, scope children and actors alike.
+
+| Global | Signature | Notes |
+|---|---|---|
+| `console.log(...args)` | `void` | Arguments are formatted and joined with a single space, then written with a trailing newline. Stdout is locked per call, so lines from different threads never interleave mid-line. |
+| `Math.floor(x)` | `number` | |
+| `Math.sqrt(x)` | `number` | |
+| `Math.abs(x)` | `number` | |
+| `Math.min(a, b)` | `number` | Exactly two arguments. |
+| `Math.max(a, b)` | `number` | Exactly two arguments. |
+| `Math.imul(a, b)` | `number` | 32-bit integer multiply with wraparound, as in JavaScript. |
+| `Date.now()` | `number` | Milliseconds since the Unix epoch, wall clock. |
+| `performance.now()` | `number` | Monotonic milliseconds with sub-millisecond fraction, from process start. Use for timing. |
+| `sleep(ms)` | `Promise<undefined>` | Resolves after `ms` milliseconds. Negative values are clamped to 0. |
+| `s.charCodeAt(i)` | `number` | The one string method; `NaN` past the end. |
+
+Passing a non-number to a `Math` function is a runtime error naming the function, not a coercion.
+
+## Concurrency globals
+
+| Global | Documented in |
+|---|---|
+| `parallel.map`, `parallel.for` | [Parallel](/docs/concurrency/parallel) |
+| `actor` | [Actors](/docs/concurrency/actors) |
+| `Channel.create/send/recv/close` | [Channels](/docs/concurrency/channels) |
+| `task.scope`, `Runtime.checkCancellation` | [Structured concurrency](/docs/concurrency/structured-concurrency) |
+| `runtime.cpu`, `runtime.gc`, `runtime.stats` | [The runtime object](/docs/runtime-api/runtime-object) |
+| `runtime.fs`, `runtime.bytes` | [Files and bytes](/docs/runtime-api/fs-and-bytes) |
+| `runtime.net`, `runtime.http` | [Networking](/docs/runtime-api/net-and-http) |
+
+## Not present
+
+No `JSON`, `Object`, `Array` statics, `String` statics, `Number`, `setTimeout`, `process`, `fetch`, `require`. Some of these will arrive with method dispatch; today, loops and object literals are the idiom.

@@ -1,0 +1,62 @@
+---
+title: Overview
+description: "From TypeScript source to native code, and how work reaches the cores."
+---
+
+```text
+TypeScript source
+      │
+      ▼
+oxc parse + type-strip ──► resolver (scopes, captures, subset gate)
+      │
+      ▼
+bytecode  (tsc-ir: FunctionProto / Chunk)         ← the compiler↔runtime contract
+      │
+      ├──► optimizer passes (emit-time, once per function)
+      ▼
+register-machine interpreter (tsr-realm)
+      │        │
+      │        └──► Tier-1 / Tier-2 ARM64 JIT (tsr-jit), hot functions + OSR
+      ▼
+work-stealing scheduler (tsr-scheduler)
+      │
+ ┌────┴─────┬─────────┐
+ ▼          ▼         ▼
+worker 0  worker 1 … worker N        one pinned OS thread per core
+ │          │         │
+per-realm arena heaps (isolated: main / scratch / actor)
+      │
+PortableValue structured clone        ← the only way data crosses realms
+```
+
+## Front end
+
+The parser is [oxc](https://oxc.rs), pinned to an exact version and wrapped by `tsc-ast`. Types are stripped, then a resolver walks the AST once to build scopes, capture sets and mutation sets, and rejects anything outside the [subset](/docs/language/supported-subset).
+
+Compilation is **lazy**: only the top level and function signatures are emitted at startup. A body is re-parsed from its retained source slice and emitted on first call, with its capture table injected as an outer scope. For large flat files a **parallel frontend** blanks every function body in a length-preserving copy, parses that on the main thread, and resolves the real bodies on worker threads. Result: a 50k-line file parses and starts in about 7 ms.
+
+Module entries go through `tsc-modules`, which discovers the graph breadth-first, compiles each file with an import map, and hands the program to `tsr-modules` for instantiation. See [Modules](/docs/language/modules).
+
+## Bytecode
+
+A Lua-style register machine: fixed 32-bit instructions with `ABC` and `ABx` forms, up to 255 registers per frame, NaN-boxed 64-bit values. A `FunctionProto` is header (name, arity, annotations, upvalue sources, JIT state) plus a lazily filled body (code, constants, spans, nested protos). Emit-time optimizer passes run once per function; the interpreter and both JIT tiers all consume the same bytecode. Spec: [bytecode.md](https://github.com/knoxpo/typescript-core/blob/main/docs/specifications/bytecode.md).
+
+## Execution
+
+A **realm** owns a heap, a globals table, a native-function table and an event loop, and runs bytecode on the interpreter. Hot functions tier up to hand-rolled ARM64: Tier-1 keeps every register in its stack slot and inlines the fast paths; Tier-2 uses type dataflow seeded from annotations to keep numbers unboxed in FP registers. Async functions stay interpreted. See [Type annotations and the JIT](/docs/language/type-annotations-and-jit).
+
+## Scheduling
+
+One pinned thread per logical core, a Chase-Lev deque per worker, a global injector, and the classic loop: pop local, steal from a random victim, check the injector, park. `--workers N` counts the calling thread, which helps execute while it waits. On Apple Silicon the macOS platform layer sets QoS so workers stay on performance cores.
+
+Tasks are small structs (shared code + owned portable data) in deques, never OS threads, so 10k tasks cost 10k allocations, not 10k threads. Actors are the exception: each gets a dedicated thread.
+
+## Memory
+
+Every realm has its own arena heap. Scratch realms for parallel chunks and scope children bump-allocate and drop wholesale. Long-lived realms run a generational collector with a copying nursery. See [Garbage collection](/docs/memory/gc).
+
+## Milestones
+
+M0 architecture → M1 multicore proof → M2 actors → M3 structured concurrency + async → M4 GC → M5 typed IR + native compilation → M6 lazy compilation, modules, I/O → M7 AI sandbox → M8 RISC-V → M9 bare metal → M10 OS.
+
+Original design document: [00-overview.md](https://github.com/knoxpo/typescript-core/blob/main/docs/architecture/00-overview.md).

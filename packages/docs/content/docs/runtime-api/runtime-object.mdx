@@ -1,0 +1,53 @@
+---
+title: The runtime object
+description: "runtime.cpu, runtime.gc and runtime.stats for introspection."
+---
+
+`runtime` is a global namespace object. Its members are installed by different subsystems and merged into the same object.
+
+## runtime.cpu
+
+| Field | Meaning |
+|---|---|
+| `runtime.cpu.count` | The effective worker count: `--workers N` if given, otherwise the machine's logical CPU count. Fixed for the life of the process. |
+
+## runtime.gc
+
+| Call | Returns |
+|---|---|
+| `runtime.gc.stats()` | A fresh object with the counters below, for the **current realm**. |
+| `runtime.gc.collect()` | Forces a minor collection if the nursery is non-empty, then a full major collection. Returns `undefined`. |
+
+```typescript
+const s = runtime.gc.stats();
+console.log("minors:", s.minorCollections, "majors:", s.majorCollections,
+            "live MB:", Math.floor(s.liveBytes / 1e6), "max pause us:", s.maxPauseUs);
+```
+
+| Field | Meaning |
+|---|---|
+| `minorCollections` | Nursery evacuations so far. |
+| `majorCollections` | Full mark-sweeps so far. |
+| `lastFreed` | Slots freed by the last collection. |
+| `lastLive` | Slots live after the last collection. |
+| `liveBytes` | Approximate live bytes measured at the last major. |
+| `lastPauseUs` / `maxPauseUs` | Last and worst pause in microseconds. |
+| `heapSlots` | Total allocated slots across all arenas (objects, arrays, strings, closures, cells, foreigns). |
+| `promotedSinceMajor` | Bytes promoted out of the nursery since the last major; one of the major triggers. |
+| `rememberedPeak` | Largest remembered set seen; another major trigger. |
+
+## runtime.stats()
+
+Process-wide scheduler counters plus this realm's GC counts:
+
+| Field | Meaning |
+|---|---|
+| `workers` | Pool size. 0 if the pool was never started. |
+| `tasksExecuted` | Chunks and scope children executed. |
+| `steals` | Chunks taken from another worker's queue. |
+| `submits` | Tasks pushed to the pool. |
+| `parks` | Times a worker went to sleep for lack of work. |
+| `actors` | Live actor threads right now. |
+| `gcMinor` / `gcMajor` | This realm's collection counts. |
+
+`tscore run --stats` prints the same numbers at exit, and `tscore top` streams them for every running process.

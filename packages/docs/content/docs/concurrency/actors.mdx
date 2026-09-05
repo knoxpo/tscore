@@ -1,0 +1,67 @@
+---
+title: Actors
+description: "Long-lived isolated state on a dedicated thread with a bounded mailbox."
+---
+
+```typescript
+const counter = actor(() => {
+    let n = 0;                             // state = captured locals
+    return {
+        add: (msg: { type: string, by: number }) => { n = n + msg.by; },
+        get: () => n,
+    };
+});
+
+counter.post({ type: "add", by: 2 });      // fire-and-forget
+const v = await counter.send({ type: "get" }); // reply
+counter.stop();
+```
+
+## Creating an actor
+
+`actor(setup, options?)`
+
+- `setup` is structured-cloned into a brand-new realm (own heap, own GC, own event loop) on a dedicated OS thread, and runs there **synchronously**. `actor()` returns only after setup finished; a setup error fails the call in the caller with the actor's message.
+- `setup` returns an object whose fields are handlers. A message's `type` field selects the handler; the handler receives the whole message.
+- Handlers may be `async`. The actor drives its own event loop per delivery.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `mailbox` | 1024 | Mailbox capacity. Must be ≥ 1. |
+| `maxHeap` | unlimited | Live-byte limit for the actor's realm, in bytes. Exceeding it errors the handler that crossed it. |
+
+## Messaging
+
+| Call | Behaviour |
+|---|---|
+| `handle.post(msg)` | Queue and return immediately. Handler errors are logged to stderr, the actor keeps running. |
+| `handle.send(msg)` | Queue and return a promise for the handler's return value. A handler error rejects the promise, so it re-raises at your `await`. |
+| `handle.stop()` | Close the mailbox, drain queued messages, exit the thread. Stopping twice is fine; messaging after stop is a runtime error. |
+
+Messages must be objects with a `type` field. Message and reply cross realms by structured clone, with the same rules as `parallel.map`: no natives, no cycles, no actor or scope handles.
+
+## Guarantees
+
+- **Sequential locally, parallel globally.** One actor processes one message at a time, in mailbox order. Different actors run concurrently on their own threads.
+- **Backpressure.** When the mailbox is full, `post` and `send` block the caller until space frees.
+- **Failure isolation.** A handler error stays inside the actor: it fails that one message and nothing else. The actor's heap is collected independently of the main realm.
+
+```typescript
+const store = actor(() => {
+    const items: string[] = [];
+    return {
+        put: (msg: { type: string, value: string }) => { items.push(msg.value); },
+        size: () => items.length,
+        boom: () => missingGlobal,       // fails only this message
+    };
+});
+```
+
+## What an actor can use
+
+Actor realms have the full API: `parallel.*`, `task.scope`, `Channel`, `sleep`, `runtime.*`, and `actor` itself, so actors can spawn actors.
+
+## Limits
+
+- One OS thread per actor, with a 32 MB stack. Thousands of actors means thousands of threads; scheduler-hosted actors are a roadmap item.
+- Handles are realm-local. You cannot capture `counter` into a `parallel.map` callback or send it to another actor. Use a [Channel](/docs/concurrency/channels) when two realms need to talk.

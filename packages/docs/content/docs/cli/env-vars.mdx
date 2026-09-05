@@ -1,0 +1,61 @@
+---
+title: Environment variables
+description: "Runtime knobs and debug switches, read from the process environment."
+---
+
+All switches are read once, at the point of use. Setting a variable to any value enables it unless a number is documented. None of these are needed for normal use; they exist for A/B measurement, debugging, and the differential test harness.
+
+## JIT
+
+| Variable | Effect |
+|---|---|
+| `TSC_NO_JIT` | Interpreter only. The baseline for every differential test. |
+| `TSC_NO_TIER2` | Allow Tier-1 (baseline templates) but never the typed Tier-2. |
+| `TSC_JIT_THRESHOLD=N` | Calls before a function is compiled. Default 50. `1` compiles on first call. |
+| `TSC_OSR_THRESHOLD=N` | Loop back-edges before on-stack replacement into compiled code. |
+| `TSC_INT_SPEC` | Toggle for the integer-lane specialisation in Tier-2. |
+| `TSC_JIT_DEBUG` | Log compile decisions, tier-ups and demotions to stderr. |
+| `TSC_DEOPT_DEBUG` | Log every deoptimisation with its reason. |
+| `TSC_JIT_MAP=<file>` | Write one `<hex addr> <hex size> <name>` line per published code region. Lets `sample`/`perf` attribute time to TypeScript functions. Used by `benchmarks/jitprof.sh`. |
+| `TSC_JIT_DUMP=<dir>` | Dump raw machine code per region for offline disassembly. |
+| `TSC_LAYOUT_DEBUG` | Print the runtime struct-layout probe results the inline heap paths depend on. |
+
+## Garbage collector
+
+| Variable | Effect |
+|---|---|
+| `TSC_NURSERY_BYTES=N` | Nursery size that triggers a minor collection. Default 16 MB. `1` is **GC-stress mode**: a minor at every safepoint. |
+| `TSC_NO_NURSERY` | Disable the copying nursery; allocate straight into the old generation. |
+| `TSCORE_GC_MAJOR_ONLY` | Disable generational collection entirely: every GC is a full mark-sweep. A/B switch. |
+| `TSC_GC_DEBUG` | Per-collection log line: kind, freed, live, pause. |
+| `TSC_ROPE_LIMIT=N` | Threshold above which string concatenation builds a rope instead of copying. |
+
+## Compiler
+
+| Variable | Effect |
+|---|---|
+| `TSC_NO_LAZY` | Compile every function body eagerly at startup. Restores startup-time reporting of all subset errors. |
+| `TSC_NO_PARALLEL_FRONTEND` | Disable the multi-threaded parse of flat top-level-function files. |
+| `TSC_COMPILE_PHASES` | Print per-phase timings (read, parse, resolve, emit, to-exec) and the `filled=N/M lazy protos` line at exit. |
+| `TSC_CAPS_DEBUG` | Dump each function's captured-variable table during emission. |
+
+## Runtime
+
+| Variable | Effect |
+|---|---|
+| `TSC_NO_POOL_WARM` | Do not pre-spawn the worker pool on a background thread at startup. |
+| `TSC_NO_AWAIT_FUSE` | Disable the fused await fast path in the interpreter. |
+| `TSC_TIMER_DEBUG` | Log timer-wheel scheduling for `sleep`. |
+
+## Typical combinations
+
+```bash
+# maximum JIT pressure, used by tests/differential.sh
+TSC_OSR_THRESHOLD=10 TSC_JIT_THRESHOLD=1 tscore run prog.ts
+
+# GC stress + aggressive JIT: the harshest correctness mode
+TSC_NURSERY_BYTES=1 TSC_OSR_THRESHOLD=10 TSC_JIT_THRESHOLD=1 tscore run prog.ts
+
+# where does startup time go?
+TSC_COMPILE_PHASES=1 tscore run big.ts --no-stats-export
+```

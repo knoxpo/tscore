@@ -1,0 +1,46 @@
+---
+title: Project configuration
+description: "tscore.json and how bare module specifiers resolve."
+---
+
+Single-file scripts need no configuration. Once you split code into modules, `tscore.json` tells the resolver where bare specifiers live.
+
+## Discovery
+
+The resolver walks **upward from the entry file's directory** and uses the first `tscore.json` it finds. Its directory becomes the project root. With no file present the root is the entry's directory and `moduleDirs` defaults to `["modules"]`.
+
+## Keys
+
+```json title="tscore.json"
+{
+  "moduleDirs": ["modules", "vendor"],
+  "paths": { "@app/": "./src/" }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `moduleDirs` | Directories under the root searched for bare specifiers. For `import { sq } from "mathx"` the resolver tries `<root>/<dir>/mathx.ts`, then `<root>/<dir>/mathx/index.ts`, in order. |
+| `paths` | Prefix rewrites tried **before** `moduleDirs`. `"@app/": "./src/"` maps `@app/util` to `<root>/src/util`. |
+
+Relative specifiers ignore the config: `./x` tries the exact path, then `.ts`, then `/index.ts`.
+
+<Callout>
+The config reader is deliberately minimal: it extracts exactly these two keys with string scanning, not a JSON parser. Keep the file flat and do not rely on comments or nesting.
+</Callout>
+
+## Example layout
+
+```text
+project/
+  tscore.json          { "moduleDirs": ["modules"] }
+  main.ts              import { sq } from "mathx";
+  modules/
+    mathx.ts           export function sq(x: number) { return x * x; }
+```
+
+```bash
+tscore run project/main.ts
+```
+
+See [Modules](/docs/language/modules) for the full ESM semantics.

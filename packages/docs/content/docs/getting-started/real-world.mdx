@@ -1,0 +1,146 @@
+---
+title: "A real problem: portfolio risk"
+description: "Monte Carlo Value-at-Risk on five stocks. Same file on tscore and Node, measured."
+---
+
+Hello world shows the mechanics. This page takes a problem people actually pay compute for, writes it once, and runs the **same file** on Node and on tscore.
+
+## The problem
+
+A desk holds five stocks. Risk wants one number every morning:
+
+> With 99% confidence, what is the most this portfolio can lose over the next 21 trading days?
+
+That is **Value-at-Risk (VaR)**, and its companion **expected shortfall** (the average loss in the worst 1% of outcomes). The stocks are correlated through the market: every name has a beta to a shared market shock plus its own idiosyncratic noise. There is no closed form for the basket's loss distribution under that model, so the standard approach is Monte Carlo:
+
+1. Draw a market shock and five stock-specific shocks for each of 21 days.
+2. Roll all five prices forward, day by day.
+3. Record the portfolio's 21-day return.
+4. Repeat for 400,000 scenarios and read the 1st percentile.
+
+Every scenario is independent of every other one. That is the important property: the work is embarrassingly parallel, and it is heavy. 400,000 scenarios × 21 days × 6 normal draws × 12 uniforms each is about **600 million random numbers**, plus the price arithmetic.
+
+## The program
+
+`examples/portfolio_var.ts` in the repository. The core is one function per scenario:
+
+```typescript title="examples/portfolio_var.ts (kernel)"
+// One scenario: roll the five stocks forward DAYS days, return the
+// portfolio's return.  Pure f64 arithmetic on one annotated argument, no
+// arrays, no calls: this qualifies for the typed JIT tier.
+function scenarioReturn(seed: number): number {
+    let x = seed % 2147483647;
+    if (x <= 0) x = x + 2147483646;
+    let p0 = 1, p1 = 1, p2 = 1, p3 = 1, p4 = 1;
+    for (let d = 0; d < DAYS; d++) {
+        let zm = -6, z0 = -6, z1 = -6, z2 = -6, z3 = -6, z4 = -6;
+        for (let k = 0; k < 12; k++) {            // sum of 12 uniforms - 6 ~ N(0,1)
+            x = (x * 48271) % 2147483647; zm += x / 2147483647;
+            x = (x * 48271) % 2147483647; z0 += x / 2147483647;
+            x = (x * 48271) % 2147483647; z1 += x / 2147483647;
+            x = (x * 48271) % 2147483647; z2 += x / 2147483647;
+            x = (x * 48271) % 2147483647; z3 += x / 2147483647;
+            x = (x * 48271) % 2147483647; z4 += x / 2147483647;
+        }
+        const market = MARKET_SIGMA * zm * SQRT_DT;
+        p0 = p0 * (1 + MU0 / 252 + B0 * market + E0 * z0 * SQRT_DT);
+        p1 = p1 * (1 + MU1 / 252 + B1 * market + E1 * z1 * SQRT_DT);
+        p2 = p2 * (1 + MU2 / 252 + B2 * market + E2 * z2 * SQRT_DT);
+        p3 = p3 * (1 + MU3 / 252 + B3 * market + E3 * z3 * SQRT_DT);
+        p4 = p4 * (1 + MU4 / 252 + B4 * market + E4 * z4 * SQRT_DT);
+    }
+    return W0 * p0 + W1 * p1 + W2 * p2 + W3 * p3 + W4 * p4 - 1;
+}
+```
+
+A batch function runs `count` scenarios and buckets the returns into a histogram, and the batches are the items handed to `parallel.map`:
+
+```typescript title="examples/portfolio_var.ts (parallel section)"
+// --- engine shim: identical source on tscore and Node -------------------
+const native = typeof parallel !== "undefined";
+const cores = native ? runtime.cpu.count : 1;
+async function pmap(items: { seed: number, count: number }[], f: any): Promise<number[][]> {
+    if (native) return await parallel.map(items, f);
+    const out: number[][] = [];
+    for (const it of items) out.push(f(it));   // Node: serial fallback
+    return out;
+}
+// ------------------------------------------------------------------------
+
+const batches: { seed: number, count: number }[] = [];
+for (let b = 0; b < BATCHES; b++) batches.push({ seed: b, count: SCENARIOS / BATCHES });
+
+const t0 = performance.now();
+const hists = await pmap(batches, (job: { seed: number, count: number }) =>
+    simulateBatch(job.seed, job.count, zeros(BINS)));
+const t1 = performance.now();
+```
+
+The rest merges the 128 histograms and reads the quantiles off the cumulative counts. Random numbers come from a Park-Miller generator seeded per scenario, so the answer is **deterministic**: identical on every engine and at every worker count.
+
+Design notes that matter for speed on tscore:
+
+- **The kernel has no calls inside its loops.** A call inside a loop keeps a function out of the baseline JIT tier, so `Math.floor`, `push`, and the per-asset helper you might reach for are all hoisted out.
+- **The kernel touches no arrays.** Prices are five scalars and the portfolio is named constants. Array access disqualifies the typed tier; scalars let it keep everything in FP registers.
+- **The parallel unit is a batch, not a scenario.** 128 jobs of 3,125 scenarios each. Each job's captures and result are structured-cloned, so a histogram per job is cheap and a 400,000-element result array would not be.
+
+## Run it
+
+```bash
+tscore run examples/portfolio_var.ts --workers 8
+```
+
+```text
+portfolio: ACME 30%  BOLT 25%  CRUX 20%  DYNE 15%  EVER 10%
+scenarios: 400000  horizon: 21 days  engine: tscore  cores: 8
+expected 1-month return: 0.76%
+VaR 95%: 8.32%   VaR 99%: 11.77%
+expected shortfall 99%: 13.4%
+simulation took 698ms
+```
+
+Read: one month out, there is a 1-in-100 chance of losing 11.8% or more, and when that happens the average loss is 13.4%.
+
+Now the same file on Node. Node 24 strips the type annotations itself; the shim sees no `parallel` global and runs the batches in a loop:
+
+```bash
+node examples/portfolio_var.ts
+```
+
+```text
+portfolio: ACME 30%  BOLT 25%  CRUX 20%  DYNE 15%  EVER 10%
+scenarios: 400000  horizon: 21 days  engine: node  cores: 1
+expected 1-month return: 0.76%
+VaR 95%: 8.32%   VaR 99%: 11.77%
+expected shortfall 99%: 13.4%
+simulation took 21788ms
+```
+
+Same numbers, to the last digit.
+
+## What happened
+
+Measured on an Apple M5 Max (6P + 12E cores), release binary, single run each, Node 24.17:
+
+| run | time | vs Node |
+|---|---|---|
+| `node examples/portfolio_var.ts` | 21.8 s | 1.0× |
+| `tscore run … --workers 1` | 6.3 s | 3.5× |
+| `tscore run … --workers 2` | 3.1 s | 7.0× |
+| `tscore run … --workers 4` | 1.5 s | 14× |
+| `tscore run … --workers 8` | 0.70 s | 31× |
+| `tscore run … --workers 18` | 0.32 s | 69× |
+
+Two separate effects are stacked here, and it is worth pulling them apart.
+
+**Per core.** tscore is 3.5× faster than V8 on this kernel with one worker. The kernel is pure `f64` arithmetic with `%` on values that exceed the 32-bit integer range, and V8 executes that modulo as a C library call while tscore's typed tier keeps it inline. This is specific to the kernel, not a general claim: on object-heavy code V8 is currently 3 to 5× faster than tscore per core (see [Results](/docs/benchmarks/results)).
+
+**Across cores.** From 1 to 8 workers tscore gets 9.0× (over-linear from the P-cores' turbo headroom), and 18 workers reach 20×. Nothing in the program changed to get this; `parallel.map` split the batches, stole work between cores and cloned the histograms back.
+
+To keep the comparison honest: rewriting the random-number generator in the way that suits V8 (bitwise xorshift, which tscore currently handles worse) brings **Node down to 1.3 s** on one core. Against that tuned version, tscore still wins from 8 workers up (0.70 s), because Node has no way to use the other cores without rewriting the program around `worker_threads`, message passing and manual chunking. That rewrite is the thing this runtime exists to make unnecessary.
+
+## Try changing it
+
+- `SCENARIOS` up to 4,000,000 for a smoother tail. Node's time scales linearly; tscore's scales with cores.
+- Add a sixth stock: one more `p5` and one more `z5` draw. The kernel stays a leaf, so nothing else changes.
+- Watch it live: run with `--stats`, or open `tscore top` in a second terminal while it runs.

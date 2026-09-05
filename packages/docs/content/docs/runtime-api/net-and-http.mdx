@@ -1,0 +1,63 @@
+---
+title: Networking
+description: "runtime.net for TCP and runtime.http.serve for HTTP/1.1."
+---
+
+## runtime.net (TCP)
+
+A single kqueue reactor thread owns every socket: nonblocking I/O, readiness-queued reads and writes, results delivered back through promises.
+
+| Call | Returns | Notes |
+|---|---|---|
+| `listen(port)` or `listen({ port })` | `Listener` | Binds synchronously on `127.0.0.1`. |
+| `accept(listener)` | `Promise<Conn>` | |
+| `connect(host, port)` | `Promise<Conn>` | |
+| `read(conn, maxBytes?)` | `Promise<string \| undefined>` | `undefined` means EOF. |
+| `write(conn, s)` | `Promise<undefined>` | `s` must be a string. |
+| `close(conn \| listener)` | `undefined` | |
+
+```typescript
+const ln = runtime.net.listen(9000);
+while (true) {
+    const conn = await runtime.net.accept(ln);
+    const line = await runtime.net.read(conn);
+    await runtime.net.write(conn, `echo: ${line}`);
+    runtime.net.close(conn);
+}
+```
+
+Connection and listener handles are portable across realms by shared core, so an accepted connection can be handed to a scope child or pushed through a channel.
+
+## runtime.http.serve
+
+```typescript
+runtime.http.serve(8080, (req) => {
+    if (req.path === "/") return "hello";
+    return { status: 404, headers: { "content-type": "text/plain" }, body: "nope" };
+});
+```
+
+`serve(port, handler, { workers? })` never returns. It prints `tscore http: listening on 127.0.0.1:<port> (<n> worker(s))` on stderr.
+
+**Request object** `req`: `{ method, path, headers, body }`. Headers are a plain object with lower-cased keys. Chunked request bodies and keep-alive are supported.
+
+**Handler return value**: a string (200, text) or `{ status?, headers?, body? }`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `workers` | 1 | `1` turns the calling thread into the event loop: the handler runs in your realm and may close over program state. `N` gives each thread its own realm and a structured clone of the handler, so main-realm globals and modules are **not** visible inside it, the same rule as `parallel.map`. |
+
+Each worker owns its connections end to end: one kqueue per worker, all watching the same listening socket, with parse, handler and response on one thread. There is no per-request hand-off.
+
+### Choosing `workers`
+
+Measured with `benchmarks/compare/http_bench.py` on Apple M5 Max, hello-world handler:
+
+| Configuration | req/s | cores used | req/s per core |
+|---|---|---|---|
+| tscore `workers: 1` | 197k | 1.1 | 186k |
+| tscore `workers: 8` | 224k | 2.0 | 115k |
+| bun ×1 | 191k | 1.0 | 185k |
+| node ×1 | 134k | 1.0 | 134k |
+
+The machine's loopback stack caps total throughput regardless of engine, so read the per-core column. Leave `workers` at 1 unless the network path, not the CPU, is the bottleneck on your hardware.

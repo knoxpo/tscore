@@ -1,0 +1,69 @@
+---
+title: Installation
+description: "Build the tscore binary from source."
+---
+
+TypeScript Core ships as a single binary, `tscore`, built from a Rust workspace. There is no npm package and no prebuilt release yet.
+
+## Prerequisites
+
+| Requirement | Notes |
+|---|---|
+| ARM64 machine | Apple Silicon Mac, or an aarch64 Linux box. The JIT emits ARM64 only. |
+| macOS or Linux | The network reactor uses kqueue; Linux is supported for compute, macOS is the primary target. |
+| Rust stable toolchain | Edition 2021. Install with [rustup](https://rustup.rs). The repo has no `rust-toolchain.toml`, so whatever `rustup default` is applies. |
+| C toolchain | Xcode Command Line Tools on macOS (`xcode-select --install`), `build-essential` on Debian/Ubuntu. |
+| Node 24 + Bun (optional) | Only for the cross-engine benchmarks and the differential harness. Not needed to run programs. |
+| Python 3 (optional) | Only for `benchmarks/jitprof.sh` and the HTTP benchmark. |
+
+## Build
+
+```bash
+git clone https://github.com/knoxpo/typescript-core.git
+cd typescript-core
+cargo build --release -p tscore
+```
+
+The binary lands at `target/release/tscore`. Release mode matters: the workspace enables thin LTO and a single codegen unit, and debug builds are an order of magnitude slower in the interpreter.
+
+Put it on your `PATH`, or call it by path:
+
+```bash
+export PATH="$PWD/target/release:$PATH"
+tscore --version
+```
+
+```text
+tscore 0.1.0
+```
+
+## Verify
+
+```bash
+tscore run examples/hello.ts
+```
+
+```text
+Hello TypeScript Core
+1 + 2 = 3
+```
+
+Then run the full test suite once, so you know the toolchain is healthy:
+
+```bash
+cargo test
+```
+
+This drives every golden program under `tests/golden/` at worker counts 1 and 4 and asserts byte-identical output.
+
+## Profiles
+
+| Profile | Command | Use |
+|---|---|---|
+| `release` | `cargo build --release` | Default for running anything. |
+| `profiling` | `cargo build --profile profiling` | Release plus debug symbols, for `sample`/`perf`. |
+| `dev` | `cargo build` | Compiler hacking only. |
+
+<Callout type="warn">
+Always run benchmarks and anything timing-sensitive on the `release` binary. `cargo run` without `--release` is a debug build.
+</Callout>
