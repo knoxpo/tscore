@@ -551,7 +551,7 @@ pub fn collect_minor<'a>(
     for (i, o) in nur.objs.iter_mut().enumerate() {
         if m.fwd_objs[i] != u32::MAX {
             evacuated += 1;
-        } else if o.overflow.capacity() > 0 && heap.pool_arr_bufs.len() < 131072 {
+        } else if o.overflow.capacity() > 0 && heap.pool_arr_bufs.len() < tsr_memory::BUF_POOL_CAP {
             let mut b = std::mem::take(&mut o.overflow);
             b.clear();
             if b.capacity() <= 1024 {
@@ -562,7 +562,7 @@ pub fn collect_minor<'a>(
     for (i, a) in nur.arrs.iter_mut().enumerate() {
         if m.fwd_arrs[i] != u32::MAX {
             evacuated += 1;
-        } else if a.capacity() > 0 && heap.pool_arr_bufs.len() < 131072 {
+        } else if a.capacity() > 0 && heap.pool_arr_bufs.len() < tsr_memory::BUF_POOL_CAP {
             let mut b = std::mem::take(a);
             b.clear();
             if b.capacity() <= 1024 {
@@ -574,7 +574,7 @@ pub fn collect_minor<'a>(
         if m.fwd_strs[i] != u32::MAX {
             evacuated += 1;
         } else if let tsr_memory::HStr::Buf(b) = hs {
-            if b.capacity() > 0 && heap.pool_str_bufs.len() < 131072 {
+            if b.capacity() > 0 && heap.pool_str_bufs.len() < tsr_memory::BUF_POOL_CAP {
                 let mut b = std::mem::take(b);
                 b.clear();
                 if b.capacity() <= 1024 {

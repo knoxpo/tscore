@@ -6,6 +6,15 @@
 //! M1: bump-style Vec arenas, free-on-realm-death; mark-sweep for the main
 //! realm arrives in tsr-gc (P4).
 
+/// Recycled backing buffers held between collections.
+///
+/// The pool only refills when a minor collection harvests dead nursery
+/// slots, so a cap below the number of allocations per cycle sends the
+/// remainder to the allocator every cycle and frees the surplus. A 16MB
+/// nursery holds roughly 350k small arrays, against the old cap of 131k,
+/// which measured a 50% pool hit rate on an array-literal loop.
+pub const BUF_POOL_CAP: usize = 262144;
+
 use std::sync::Arc;
 use tsc_ir::FunctionProto;
 
@@ -1415,7 +1424,7 @@ impl Heap {
             Some(r) => {
                 let old = std::mem::replace(&mut self.objs[r as usize], o);
                 // the freed slot kept its overflow buffer — recycle it
-                if old.overflow.capacity() > 0 && self.pool_arr_bufs.len() < 131072 {
+                if old.overflow.capacity() > 0 && self.pool_arr_bufs.len() < BUF_POOL_CAP {
                     let mut b = old.overflow;
                     b.clear();
                     self.pool_arr_bufs.push(b);
@@ -1439,7 +1448,7 @@ impl Heap {
         let r = match self.free_arrs.pop() {
             Some(r) => {
                 let old = std::mem::replace(&mut self.arrs[r as usize], v);
-                if old.capacity() > 0 && self.pool_arr_bufs.len() < 131072 {
+                if old.capacity() > 0 && self.pool_arr_bufs.len() < BUF_POOL_CAP {
                     let mut b = old;
                     b.clear();
                     self.pool_arr_bufs.push(b);
@@ -1464,7 +1473,7 @@ impl Heap {
             Some(r) => {
                 let old = std::mem::replace(&mut self.strs[r as usize], s);
                 if let HStr::Buf(mut b) = old {
-                    if b.capacity() > 0 && self.pool_str_bufs.len() < 131072 {
+                    if b.capacity() > 0 && self.pool_str_bufs.len() < BUF_POOL_CAP {
                         b.clear();
                         self.pool_str_bufs.push(b);
                     }
