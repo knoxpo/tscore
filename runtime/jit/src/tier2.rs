@@ -543,7 +543,7 @@ pub fn compile(
                 .unwrap_or(*h);
             !pbody.code[*h..=end]
                 .iter()
-                .any(|i| matches!(i.op, Op::Len | Op::GetIndex))
+                .any(|_| false) // array loops allowed: x21 is the intermediate now, x22 stays the array cache
                 && lane_pick(pbody, facts, *h, vs).is_some()
         });
         let int_lane = acache_on || lane_on;
@@ -735,7 +735,7 @@ pub fn compile(
             // against what the lane wins there.
             if pbody.code[*h..=end]
                 .iter()
-                .any(|i| matches!(i.op, Op::Len | Op::GetIndex))
+                .any(|_| false) // array loops allowed: x21 is the intermediate now, x22 stays the array cache
             {
                 continue;
             }
@@ -2224,18 +2224,29 @@ fn emit_op(
             let slow = c.a.new_label();
             let done = c.a.new_label();
             if let Some(o) = c.offsets {
-                // the index guard clobbers x10, so it has to run before
-                // the base pointer lands there
-                c.fetch_x(ins.c, 9);
-                c.guard_number(9, slow);
+                // An index the lane already holds as an integer needs no
+                // tag guard and no integrality check: it is a sign-extended
+                // i32, so a negative one fails the unsigned bounds compare.
+                let lane_ix = in_lane && (c.lane == Some(ins.c) || c.itmp == Some(ins.c));
+                if !lane_ix {
+                    // the index guard clobbers x10, so it has to run before
+                    // the base pointer lands there
+                    c.fetch_x(ins.c, 9);
+                    c.guard_number(9, slow);
+                }
                 let reuse = *acache == Some(ins.b) && c.int_lane;
                 c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, c.acache_on);
                 *acache = Some(ins.b);
-                c.a.fmov_dx(0, 9);
-                c.a.fcvtzs(13, 0);
-                c.a.scvtf(1, 13);
-                c.a.fcmp(1, 0);
-                c.a.b_cond(Cond::Ne, slow);
+                if lane_ix {
+                    let r = if c.lane == Some(ins.c) { R_LANE } else { R_ITMP };
+                    c.a.mov(13, r);
+                } else {
+                    c.a.fmov_dx(0, 9);
+                    c.a.fcvtzs(13, 0);
+                    c.a.scvtf(1, 13);
+                    c.a.fcmp(1, 0);
+                    c.a.b_cond(Cond::Ne, slow);
+                }
                 c.a.ldr_imm(14, 10, o.vec_len);
                 c.a.cmp_reg(13, 14);
                 c.a.b_cond(Cond::Hs, slow);
