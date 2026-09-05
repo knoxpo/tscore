@@ -5,6 +5,9 @@
 //!              [--dump-bytecode] [--no-stats-export]
 //!   tscore top
 
+mod help;
+
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -14,17 +17,51 @@ use tsr_realm::StatsHub;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut it = args.iter();
+    let out = help::Style::for_stdout();
+    let err = help::Style::for_stderr();
+    let wants_help = args.iter().skip(1).any(|a| a == "-h" || a == "--help");
     match it.next().map(String::as_str) {
+        Some("run") if wants_help => {
+            print!("{}", help::run(&out));
+            return ExitCode::SUCCESS;
+        }
         Some("run") => {}
+        Some("top") if wants_help => {
+            print!("{}", help::top(&out));
+            return ExitCode::SUCCESS;
+        }
         Some("top") => return top(),
         Some("--version") | Some("-V") => {
             println!("tscore {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
-        _ => {
-            eprintln!(
-                "usage: tscore run <file.ts> [--workers N] [--max-heap MB] \
-                 [--stats] [--dump-bytecode]  |  tscore top"
+        None | Some("-h") | Some("--help") => {
+            print!("{}", help::root(&out));
+            return ExitCode::SUCCESS;
+        }
+        Some("help") => {
+            let page = match it.next().map(String::as_str) {
+                None => help::root(&out),
+                Some("run") => help::run(&out),
+                Some("top") => help::top(&out),
+                Some(other) => {
+                    eprint!(
+                        "{}",
+                        help::usage_error(&err, &format!("no help for `{other}`"))
+                    );
+                    return ExitCode::from(2);
+                }
+            };
+            print!("{page}");
+            return ExitCode::SUCCESS;
+        }
+        Some(other) => {
+            eprint!(
+                "{}",
+                help::usage_error(
+                    &err,
+                    &format!("unknown command `{other}` (expected run, top, help)")
+                )
             );
             return ExitCode::from(2);
         }
@@ -44,26 +81,33 @@ fn main() -> ExitCode {
             "--workers" => {
                 workers = it.next().and_then(|n| n.parse().ok());
                 if workers.is_none() {
-                    eprintln!("--workers needs a number");
+                    eprint!("{}", help::usage_error(&err, "--workers needs a number"));
                     return ExitCode::from(2);
                 }
             }
             "--max-heap" => {
                 max_heap_mb = it.next().and_then(|n| n.parse().ok());
                 if max_heap_mb.is_none() {
-                    eprintln!("--max-heap needs a number (MB)");
+                    eprint!(
+                        "{}",
+                        help::usage_error(&err, "--max-heap needs a number (MB)")
+                    );
                     return ExitCode::from(2);
                 }
             }
             f if !f.starts_with('-') && file.is_none() => file = Some(f.to_string()),
             other => {
-                eprintln!("unknown argument: {other}");
+                eprint!(
+                    "{}",
+                    help::usage_error(&err, &format!("unknown argument `{other}`"))
+                );
                 return ExitCode::from(2);
             }
         }
     }
     let Some(file) = file else {
-        eprintln!("usage: tscore run <file.ts>");
+        eprint!("{}", help::usage_error(&err, "run needs a file"));
+        eprint!("{}", help::run(&err));
         return ExitCode::from(2);
     };
 
@@ -283,6 +327,8 @@ impl Drop for StatsExport {
 
 /// `tscore top` — live table of running tscore processes.
 fn top() -> ExitCode {
+    let tty = std::io::stdout().is_terminal();
+    let st = help::Style::for_stdout();
     loop {
         let mut rows: Vec<Vec<String>> = Vec::new();
         let now = std::time::SystemTime::now()
@@ -295,7 +341,9 @@ fn top() -> ExitCode {
                 if !name.starts_with("tscore-stats-") || !name.ends_with(".txt") {
                     continue;
                 }
-                let Ok(body) = std::fs::read_to_string(e.path()) else { continue };
+                let Ok(body) = std::fs::read_to_string(e.path()) else {
+                    continue;
+                };
                 let mut kv = std::collections::HashMap::new();
                 for line in body.lines() {
                     if let Some((k, v)) = line.split_once('\t') {
@@ -320,7 +368,11 @@ fn top() -> ExitCode {
                     .unwrap_or_else(|| "-".into());
                 rows.push(vec![
                     get("pid"),
-                    if age > 3 { format!("{script} (stale)") } else { script },
+                    if age > 3 {
+                        format!("{script} (stale)")
+                    } else {
+                        script
+                    },
                     format!("{}s", get("uptime_s")),
                     get("workers"),
                     get("tasks"),
@@ -332,31 +384,152 @@ fn top() -> ExitCode {
                 ]);
             }
         }
-        // redraw
-        print!("\x1b[2J\x1b[H");
-        println!("tscore top — {} process(es), refresh 1s, ctrl-c to quit\n", rows.len());
-        let headers =
-            ["PID", "SCRIPT", "UP", "WRK", "TASKS", "STEALS", "HEAP", "GC m/M", "PAUSE", "ACTORS"];
-        let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
-        for r in &rows {
-            for (i, c) in r.iter().enumerate() {
-                widths[i] = widths[i].max(c.len());
-            }
+        let frame = render_table(&st, &rows);
+        let mut out = std::io::stdout();
+        if tty {
+            // home + erase-to-end-of-screen, then the whole frame in one write: no tearing
+            let _ = out.write_all(b"\x1b[H\x1b[J");
         }
-        let fmt_row = |cells: &[String]| {
-            cells
-                .iter()
-                .enumerate()
-                .map(|(i, c)| format!("{:<w$}", c, w = widths[i] + 2))
-                .collect::<String>()
-        };
-        println!("{}", fmt_row(&headers.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
-        for r in &rows {
-            println!("{}", fmt_row(r));
-        }
-        if rows.is_empty() {
-            println!("(no running tscore processes found)");
+        let _ = out.write_all(frame.as_bytes());
+        let _ = out.flush();
+        if !tty {
+            // piped or redirected: one plain frame, no escape codes, then exit
+            return ExitCode::SUCCESS;
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+const TOP_HEADERS: [&str; 10] = [
+    "PID", "SCRIPT", "UP", "WRK", "TASKS", "STEALS", "HEAP", "GC m/M", "PAUSE", "ACTORS",
+];
+
+/// Renders `top` as a header line plus a box-drawn table.
+fn render_table(st: &help::Style, rows: &[Vec<String>]) -> String {
+    let w = |s: &str| s.chars().count(); // chars, not bytes: a non-ASCII script name would skew every column
+    let mut widths: Vec<usize> = TOP_HEADERS.iter().map(|h| w(h)).collect();
+    for r in rows {
+        for (i, c) in r.iter().enumerate() {
+            widths[i] = widths[i].max(w(c));
+        }
+    }
+    // PID and SCRIPT are labels; the rest are numbers, right-aligned so digits line up.
+    // Pad on the plain text, colour afterwards, so escapes never count toward width.
+    let pad = |c: &str, i: usize| {
+        let gap = " ".repeat(widths[i] - w(c));
+        if i < 2 {
+            format!("{c}{gap}")
+        } else {
+            format!("{gap}{c}")
+        }
+    };
+    let edge = |s: &str| st.dim(&st.rgb(help::CORAL, s));
+    let rule = |l: &str, m: &str, r: &str| {
+        let mut s = String::from(l);
+        for (i, width) in widths.iter().enumerate() {
+            if i > 0 {
+                s.push_str(m);
+            }
+            s.push_str(&"─".repeat(width + 2));
+        }
+        s.push_str(r);
+        format!("  {}\n", edge(&s))
+    };
+    let sep = edge("│");
+    let row = |cells: &[String], paint: &dyn Fn(usize, &str) -> String| {
+        let mut s = format!("  {sep}");
+        for (i, c) in cells.iter().enumerate() {
+            s.push_str(&format!(" {} {sep}", paint(i, &pad(c, i))));
+        }
+        s.push('\n');
+        s
+    };
+
+    let mut out = format!(
+        "\n  {}  {}\n\n",
+        st.bold(&st.rgb(help::CORAL, "tscore top")),
+        st.dim(&format!(
+            "{} process{} · refresh 1s · ctrl-c to quit",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "es" }
+        ))
+    );
+    out.push_str(&rule("╭", "┬", "╮"));
+    let headers: Vec<String> = TOP_HEADERS.iter().map(|s| s.to_string()).collect();
+    out.push_str(&row(&headers, &|_, c| st.bold(&st.rgb(help::CYAN, c))));
+    out.push_str(&rule("├", "┼", "┤"));
+    if rows.is_empty() {
+        // ponytail: one spanning cell, so the frame keeps its shape when nothing is running
+        let inner: usize = widths.iter().map(|x| x + 3).sum::<usize>() - 1;
+        let msg = "no running tscore processes";
+        out.push_str(&format!(
+            "  {sep} {}{}{sep}\n",
+            st.dim(msg),
+            " ".repeat(inner.saturating_sub(w(msg) + 1))
+        ));
+    }
+    for r in rows {
+        let stale = r[1].ends_with("(stale)");
+        let slow_pause = r[8].trim_end_matches("us").parse::<u64>().unwrap_or(0) > 10_000;
+        out.push_str(&row(r, &|i, c| match i {
+            _ if stale => st.dim(c),
+            1 => st.bold(c),
+            8 if slow_pause => st.rgb(help::YELLOW, c),
+            _ => c.to_string(),
+        }));
+    }
+    out.push_str(&rule("╰", "┴", "╯"));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{help, render_table};
+
+    fn plain(rows: &[Vec<String>]) -> String {
+        render_table(&help::Style::plain(), rows)
+    }
+
+    /// Every line of a frame must be the same display width, or the box is broken.
+    fn assert_rectangular(frame: &str) {
+        let lines: Vec<&str> = frame
+            .lines()
+            .filter(|l| l.trim_start().starts_with(['╭', '│', '├', '╰']))
+            .collect();
+        let w = lines[0].chars().count();
+        for l in &lines {
+            assert_eq!(l.chars().count(), w, "ragged line: {l:?}");
+        }
+    }
+
+    #[test]
+    fn empty_table_is_rectangular() {
+        let f = plain(&[]);
+        assert_rectangular(&f);
+        assert!(f.contains("no running tscore processes"));
+        assert!(f.contains("0 processes · refresh 1s"));
+        assert!(!f.contains('\x1b'));
+    }
+
+    #[test]
+    fn rows_widen_columns_and_stay_rectangular() {
+        let mk = |pid: &str, script: &str| {
+            vec![
+                pid, script, "38s", "4", "10", "2", "1.5M", "3/1", "120us", "7",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+        };
+        let f = plain(&[mk("412", "a-very-long-script-name.ts"), mk("9", "b.ts")]);
+        assert_rectangular(&f);
+        assert!(f.contains("a-very-long-script-name.ts"));
+        assert!(f.contains("2 processes · refresh 1s"));
+    }
+
+    #[test]
+    fn one_process_is_singular() {
+        let r = vec![vec![String::from("1"); 10]];
+        assert!(plain(&r).contains("1 process · refresh 1s"));
     }
 }

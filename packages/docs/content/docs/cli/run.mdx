@@ -4,10 +4,14 @@ description: "Execute a TypeScript file."
 ---
 
 ```text
+tscore                       banner + command list (same as -h / --help)
 tscore run <file.ts> [--workers N] [--max-heap MB] [--stats] [--dump-bytecode] [--no-stats-export]
 tscore top
+tscore help [run|top]        per-command help (also `tscore run --help`)
 tscore --version | -V
 ```
+
+Output is colored when stdout is a terminal; set `NO_COLOR=1` to disable.
 
 Argument parsing is hand-rolled and strict: the first non-flag argument is the file, anything else unrecognised is an error. Flags may appear in any order after `run`.
 

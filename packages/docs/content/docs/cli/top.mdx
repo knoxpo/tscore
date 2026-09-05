@@ -8,16 +8,20 @@ tscore top
 ```
 
 ```text
-tscore top — 2 process(es), refresh 1s, ctrl-c to quit
-
-PID    SCRIPT              UP    WRK  TASKS  STEALS  HEAP    GC m/M  PAUSE   ACTORS
-41822  parallel_primes.ts  3s    8    64     19      0.1M    0/0     0us     0
-41830  actors.ts           12s   18   0      0       2.4M    3/1     1820us  2
+┌───────┬────────────────────┬─────┬─────┬───────┬────────┬───────┬────────┬────────┬────────┐
+│ PID   │ SCRIPT             │  UP │ WRK │ TASKS │ STEALS │  HEAP │ GC m/M │  PAUSE │ ACTORS │
+├───────┼────────────────────┼─────┼─────┼───────┼────────┼───────┼────────┼────────┼────────┤
+│ 41822 │ parallel_primes.ts │  3s │   8 │    64 │     19 │  0.1M │    0/0 │    0us │      0 │
+│ 41830 │ actors.ts          │ 12s │  18 │     0 │      0 │  2.4M │    3/1 │ 1820us │      2 │
+└───────┴────────────────────┴─────┴─────┴───────┴────────┴───────┴────────┴────────┴────────┘
+  2 processes · refresh 1s · ctrl-c to quit
 ```
 
 ## How it works
 
-Every `tscore run` writes a key/value snapshot to `$TMPDIR/tscore-stats-<pid>.txt` every 500 ms and deletes it on exit. `tscore top` scans that directory once a second and renders a table. There is no daemon and no socket.
+Every `tscore run` writes a key/value snapshot to `$TMPDIR/tscore-stats-<pid>.txt` every 500 ms and deletes it on exit. `tscore top` scans that directory once a second and redraws the table in place. There is no daemon and no socket.
+
+The live redraw only happens on a terminal. When stdout is piped or redirected (`tscore top | cat`, `tscore top > snapshot.txt`) it prints a single frame with no escape codes and exits.
 
 | Column | Source |
 |---|---|
