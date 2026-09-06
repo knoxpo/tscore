@@ -209,7 +209,7 @@ fi
     echo
     echo "| category | status |"
     echo "|---|---|"
-    echo "| modules | SHIPPED — full ESM (static + dynamic import, cycles, bare specifiers, TLA) |"
+    echo "| modules | SHIPPED — full ESM: static + dynamic import, cycles (TDZ), TLA; bare specifiers via tscore.json and node_modules (package.json exports/main); .js/.mjs/.cjs specifiers resolve to TS sources; import.meta.url/filename/dirname |"
     echo "| networking | SHIPPED — runtime.net TCP (kqueue reactor, connect) + runtime.http |"
     echo "| async file I/O | SHIPPED — runtime.fs (promise-native, dedicated I/O pool) + bytes |"
     echo "| http throughput | see the HTTP section above (benchmarks/compare/http_bench.py) |"
