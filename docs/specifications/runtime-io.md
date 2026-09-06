@@ -1,4 +1,4 @@
-# runtime.fs / runtime.net / runtime.http
+# runtime.fs / runtime.path / runtime.net / runtime.http
 
 Own, promise-native API surface (Deno-style; no Node compat layer).
 All blocking work happens off the realm thread; results return through
@@ -7,15 +7,58 @@ the Completer/Wake contract (the timer wheel's pattern).
 ## runtime.fs
 
 Dedicated 4-thread blocking-I/O pool (libuv model — never the CPU
-scheduler pool). UTF-8 strings v1 (no bytes type in the value model; a
-Bytes handle is the upgrade path).
+scheduler pool). Anything that touches the filesystem returns a promise;
+`cwd` and `tempDir` are process state, not disk traversal, and are the
+only two synchronous members.
 
-- `readFile(path) -> Promise<string>` / `writeFile(path, s)` /
+- `readFile(path) -> Promise<string>` (strict UTF-8) / `writeFile(path, s)` /
   `appendFile(path, s)`
-- `readDir(path) -> Promise<string[]>` (sorted)
-- `stat(path) -> Promise<{size, isFile, isDir, modifiedMs}>`
+- `readDir(path) -> Promise<{name, isFile, isDir, isSymlink}[]>` (sorted by
+  name). The type comes back in the dirent, so a tree walk costs no extra
+  syscall per entry; only a filesystem reporting an unknown type falls back
+  to a stat. **This replaced the earlier `string[]` shape.**
+- `stat(path)` / `lstat(path)` -> `Promise<{size, isFile, isDir, isSymlink,
+  modifiedMs}>`. `stat` follows symlinks, `lstat` does not.
 - `mkdir(path)` (recursive) / `remove(path)` (file or dir) /
   `exists(path) -> Promise<boolean>`
+- `rename(from, to)` / `copy(from, to)` / `truncate(path, len)` /
+  `realPath(path) -> Promise<string>`
+- `makeTempDir() -> Promise<string>`. Uses `create_dir`, never
+  `create_dir_all`: it must fail on an existing path so that a returned
+  directory is provably one this process created, and not an
+  attacker-planted symlink.
+- `symlink(target, path)` / `readLink(path)` / `chmod(path, mode)` — Unix
+  only; they reject with "not supported on this platform" elsewhere.
+- `cwd() -> string` / `tempDir() -> string` — synchronous.
+- `readBytes(path) -> Promise<Bytes>` / `writeBytes(path, bytes)`
+
+## runtime.bytes
+
+Immutable byte buffers as `Foreign::Handle` objects, portable across realms
+by shared core.
+
+- `size` / `at` (single byte, `undefined` past the end) / `slice` (clamped) /
+  `concat` / `equals` / `indexOf` (naive scan)
+- `toString` (lossy UTF-8) / `decode` (strict UTF-8, matching `readFile`) /
+  `fromString`
+- `toHex` / `fromHex`, `toBase64` / `fromBase64` (RFC 4648, padded),
+  `toArray` / `fromArray`
+
+Decoders validate rather than saturate: a bad hex digit, a bad base64
+length or padding, or an out-of-range array element raises instead of
+silently substituting a zero.
+
+## runtime.path
+
+Pure string manipulation, POSIX semantics, all synchronous — no syscalls.
+
+- `join(...parts)` / `dirname` / `basename` / `extname` / `normalize` /
+  `isAbsolute`
+
+`normalize` is lexical: it collapses `.`, `..` and duplicate separators
+without consulting the filesystem, so it does not resolve symlinks (that is
+`fs.realPath`). A trailing separator is always dropped — one spelling per
+path, which is where this diverges from Node.
 
 ## runtime.net (TCP)
 
@@ -65,8 +108,3 @@ independent server processes with four independent clients total the
 same as one server alone. `workers: 8` buys about +13% for ~2x the CPU
 here, so `workers: 1` is the default; multi-worker is for machines
 where the network path is not the bottleneck.
-
-## runtime.bytes + fs binary
-
-Immutable byte buffers as handles: `fs.readBytes`/`fs.writeBytes`,
-`bytes.size/slice/toString/fromString`.

@@ -1,0 +1,27 @@
+read: helloworld
+stat: 10 true false false
+entry: a.txt file=true dir=false link=false
+entry: b.txt file=true dir=false link=false
+entry: sub file=false dir=true link=false
+exists: true false
+renamed: false true
+copied: helloworld
+truncated: hello
+bytes rt: true 6
+at: 0 255 undefined
+hex: 000f10ff4142
+fromHex: true
+b64: Zm9vYmFy Zg==
+fromB64: fooba
+slice: 4142
+concat: abcd
+indexOf: 2 -1
+decode: héllo
+toArray: 3 0 255 65 
+join: a/c /x/y
+dirname: a . /
+basename: b.txt /
+extname: .txt []
+normalize: a/b/d /x
+isAbsolute: true false
+cleaned: false

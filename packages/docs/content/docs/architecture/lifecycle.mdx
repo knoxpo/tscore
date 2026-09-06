@@ -32,7 +32,7 @@ Notes on the steps (`cli/src/main.rs`):
 1. **Module detection is textual.** A word-boundary scan for `import`/`export` picks the graph compiler; nothing else about the file is inspected first.
 2. **Worker count is fixed before any thread exists.** `configure(workers)` is first-call-wins. If an observer thread reached the pool first it would lock in the machine's CPU count and `--workers` would be ignored, so the CLI does it up front.
 3. **The program runs on its own thread.** 64 MB of stack gives the interpreter about 10,000 nested calls. The main OS thread only waits and prints the summary.
-4. **Natives are installed in a fixed order** into the realm's globals: `console`/`Math`/`Date`/`performance`/`sleep`, then `parallel` + `runtime.{cpu,gc,stats}`, `actor`, `task` + `Runtime`, `Channel`, module support, `runtime.fs`/`bytes`, `runtime.net`/`http`. A scratch realm or actor realm installs a subset of the same list.
+4. **Natives are installed in a fixed order** into the realm's globals: `console`/`Math`/`Date`/`performance`/`sleep`, then `parallel` + `runtime.{cpu,gc,stats}`, `actor`, `task` + `Runtime`, `Channel`, module support, `runtime.fs`/`bytes`/`path`, `runtime.net`/`http`. A scratch realm or actor realm installs a subset of the same list.
 5. **Runtime errors are attributed** to the module they came from, not the entry file, using the span and source carried on the error.
 
 ## Compilation is lazy

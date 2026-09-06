@@ -1,52 +1,113 @@
 ---
 title: Files and bytes
-description: "runtime.fs and runtime.bytes, a promise-native filesystem API."
+description: "runtime.fs, runtime.bytes and runtime.path — a promise-native filesystem API."
 ---
 
-Blocking work never runs on the realm thread. `runtime.fs` hands every call to a dedicated 4-thread I/O pool (the libuv model, separate from the CPU pool) and returns a promise.
+Blocking work never runs on the realm thread. `runtime.fs` hands every filesystem call to a dedicated 4-thread I/O pool (the libuv model, separate from the CPU pool) and returns a promise.
+
+The rule is: **anything that touches the filesystem returns a promise.** `cwd` and `tempDir` are process state rather than disk traversal, so they return directly — they are the only two synchronous members.
 
 ## runtime.fs
 
 | Call | Returns | Notes |
 |---|---|---|
-| `readFile(path)` | `Promise<string>` | UTF-8. |
+| `readFile(path)` | `Promise<string>` | Strict UTF-8; invalid bytes reject. |
 | `writeFile(path, s)` | `Promise<undefined>` | Creates or truncates. |
 | `appendFile(path, s)` | `Promise<undefined>` | |
-| `readDir(path)` | `Promise<string[]>` | Entry names, sorted. |
-| `stat(path)` | `Promise<{ size, isFile, isDir, modifiedMs }>` | |
+| `readDir(path)` | `Promise<Entry[]>` | Sorted by name. See below. |
+| `stat(path)` | `Promise<Stat>` | Follows symlinks. |
+| `lstat(path)` | `Promise<Stat>` | Does **not** follow symlinks. |
 | `mkdir(path)` | `Promise<undefined>` | Recursive. |
 | `remove(path)` | `Promise<undefined>` | File or directory tree. |
 | `exists(path)` | `Promise<boolean>` | |
+| `rename(from, to)` | `Promise<undefined>` | |
+| `copy(from, to)` | `Promise<undefined>` | Files only. |
+| `realPath(path)` | `Promise<string>` | Canonicalizes and resolves symlinks. |
+| `truncate(path, len)` | `Promise<undefined>` | `len` must be a non-negative integer. |
+| `makeTempDir()` | `Promise<string>` | Creates a fresh directory under the OS temp dir and returns its path. |
+| `symlink(target, path)` | `Promise<undefined>` | Unix only. |
+| `readLink(path)` | `Promise<string>` | The link target, uninterpreted. |
+| `chmod(path, mode)` | `Promise<undefined>` | Unix only; `mode` is an integer in `0..=0o7777`. |
+| `cwd()` | `string` | Synchronous. |
+| `tempDir()` | `string` | Synchronous. |
 | `readBytes(path)` | `Promise<Bytes>` | Binary read. |
 | `writeBytes(path, bytes)` | `Promise<undefined>` | Binary write. |
+
+`stat` and `lstat` return `{ size, isFile, isDir, isSymlink, modifiedMs }`. `readDir` returns `{ name, isFile, isDir, isSymlink }` per entry — the file type comes back in the directory read itself, so walking a tree costs no extra syscall per entry.
 
 An I/O error rejects the promise with the OS message, which re-raises at your `await`.
 
 ```typescript
-await runtime.fs.writeFile("out.txt", "hello\n");
-await runtime.fs.appendFile("out.txt", "world\n");
+await runtime.fs.writeFile("out.txt", "hello ");
+await runtime.fs.appendFile("out.txt", "world");
 console.log(await runtime.fs.readFile("out.txt"));
+
 const st = await runtime.fs.stat("out.txt");
 console.log(st.size, st.isFile);
-for (const name of await runtime.fs.readDir(".")) console.log(name);
+
+for (const e of await runtime.fs.readDir(".")) {
+  console.log(e.name, e.isDir);
+}
+```
+
+`makeTempDir` is the safe way to get scratch space: it creates the directory itself and fails rather than reusing a path that already exists, so a returned path is always one this process made.
+
+```typescript
+const dir = await runtime.fs.makeTempDir();
+await runtime.fs.writeFile(runtime.path.join(dir, "scratch"), "...");
+await runtime.fs.remove(dir);
 ```
 
 ## runtime.bytes
 
-`Bytes` is an immutable byte-buffer handle. It is not an array; you cannot index it. Handles are portable across realms by shared core, like channels.
+`Bytes` is an immutable byte-buffer handle. It is not an array and cannot be indexed — use `bytes.at` to read a single byte. Handles are portable across realms by shared core, like channels.
 
-| Call | Returns |
-|---|---|
-| `bytes.size(b)` | `number` |
-| `bytes.slice(b, from?, to?)` | New `Bytes`; bounds are clamped. |
-| `bytes.toString(b)` | `string`, lossy UTF-8 decode. |
-| `bytes.fromString(s)` | `Bytes` of the UTF-8 encoding. |
+| Call | Returns | Notes |
+|---|---|---|
+| `bytes.size(b)` | `number` | |
+| `bytes.at(b, i)` | `number` \| `undefined` | `undefined` past the end. |
+| `bytes.slice(b, from?, to?)` | `Bytes` | Bounds are clamped. |
+| `bytes.concat(a, b)` | `Bytes` | |
+| `bytes.equals(a, b)` | `boolean` | |
+| `bytes.indexOf(b, needle)` | `number` | Byte offset, or `-1`. `needle` is a `Bytes`. |
+| `bytes.toString(b)` | `string` | **Lossy** UTF-8 decode. |
+| `bytes.decode(b)` | `string` | **Strict** UTF-8 decode; invalid bytes throw. |
+| `bytes.fromString(s)` | `Bytes` | UTF-8 encoding of `s`. |
+| `bytes.toHex(b)` / `bytes.fromHex(s)` | `string` / `Bytes` | Lowercase output. |
+| `bytes.toBase64(b)` / `bytes.fromBase64(s)` | `string` / `Bytes` | RFC 4648, padded. |
+| `bytes.toArray(b)` / `bytes.fromArray(nums)` | `number[]` / `Bytes` | |
+
+`toString` and `decode` are the deliberate pair: `toString` substitutes replacement characters for invalid UTF-8, `decode` throws — matching `fs.readFile`. Reach for `decode` unless you specifically want the lossy behaviour.
+
+Every decoder validates rather than saturating. `fromHex` throws on an odd length or a non-hex digit, `fromBase64` on a bad length, an unknown character or misplaced padding, and `fromArray` unless every element is an integer in `0..=255`.
 
 ```typescript
 const raw = await runtime.fs.readBytes("image.bin");
 const head = runtime.bytes.slice(raw, 0, 16);
-console.log(runtime.bytes.size(raw), runtime.bytes.size(head));
+console.log(runtime.bytes.size(raw), runtime.bytes.toHex(head));
+console.log(runtime.bytes.toBase64(runtime.bytes.fromString("foobar"))); // Zm9vYmFy
 await runtime.fs.writeBytes("head.bin", head);
+```
+
+## runtime.path
+
+Pure string manipulation with POSIX semantics. No syscalls, nothing touches the disk, every call synchronous.
+
+| Call | Returns | Notes |
+|---|---|---|
+| `path.join(...parts)` | `string` | Skips empty parts, then normalizes. |
+| `path.dirname(p)` | `string` | `"a"` → `"."`, `"/a"` → `"/"`. |
+| `path.basename(p)` | `string` | Trailing separators are stripped first. |
+| `path.extname(p)` | `string` | `""` for a dotfile like `.gitignore`. |
+| `path.normalize(p)` | `string` | Lexical only. |
+| `path.isAbsolute(p)` | `boolean` | |
+
+`normalize` collapses `.`, `..` and duplicate separators without consulting the filesystem, so it does not resolve symlinks — that is `fs.realPath`. A trailing separator is always dropped, and `..` cannot escape the root of an absolute path but survives in a relative one.
+
+```typescript
+runtime.path.join("a", "b", "../c"); // "a/c"
+runtime.path.normalize("/x/../y//z"); // "/y/z"
+runtime.path.extname("archive.tar.gz"); // ".gz"
 ```
 
 There is no Node compatibility layer. These are the runtime's own APIs, modelled loosely on Deno.
