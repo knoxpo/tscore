@@ -38,6 +38,10 @@ median_time() { # cmd... -> median TIME_MS over $RUNS runs (first run discarded 
 
 get_result() { "$@" 2>/dev/null | awk '/^RESULT/ {print $2}'; }
 
+peak_mb() { # cmd... -> peak RSS in MB of one run
+    /usr/bin/time -l "$@" 2>&1 >/dev/null | awk '/maximum resident set size/ {printf "%.0f", $1/1048576}'
+}
+
 check_agree() { # name r_tscore r_node r_bun
     if [ "$2" != "$3" ] || [ "$2" != "$4" ]; then
         echo "FAIL: $1 RESULT mismatch (tscore=$2 node=$3 bun=$4)" >&2
@@ -71,6 +75,7 @@ row() { # name tscore_ms node_ms bun_ms -> markdown row with ratios vs node + wi
     echo "- machine: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m), $(sysctl -n hw.ncpu) logical cpus ($(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || echo '?')P + $(sysctl -n hw.perflevel1.logicalcpu 2>/dev/null || echo '?')E)"
     echo "- tscore: $($TSCORE --version), node: $(node --version), bun: $(bun --version)"
     echo "- steady-state cells: median TIME_MS of $RUNS runs, first run discarded; in-program warmup pass before timing"
+    echo "- peak RSS: maximum resident set size of one run per engine (/usr/bin/time -l), MB"
     echo "- ratios: engine_ms / node_ms — lower is better, <1.00x is faster than node"
     echo "- methodology: shared benchmarks are byte-identical sources in the tscore language subset;"
     echo "  node/bun run non-idiomatic code (no Array.map, classes, etc.) — this compares engines on"
@@ -104,14 +109,16 @@ row "parse+compile (~50k LOC)" "$p_ts" "$p_node" "$p_bun"
     echo
     echo "## Steady-state (shared sources, in-program TIME_MS)"
     echo
-    echo "| benchmark | tscore | node | bun | winner |"
-    echo "|---|---|---|---|---|"
+    echo "| benchmark | tscore | node | bun | winner | peak RSS MB (tscore / node / bun) |"
+    echo "|---|---|---|---|---|---|"
 } >>"$OUT"
 for b in objects closures alloc gc_churn promises; do
     echo "== $b ==" >&2
     f=$DIR/bench/$b.ts
     check_agree "$b" "$(get_result "$TSCORE" run "$f")" "$(get_result node "$f")" "$(get_result bun "$f")"
     row "$b" "$(median_time "$TSCORE" run "$f")" "$(median_time node "$f")" "$(median_time bun "$f")"
+    # memory column appended to the row just written: one run each, peak RSS
+    sed -i '' "\$ s/|\$/| $(peak_mb "$TSCORE" run "$f") \/ $(peak_mb node "$f") \/ $(peak_mb bun "$f") |/" "$OUT"
 done
 
 # ---- async: timers + channels (per-engine variants, same algorithm) ----

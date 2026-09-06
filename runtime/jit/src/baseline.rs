@@ -178,10 +178,15 @@ pub type CompiledFn = extern "C" fn(
     *mut core::ffi::c_void,
     *const FunctionProto,
     u64,
-    u32,
+    u64,
     u32,
     u64,
 ) -> JitRet;
+
+/// Closure argument of a frame that has no closure (the module body).
+/// Same bits as before the payload widened, so compiled code's 32-bit
+/// compare still matches.
+pub const NO_CLOSURE: u64 = u32::MAX as u64;
 
 const SAFEPOINT_INTERVAL: u16 = 1024;
 pub const MAX_CODE: usize = 16 * 1024;

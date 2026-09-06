@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tsc_ir::FunctionProto;
-use tsr_memory::{Closure, Foreign, Heap, Kind, Obj, Value};
+use tsr_memory::{Closure, Foreign, Heap, Kind, Obj, Ref, Value};
 
 /// Realm-independent value tree. `Send + Sync`: safe to hand to any worker.
 #[derive(Clone)]
@@ -52,7 +52,7 @@ pub fn clone_out(heap: &Heap, v: Value) -> Result<PortableValue, String> {
 fn clone_rec(
     heap: &Heap,
     v: Value,
-    visiting: &mut HashSet<(u8, u32)>,
+    visiting: &mut HashSet<(u8, Ref)>,
 ) -> Result<PortableValue, String> {
     // TDZ sentinel is a TAG_SPECIAL payload below FOREIGN_BASE: kind()
     // would underflow it into a bogus Foreign ref. An uninitialized export

@@ -194,7 +194,7 @@ pub struct Realm {
     /// reused either. Results live in the old generation and are rooted
     /// until that clear. Ten distinct keys serve alloc's five million
     /// concats.
-    pub concat_cache: Vec<(u32, i32, Value)>,
+    pub concat_cache: Vec<(tsr_memory::Ref, i32, Value)>,
     pub concat_roots: Vec<Value>,
     /// Promises with an outstanding cross-thread Completer.
     pub external_pending: usize,
@@ -235,7 +235,7 @@ impl Realm {
             major_slack: 1,
             const_cache: vec![(0, Value::UNDEFINED); CONST_CACHE],
             const_roots: Vec::new(),
-            concat_cache: vec![(u32::MAX, 0, Value::UNDEFINED); CONCAT_CACHE],
+            concat_cache: vec![(tsr_memory::Ref::MAX, 0, Value::UNDEFINED); CONCAT_CACHE],
             concat_roots: Vec::new(),
             external_pending: 0,
             idle_helper: None,
@@ -333,7 +333,7 @@ impl Realm {
                     );
                 }
                 // old slots may be reused after this: drop the cache
-                self.concat_cache.fill((u32::MAX, 0, Value::UNDEFINED));
+                self.concat_cache.fill((tsr_memory::Ref::MAX, 0, Value::UNDEFINED));
                 self.concat_roots.clear();
                 tsr_gc::collect(
                     &mut self.heap,
@@ -448,7 +448,7 @@ impl Realm {
                 if n.fract() == 0.0 && n.abs() < 9e15 {
                     let ni = n as i64;
                     if lb & tsr_memory::YOUNG_BIT == 0 && (0..1024).contains(&ni) {
-                        let i = ((lb.wrapping_mul(0x9E37_79B1) ^ (ni as u32)) as usize) & (CONCAT_CACHE - 1);
+                        let i = ((lb.wrapping_mul(0x9E37_79B1) ^ (ni as u64)) as usize) & (CONCAT_CACHE - 1);
                         let e = self.concat_cache[i];
                         if e.0 == lb && e.1 == ni as i32 {
                             return e.2;

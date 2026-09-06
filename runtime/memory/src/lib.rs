@@ -18,8 +18,12 @@ pub const BUF_POOL_CAP: usize = 262144;
 use std::sync::Arc;
 use tsc_ir::FunctionProto;
 
-/// Index into one of the realm heap's arenas.
-pub type Ref = u32;
+/// Heap reference payload: today an index into one of the realm heap's
+/// arenas, carried in the low 48 bits of a `Value` so an address fits
+/// the same slot later.
+pub type Ref = u64;
+/// Bits of a `Value` that hold the reference payload.
+pub const PAYLOAD_MASK: u64 = (1 << TAG_SHIFT) - 1;
 
 /// Concatenations at or below this many bytes are copied flat; larger
 /// ones build a rope node. Read once — an env lookup per concat costs
@@ -53,7 +57,7 @@ const CANON_NAN: u64 = 0x7FF8_0000_0000_0000;
 /// TAG_SPECIAL payloads: 0 null, 1 undefined, 2 false, 3 true,
 /// 4 = JIT error sentinel (never a live value), 5..8 reserved,
 /// >= FOREIGN_BASE = foreign arena ref + FOREIGN_BASE.
-const FOREIGN_BASE: u32 = 8;
+const FOREIGN_BASE: u64 = 8;
 
 /// Returned by JIT helpers to signal "error stored in realm.jit_error".
 pub const JIT_ERR_SENTINEL: u64 = (TAG_SPECIAL << TAG_SHIFT) | 4;
@@ -120,8 +124,9 @@ impl Value {
     }
 
     #[inline(always)]
-    fn tagged(tag: u64, payload: u32) -> Value {
-        Value((tag << TAG_SHIFT) | payload as u64)
+    fn tagged(tag: u64, payload: u64) -> Value {
+        debug_assert!(payload & !PAYLOAD_MASK == 0, "payload exceeds 48 bits");
+        Value((tag << TAG_SHIFT) | payload)
     }
 
     #[inline(always)]
@@ -146,7 +151,7 @@ impl Value {
     }
     #[inline(always)]
     pub fn native(i: u32) -> Value {
-        Value::tagged(TAG_NATIVE, i)
+        Value::tagged(TAG_NATIVE, i as u64)
     }
     #[inline(always)]
     pub fn foreign(r: Ref) -> Value {
@@ -158,8 +163,8 @@ impl Value {
         self.0 >> TAG_SHIFT
     }
     #[inline(always)]
-    fn payload(self) -> u32 {
-        self.0 as u32
+    fn payload(self) -> u64 {
+        self.0 & PAYLOAD_MASK
     }
 
     #[inline(always)]
@@ -218,7 +223,7 @@ impl Value {
             TAG_ARR => Kind::Array(p),
             TAG_CLOSURE => Kind::Closure(p),
             TAG_CELL => Kind::Cell(p),
-            _ => Kind::Native(p),
+            _ => Kind::Native(p as u32),
         }
     }
 }
@@ -647,7 +652,8 @@ pub struct GcScratch {
 pub struct GenState {
     pub old: Bitmap,
     pub dirty: Bitmap,
-    pub young: Vec<Ref>,
+    /// u32 on purpose: the JIT pushes 4-byte entries.
+    pub young: Vec<u32>,
 }
 
 impl GenState {
@@ -658,7 +664,7 @@ impl GenState {
         // clears all dirty bits; minor-freed slots were never old; and
         // free_foreign clears both explicitly
         debug_assert!(!self.old.get(r) && !self.dirty.get(r));
-        self.young.push(r);
+        self.young.push(r as u32);
     }
 }
 
@@ -781,7 +787,7 @@ impl HStr {
 /// refs index the nursery arenas; minor GC evacuates survivors into the
 /// old arenas and rewrites every reachable edge. Closures/cells/foreigns
 /// never carry it (non-moving kinds).
-pub const YOUNG_BIT: u32 = 1 << 31;
+pub const YOUNG_BIT: u64 = 1 << 31;
 
 #[inline(always)]
 pub fn is_young(r: Ref) -> bool {
@@ -823,12 +829,12 @@ pub struct Heap {
     pub foreigns: Vec<Foreign>,
     // free lists rebuilt by the sweep (tsr-gc); alloc reuses them.
     // ponytail: non-moving collector — no compaction, refs stay stable
-    pub free_strs: Vec<Ref>,
-    pub free_objs: Vec<Ref>,
-    pub free_arrs: Vec<Ref>,
-    pub free_closures: Vec<Ref>,
-    pub free_cells: Vec<Ref>,
-    pub free_foreigns: Vec<Ref>,
+    pub free_strs: Vec<u32>,
+    pub free_objs: Vec<u32>,
+    pub free_arrs: Vec<u32>,
+    pub free_closures: Vec<u32>,
+    pub free_cells: Vec<u32>,
+    pub free_foreigns: Vec<u32>,
     pub allocs_since_gc: usize,
     pub gc_threshold: usize,
     // generational state (sticky in-place mark-sweep)
@@ -930,7 +936,7 @@ macro_rules! alloc {
     ($fn_name:ident, $get:ident, $get_mut:ident, $field:ident, $free:ident, $gen:ident, $t:ty) => {
         pub fn $fn_name(&mut self, v: $t) -> Ref {
             self.allocs_since_gc += 1;
-            if let Some(r) = self.$free.pop() {
+            if let Some(r) = self.$free.pop().map(|r| r as Ref) {
                 self.$field[r as usize] = v;
                 self.$gen.on_alloc(r);
                 return r;
@@ -959,7 +965,7 @@ macro_rules! alloc_moving {
     ($fn_name:ident, $get:ident, $get_mut:ident, $field:ident, $free:ident, $gen:ident, $t:ty) => {
         pub fn $fn_name(&mut self, v: $t) -> Ref {
             self.allocs_since_gc += 1;
-            if let Some(r) = self.$free.pop() {
+            if let Some(r) = self.$free.pop().map(|r| r as Ref) {
                 self.$field[r as usize] = v;
                 self.$gen.on_alloc(r);
                 return r;
@@ -1012,7 +1018,7 @@ impl Heap {
         upvals: &[Value],
     ) -> Ref {
         self.allocs_since_gc += 1;
-        if let Some(r) = self.free_closures.pop() {
+        if let Some(r) = self.free_closures.pop().map(|r| r as Ref) {
             let c = &mut self.closures[r as usize];
             if !Arc::ptr_eq(&c.proto, proto) {
                 c.proto = proto.clone();
@@ -1053,7 +1059,7 @@ impl Heap {
             return self.young_str(HStr::Buf(b));
         }
         self.allocs_since_gc += 1;
-        if let Some(r) = self.free_strs.pop() {
+        if let Some(r) = self.free_strs.pop().map(|r| r as Ref) {
             // freed slots arrive pre-cleared (sweep clears + caps capacity)
             let slot = &mut self.strs[r as usize];
             match slot {
@@ -1342,7 +1348,7 @@ impl Heap {
             return self.young_str(h);
         }
         self.allocs_since_gc += 1;
-        if let Some(r) = self.free_strs.pop() {
+        if let Some(r) = self.free_strs.pop().map(|r| r as Ref) {
             self.strs[r as usize] = h;
             self.gen_strs.on_alloc(r);
             return r;
@@ -1364,7 +1370,7 @@ impl Heap {
         self.foreigns[r as usize] = Foreign::Free;
         self.gen_foreigns.old.clear(r);
         self.gen_foreigns.dirty.clear(r);
-        self.free_foreigns.push(r);
+        self.free_foreigns.push(r as u32);
     }
 
     // ---- write barriers: record old containers that gain new edges ----
@@ -1462,7 +1468,7 @@ impl Heap {
             return self.young_arr(b);
         }
         self.allocs_since_gc += 1;
-        if let Some(r) = self.free_arrs.pop() {
+        if let Some(r) = self.free_arrs.pop().map(|r| r as Ref) {
             // freed slots arrive pre-cleared (sweep clears + caps capacity)
             debug_assert!(self.arrs[r as usize].is_empty());
             self.gen_arrs.on_alloc(r);
@@ -1485,7 +1491,7 @@ impl Heap {
             return self.young_obj(o);
         }
         self.allocs_since_gc += 1;
-        if let Some(r) = self.free_objs.pop() {
+        if let Some(r) = self.free_objs.pop().map(|r| r as Ref) {
             let o = &mut self.objs[r as usize];
             debug_assert!(o.vlen == 0);
             o.shape = shape;
@@ -1510,7 +1516,7 @@ impl Heap {
             return self.young_arr(b);
         }
         self.allocs_since_gc += 1;
-        if let Some(r) = self.free_arrs.pop() {
+        if let Some(r) = self.free_arrs.pop().map(|r| r as Ref) {
             let v = &mut self.arrs[r as usize];
             debug_assert!(v.is_empty());
             v.extend_from_slice(values);
@@ -1532,7 +1538,7 @@ impl Heap {
             return self.young_obj(Obj::default());
         }
         self.allocs_since_gc += 1;
-        if let Some(r) = self.free_objs.pop() {
+        if let Some(r) = self.free_objs.pop().map(|r| r as Ref) {
             // freed slots arrive pre-cleared: sweep resets shape + values
             debug_assert!(self.objs[r as usize].vlen == 0);
             self.gen_objs.on_alloc(r);
@@ -1605,7 +1611,7 @@ impl Heap {
 
     pub fn promote_obj(&mut self, o: Obj) -> Ref {
         self.promoted_bytes_since_major += 72 + o.overflow.len() * 8;
-        let r = match self.free_objs.pop() {
+        let r = match self.free_objs.pop().map(|r| r as Ref) {
             Some(r) => {
                 let old = std::mem::replace(&mut self.objs[r as usize], o);
                 // the freed slot kept its overflow buffer — recycle it
@@ -1630,7 +1636,7 @@ impl Heap {
 
     pub fn promote_arr(&mut self, v: Vec<Value>) -> Ref {
         self.promoted_bytes_since_major += 32 + v.len() * 8;
-        let r = match self.free_arrs.pop() {
+        let r = match self.free_arrs.pop().map(|r| r as Ref) {
             Some(r) => {
                 let old = std::mem::replace(&mut self.arrs[r as usize], v);
                 if old.capacity() > 0 && self.pool_arr_bufs.len() < BUF_POOL_CAP {
@@ -1653,7 +1659,7 @@ impl Heap {
     pub fn promote_str(&mut self, s: HStr) -> Ref {
         self.promoted_bytes_since_major += 24 + s.byte_len();
         let is_rope = matches!(s, HStr::Rope(..));
-        let r = match self.free_strs.pop() {
+        let r = match self.free_strs.pop().map(|r| r as Ref) {
             Some(r) => {
                 let old = std::mem::replace(&mut self.strs[r as usize], s);
                 if let HStr::Buf(mut b) = old {

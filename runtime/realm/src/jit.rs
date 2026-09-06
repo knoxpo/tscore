@@ -8,7 +8,7 @@ use crate::{Realm, RtError};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::Arc;
 use tsc_ir::{Const, FunctionProto, Op, UpvalSrc, TIER_BASELINE, TIER_COLD, TIER_COMPILING, TIER_OPT, TIER_REJECTED};
-use tsr_jit::baseline::{CompiledFn, Helpers, JitRet};
+use tsr_jit::baseline::{CompiledFn, Helpers, JitRet, NO_CLOSURE};
 use tsr_memory::{to_int32, to_uint32, Kind, Value, JIT_ERR_SENTINEL};
 
 fn realm<'a>(p: *mut core::ffi::c_void) -> &'a mut Realm {
@@ -170,7 +170,7 @@ extern "C" fn h_call_resume(
     ret_val: u64,
     ret_stack: u64,
     new_base_bytes: u64,
-    closure: u32,
+    closure: u64,
     depth: u32,
 ) -> JitRet {
     let r = realm(p);
@@ -278,13 +278,13 @@ extern "C" fn h_step(
     pp: *const FunctionProto,
     pc: u64,
     base_bytes: u64,
-    closure: u32,
+    closure: u64,
 ) -> JitRet {
     let r = realm(p);
     let pr = proto(pp);
     let pc = pc as usize;
     let base = (base_bytes / 8) as usize;
-    let closure = if closure == u32::MAX { None } else { Some(closure) };
+    let closure = if closure == NO_CLOSURE { None } else { Some(closure) };
     match step(r, pr, pc, base, closure) {
         Ok(ctrl) => ok(r, ctrl),
         Err(e) => fail(r, e),
@@ -296,7 +296,7 @@ fn step(
     proto: &FunctionProto,
     pc: usize,
     base: usize,
-    closure: Option<u32>,
+    closure: Option<u64>,
 ) -> Result<u64, RtError> {
     let pbody = proto.body();
     let ins = pbody.code[pc];
@@ -1002,7 +1002,7 @@ extern "C" fn h_get_global(
 
 extern "C" fn h_get_upval(p: *mut core::ffi::c_void, closure_u32: u64, idx: u64) -> JitRet {
     let r = realm(p);
-    let entry = r.heap.closure(closure_u32 as u32).upvals[idx as usize];
+    let entry = r.heap.closure(closure_u32).upvals[idx as usize];
     let v = match entry.as_cell() {
         Some(c) => *r.heap.cell(c),
         None => entry, // immutable value capture
@@ -1017,7 +1017,7 @@ extern "C" fn h_set_upval(
     v_bits: u64,
 ) -> JitRet {
     let r = realm(p);
-    let entry = r.heap.closure(closure_u32 as u32).upvals[idx as usize];
+    let entry = r.heap.closure(closure_u32).upvals[idx as usize];
     let cell = entry.as_cell().expect("SetUpval on value capture");
     r.heap.barrier_cell(cell);
     *r.heap.cell_mut(cell) = Value::from_bits(v_bits);
@@ -1104,7 +1104,7 @@ extern "C" fn h_new_closure(
     pp: *const FunctionProto,
     pc: u64,
     base_bytes: u64,
-    closure: u32,
+    closure: u64,
     child: *const std::sync::Arc<FunctionProto>,
 ) -> JitRet {
     let r = realm(p);
@@ -1138,7 +1138,7 @@ extern "C" fn h_new_closure(
             }
             UpvalSrc::ParentLocalValue(reg) => r.stack[base + reg as usize],
             UpvalSrc::ParentUpval(idx) => {
-                debug_assert!(closure != u32::MAX, "upval capture outside closure");
+                debug_assert!(closure != NO_CLOSURE, "upval capture outside closure");
                 r.heap.closure(closure).upvals[idx as usize]
             }
         };
@@ -1494,7 +1494,7 @@ pub fn enter_osr(
     f: CompiledFn,
     proto: &FunctionProto,
     base: usize,
-    closure: Option<u32>,
+    closure: Option<u64>,
     depth: u32,
     target_pc: usize,
 ) -> Result<crate::interpreter::FrameResult, RtError> {
@@ -1502,7 +1502,7 @@ pub fn enter_osr(
         realm as *mut Realm as *mut core::ffi::c_void,
         proto as *const FunctionProto,
         (base * 8) as u64,
-        closure.unwrap_or(u32::MAX),
+        closure.unwrap_or(NO_CLOSURE),
         depth,
         target_pc as u64,
     );
@@ -1732,14 +1732,14 @@ pub fn enter_jit_frame(
     f: CompiledFn,
     proto: &FunctionProto,
     base: usize,
-    closure: Option<u32>,
+    closure: Option<u64>,
     depth: u32,
 ) -> Result<crate::interpreter::FrameResult, RtError> {
     let ret = f(
         realm as *mut Realm as *mut core::ffi::c_void,
         proto as *const FunctionProto,
         (base * 8) as u64,
-        closure.unwrap_or(u32::MAX),
+        closure.unwrap_or(NO_CLOSURE),
         depth,
         0,
     );
@@ -1773,14 +1773,14 @@ pub fn enter_jit(
     f: CompiledFn,
     proto: &FunctionProto,
     base: usize,
-    closure: Option<u32>,
+    closure: Option<u64>,
     depth: u32,
 ) -> Result<Value, RtError> {
     let ret = f(
         realm as *mut Realm as *mut core::ffi::c_void,
         proto as *const FunctionProto,
         (base * 8) as u64,
-        closure.unwrap_or(u32::MAX),
+        closure.unwrap_or(NO_CLOSURE),
         depth,
         0,
     );

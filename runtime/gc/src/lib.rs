@@ -136,7 +136,7 @@ pub fn collect<'a>(
                 } else {
                     let c: &mut dyn FnMut(&mut Heap, Ref) = &mut $clear;
                     c(heap, r);
-                    heap.$free.push(r);
+                    heap.$free.push(r as u32);
                     freed += 1;
                 }
             }
@@ -260,10 +260,10 @@ fn forward(
                 if m.fwd_objs[yi] == u32::MAX {
                     let o = std::mem::take(&mut nur.objs[yi]);
                     let nr = heap.promote_obj(o);
-                    m.fwd_objs[yi] = nr;
+                    m.fwd_objs[yi] = nr as u32;
                     m.scan.push((K_OBJ << 32) | nr as u64);
                 }
-                Value::object(m.fwd_objs[yi])
+                Value::object(m.fwd_objs[yi] as Ref)
             } else {
                 if !heap.gen_objs.old.get(r) && !m.yobjs.get(r) {
                     m.yobjs.set(r);
@@ -278,10 +278,10 @@ fn forward(
                 if m.fwd_arrs[yi] == u32::MAX {
                     let a = std::mem::take(&mut nur.arrs[yi]);
                     let nr = heap.promote_arr(a);
-                    m.fwd_arrs[yi] = nr;
+                    m.fwd_arrs[yi] = nr as u32;
                     m.scan.push((K_ARR << 32) | nr as u64);
                 }
-                Value::array(m.fwd_arrs[yi])
+                Value::array(m.fwd_arrs[yi] as Ref)
             } else {
                 if !heap.gen_arrs.old.get(r) && !m.yarrs.get(r) {
                     m.yarrs.set(r);
@@ -298,9 +298,9 @@ fn forward(
                         &mut nur.strs[yi],
                         tsr_memory::HStr::Buf(String::new()),
                     );
-                    m.fwd_strs[yi] = heap.promote_str(s);
+                    m.fwd_strs[yi] = heap.promote_str(s) as u32;
                 }
-                Value::str_ref(m.fwd_strs[yi])
+                Value::str_ref(m.fwd_strs[yi] as Ref)
             } else {
                 if !heap.gen_strs.old.get(r) {
                     m.ystrs.set(r);
@@ -471,6 +471,7 @@ pub fn collect_minor<'a>(
             let young = std::mem::take(&mut heap.$gen.young);
             let bytes: &dyn Fn(&Heap, tsr_memory::Ref) -> usize = &$bytes;
             for r in young {
+                let r = r as tsr_memory::Ref;
                 if $marks.get(r) {
                     heap.$gen.old.set(r);
                     promoted += 1;
@@ -478,7 +479,7 @@ pub fn collect_minor<'a>(
                 } else {
                     let clear: &mut dyn FnMut(&mut Heap, tsr_memory::Ref) = &mut $clear;
                     clear(heap, r);
-                    heap.$free.push(r);
+                    heap.$free.push(r as u32);
                     freed += 1;
                 }
             }
@@ -519,6 +520,7 @@ pub fn collect_minor<'a>(
         // the same slot to two allocations
         let young = std::mem::take(&mut heap.gen_foreigns.young);
         for r in young {
+            let r = r as tsr_memory::Ref;
             if matches!(heap.foreigns[r as usize], Foreign::Free) {
                 continue; // already freed explicitly
             }
@@ -538,7 +540,7 @@ pub fn collect_minor<'a>(
                     }
                 }
                 heap.foreigns[r as usize] = Foreign::Free;
-                heap.free_foreigns.push(r);
+                heap.free_foreigns.push(r as u32);
                 freed += 1;
             }
         }
@@ -669,7 +671,7 @@ fn bulk_promote(heap: &mut Heap, stats: &mut GcStats) {
         ($gen:ident, $bytes:expr) => {{
             let young = std::mem::take(&mut heap.$gen.young);
             for &r in &young {
-                heap.$gen.old.set(r);
+                heap.$gen.old.set(r as tsr_memory::Ref);
             }
             promoted += young.len();
             promoted_bytes += young.len() * $bytes;
@@ -682,6 +684,7 @@ fn bulk_promote(heap: &mut Heap, stats: &mut GcStats) {
     bulk!(gen_cells, 8);
     let young = std::mem::take(&mut heap.gen_foreigns.young);
     for &r in &young {
+        let r = r as tsr_memory::Ref;
         if !matches!(heap.foreigns[r as usize], Foreign::Free) {
             heap.gen_foreigns.old.set(r);
             promoted += 1;
