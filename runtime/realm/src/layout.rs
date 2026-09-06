@@ -71,6 +71,11 @@ pub struct HeapLayout {
     /// Realm.const_cache data pointer: the string-constant interning
     /// cache, direct-mapped on the constant's address, probed inline.
     pub const_cache_ptr: u32,
+    /// Closure reuse: free-list length, young-log Vec words.
+    pub free_closures_len: u32,
+    pub closures_young_ptr: u32,
+    pub closures_young_len: u32,
+    pub closures_young_cap: u32,
     /// The three raw words of an empty Vec<Value> (written into a freshly
     /// bumped Obj's overflow field).
     pub empty_vec_words: [u64; 3],
@@ -445,6 +450,18 @@ pub fn discover() -> Option<HeapLayout> {
         "const_cache_ptr",
         find_word(as_words(&realm), realm.const_cache.as_ptr() as u64)
     );
+    realm.heap.free_closures.reserve(16);
+    realm.heap.gen_closures.young.reserve(16);
+    let (_, free_closures_len, _) = vec_words!(
+        "free_closures",
+        |r: &Realm| r.heap.free_closures.as_ptr(),
+        |r: &mut Realm| { let c = r.heap.free_closures.capacity(); r.heap.free_closures.reserve(c + 8); }
+    );
+    let (closures_young_ptr, closures_young_len, closures_young_cap) = vec_words!(
+        "closures_young",
+        |r: &Realm| r.heap.gen_closures.young.as_ptr(),
+        |r: &mut Realm| { let c = r.heap.gen_closures.young.capacity(); r.heap.gen_closures.young.reserve(c + 8); }
+    );
     let saved = realm.heap.allocs_since_gc;
     realm.heap.allocs_since_gc = 0xB0BA_0005_0001;
     let allocs_since_gc_off = probe!(
@@ -499,6 +516,10 @@ pub fn discover() -> Option<HeapLayout> {
         objs_dirty_ptr,
         objs_dirty_len,
         const_cache_ptr,
+        free_closures_len,
+        closures_young_ptr,
+        closures_young_len,
+        closures_young_cap,
         empty_vec_words,
         obj_vlen,
         obj_overflow,

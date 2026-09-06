@@ -401,6 +401,106 @@ impl C {
         self.a.bind(ok);
     }
 
+    /// Closure creation. Fast path reuses a freed slot whose proto is
+    /// already `child` (no Arc traffic) and whose upvals buffer has room:
+    /// pop the free list, write the captured values, log it young. The
+    /// helper covers everything else — empty free list, a slot that held
+    /// another proto, a small buffer, a capture that is not a cell.
+    /// `reg(r)` maps the child's parent-register sources to vregs (the
+    /// window for an inlined callee); `clo` gives the current closure's
+    /// ref in a register for ParentUpval sources; the slow path gets the
+    /// helper's (proto, pc, base) triple.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_closure(
+        &mut self,
+        dst: u8,
+        child: &std::sync::Arc<FunctionProto>,
+        reg: &dyn Fn(u8) -> u8,
+        clo: &dyn Fn(&mut C) -> u32,
+        slow_proto: u64,
+        slow_pc: usize,
+        slow_base_off: u32,
+        o: Option<HeapOffsets>,
+    ) {
+        let slow = self.a.new_label();
+        let done = self.a.new_label();
+        let n = child.upvals.len();
+        if let Some(o) = o.filter(|_| n <= 8) {
+            let child_word = unsafe { *(child as *const std::sync::Arc<FunctionProto> as *const u64) };
+            self.a.ldr_imm(12, R_REALM, o.free_closures_len);
+            self.a.cbz(12, slow);
+            self.a.ldr_imm(9, R_REALM, o.closures_young_len);
+            self.a.ldr_imm(11, R_REALM, o.closures_young_cap);
+            self.a.cmp_reg(9, 11);
+            self.a.b_cond(Cond::Hs, slow);
+            self.a.sub_imm(12, 12, 1);
+            self.a.ldr_imm(13, R_REALM, o.free_closures_len - o.vec_len + o.vec_ptr); // free list data ptr
+            self.a.add_reg_lsl(13, 13, 12, 2); // Vec<u32> entries
+            self.a.ldr_w_imm(10, 13, 0); // r = free_closures[len-1]
+            self.a.ldr_imm(13, R_REALM, o.realm_closures_ptr);
+            self.a.add_reg_lsl(13, 13, 10, 5); // &closures[r] (32 bytes each)
+            self.a.ldr_imm(11, 13, o.closure_proto_off);
+            self.a.mov_imm64(14, child_word);
+            self.a.cmp_reg(11, 14);
+            self.a.b_cond(Cond::Ne, slow); // other proto: helper swaps the Arc
+            let up_base = o.closure_upvals_ptr - o.vec_ptr;
+            self.a.ldr_imm(11, 13, up_base + o.vec_cap);
+            self.a.cmp_imm(11, n as u32);
+            self.a.b_cond(Cond::Lo, slow);
+            self.a.ldr_imm(17, 13, o.closure_upvals_ptr); // upvals data
+            for (i, u) in child.upvals.iter().enumerate() {
+                match *u {
+                    tsc_ir::UpvalSrc::ParentLocal(r) => {
+                        self.fetch_x(reg(r), 9);
+                        self.a.lsr_imm(11, 9, 48);
+                        self.a.movz(14, 0xFFFE, 0); // TAG_CELL
+                        self.a.cmp_reg(11, 14);
+                        self.a.b_cond(Cond::Ne, slow);
+                    }
+                    tsc_ir::UpvalSrc::ParentLocalValue(r) => self.fetch_x(reg(r), 9),
+                    tsc_ir::UpvalSrc::ParentUpval(idx) => {
+                        let cr = clo(self);
+                        self.a.ldr_imm(11, R_REALM, o.realm_closures_ptr);
+                        self.a.add_reg_lsl(11, 11, cr, 5);
+                        self.a.ldr_imm(11, 11, o.closure_upvals_ptr);
+                        self.a.ldr_imm(9, 11, idx as u32 * 8);
+                    }
+                }
+                self.a.str_imm(9, 17, i as u32 * 8);
+            }
+            self.a.mov_imm64(11, n as u64);
+            self.a.str_imm(11, 13, up_base + o.vec_len);
+            self.a.str_imm(12, R_REALM, o.free_closures_len); // pop
+            // young log + allocation count
+            self.a.ldr_imm(12, R_REALM, o.closures_young_len);
+            self.old_alloc_log(o.closures_young_ptr, o.closures_young_len, o);
+            self.a.mov_imm64(9, 0xFFFDu64 << 48); // TAG_CLOSURE
+            self.a.orr_reg(0, 9, 10);
+            self.a.b(done);
+        }
+        self.a.bind(slow);
+        // flush the d-reg homes the helper's upval sources read from slots
+        for u in &child.upvals {
+            let src = match *u {
+                tsc_ir::UpvalSrc::ParentLocal(r) | tsc_ir::UpvalSrc::ParentLocalValue(r) => reg(r),
+                tsc_ir::UpvalSrc::ParentUpval(_) => continue,
+            };
+            if src < LOW {
+                self.a.str_d_imm((8 + src) as u32, R_SLOTS, C::slot(src));
+            }
+        }
+        self.a.mov(0, R_REALM);
+        self.a.mov_imm64(1, slow_proto);
+        self.a.mov_imm64(2, slow_pc as u64);
+        self.a.add_imm(3, R_BASE, slow_base_off);
+        let cr = clo(self);
+        self.a.mov(4, cr);
+        self.a.mov_imm64(5, child as *const std::sync::Arc<FunctionProto> as u64);
+        self.thin_keep_arrays(self.helpers.new_closure);
+        self.a.bind(done);
+        self.put_x(dst, 0);
+    }
+
     /// Compare a shape id: an immediate while ids fit twelve bits (they
     /// are small and sequential; widening hands out fresh ones).
     fn cmp_sid(&mut self, reg: u32, sid: u32) {
@@ -1187,6 +1287,9 @@ pub fn compile(
         // arena (thin_keep_arrays). Only arrs growth moves a slot.
         let apreserves = match ins.op {
             Op::Len | Op::GetIndex | Op::ArrayPush | Op::SetIndex | Op::NewArrayLit => true, // arms manage it
+            // an inlined call's fast path touches no array; its generic
+            // fallback reloads and zeroes x22 at run time
+            Op::Call => inlines.get(pc).is_some_and(|i| i.is_some()),
             Op::Jump => ins.sbx() >= 0,
             Op::Concat | Op::LoadConst | Op::NewObjectLit | Op::NewObject | Op::Closure
             | Op::NewCell | Op::LoadCell | Op::StoreCell | Op::GetUpval | Op::SetUpval
@@ -1689,6 +1792,9 @@ pub fn inlinable(callee: &FunctionProto) -> bool {
                 // against the shape since the callee carries no facts
                 Op::NewArrayLit => i.c as usize <= 8,
                 Op::NewObjectLit => matches!(b.consts.get(i.c as usize), Some(Const::Keys(k)) if k.len() <= 3),
+                // a closure creation is one helper call; its upval sources
+                // are the callee's own registers, which live in the window
+                Op::Closure => (i.bx() as usize) < b.protos.len(),
                 Op::GetUpval => callee
                     .upvals
                     .get(i.b as usize)
@@ -1706,6 +1812,7 @@ pub fn inlinable(callee: &FunctionProto) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn emit_inline_call(
     c: &mut C,
+    pc: usize,
     ins: Instr,
     proto_word: u64,
     callee: &FunctionProto,
@@ -1806,13 +1913,49 @@ fn emit_inline_call(
             }
             Op::Mod => {
                 guard(c, map(cins.b), generic);
-                guard(c, map(cins.c), generic);
+                // a divisor the callee loaded as an integer constant takes
+                // the magic-multiply path (no sdiv on the chain, no second
+                // integrality check); `x + bias % 100` ran the generic one
+                let const_div = callee.body().code[..cpc]
+                    .iter()
+                    .rev()
+                    .find(|i| writes_a_op(i.op) && i.a == cins.c)
+                    .and_then(|i| (i.op == Op::LoadInt).then(|| i.sbx() as i64));
                 let db = c.fetch(map(cins.b), 0);
-                let dc = c.fetch(map(cins.c), 1);
-                emit_mod_num(c, map(cins.a), db, dc, fmod_addr);
-                c.zero_cache(); // fmod path is a blr
-                // x14 (closure addr) may be clobbered: recompute lazily in
-                // GetUpval below — mark by zeroing
+                match const_div {
+                    Some(d) => {
+                        emit_mod_const(c, map(cins.a), db, d, fmod_addr, None, pc);
+                        c.itmp = None; // window vreg: not an intermediate for the caller
+                    }
+                    None => {
+                        guard(c, map(cins.c), generic);
+                        let dc = c.fetch(map(cins.c), 1);
+                        emit_mod_num(c, map(cins.a), db, dc, fmod_addr);
+                    }
+                }
+                // the fmod slow paths zero the field cache themselves; x14
+                // (closure addr) may be clobbered: GetUpval reloads on 0
+                c.a.movz(14, 0, 0);
+            }
+            Op::Closure => {
+                // the callee's window is the frame: its upval sources are
+                // callee registers; ParentUpval reads the callee's closure
+                let child = &callee.body().protos[cins.bx() as usize];
+                let call_a = ins.a;
+                c.emit_closure(
+                    map(cins.a),
+                    child,
+                    &|r| map(r),
+                    &|c: &mut C| {
+                        c.fetch_x(call_a, 8);
+                        c.a.orr_reg32(4, 31, 8);
+                        4
+                    },
+                    callee as *const FunctionProto as u64,
+                    cpc,
+                    w as u32 * 8,
+                    Some(*o),
+                );
                 c.a.movz(14, 0, 0);
             }
             Op::Neg => {
@@ -2386,7 +2529,7 @@ fn emit_op(
                     && (ins.a as usize + 1 + callee.body().n_regs as usize) < 256
                 {
                     emit_inline_call(
-                        c, ins, *pw, callee, lits, &o, fmod_addr, inline_generic,
+                        c, pc, ins, *pw, callee, lits, &o, fmod_addr, inline_generic,
                         inline_done,
                     );
                     inlined = true;
@@ -3139,28 +3282,18 @@ fn emit_op(
         }
 
         Op::Closure => {
-            // flush the d-reg homes the child's upval sources read from
-            // slots (helper never GCs — no reload needed)
             let child = &pbody.protos[ins.bx() as usize];
-            for u in &child.upvals {
-                let src = match *u {
-                    tsc_ir::UpvalSrc::ParentLocal(reg)
-                    | tsc_ir::UpvalSrc::ParentLocalValue(reg) => reg,
-                    tsc_ir::UpvalSrc::ParentUpval(_) => continue,
-                };
-                if src < LOW {
-                    c.a.str_d_imm((8 + src) as u32, R_SLOTS, C::slot(src));
-                }
-            }
-            c.a.mov(0, R_REALM);
-            c.a.mov(1, R_PROTO);
-            c.a.mov_imm64(2, pc as u64);
-            c.a.mov(3, R_BASE);
-            let cl = c.closure(4);
-            c.a.mov(4, cl);
-            c.a.mov_imm64(5, child as *const std::sync::Arc<FunctionProto> as u64);
-            c.thin_keep_arrays(c.helpers.new_closure);
-            c.put_x(ins.a, 0);
+            let o = c.offsets;
+            c.emit_closure(
+                ins.a,
+                child,
+                &|r| r,
+                &|c: &mut C| c.closure(4),
+                proto as *const FunctionProto as u64,
+                pc,
+                0,
+                o,
+            );
         }
         Op::Concat => {
             c.a.mov(0, R_REALM);
