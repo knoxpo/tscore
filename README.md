@@ -121,3 +121,9 @@ User guide site (Fumadocs): `cd packages/docs && npm install && npm run dev`, th
 - [Concurrency semantics](docs/specifications/concurrency-semantics.md)
 - [Memory & ownership](docs/specifications/memory-ownership.md)
 - [Benchmark methodology](docs/architecture/benchmark-methodology.md)
+
+## License
+
+[AGPL-3.0-only](LICENSE.md), with additional terms under section 7 reserving the
+project's name and branding. Commercial use is fine; proprietary forks are not,
+and a fork you distribute must be renamed. See [LICENSE.md](LICENSE.md).
