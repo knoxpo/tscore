@@ -260,8 +260,10 @@ pub fn optimize(
     }
 
     copy_prop(&mut p, consts, upval_srcs);
-    if forward_field_stores(&mut p, consts, upval_srcs) {
-        // the rewrite leaves `Move dst, val` behind for copy-prop to chase
+    let mut again = forward_field_stores(&mut p, consts, upval_srcs);
+    again |= cse_get_index(&mut p, consts, upval_srcs);
+    if again {
+        // the rewrites leave `Move dst, val` behind for copy-prop to chase
         copy_prop(&mut p, consts, upval_srcs);
     }
     sink_move_dst(&mut p, consts, upval_srcs, n_regs);
@@ -456,6 +458,48 @@ fn forward_field_stores(p: &mut P, consts: &[Const], upval_srcs: &[Vec<UpvalSrc>
 
 /// Pass 2: delete pure defs whose target is never read afterwards.
 /// Backward liveness over the CFG; iterates to a fixpoint.
+/// `a[i].x + a[i].y` reads the element twice. The second GetIndex of the
+/// same array and index, with nothing in between that could change
+/// either or the element, becomes a Move of the first result — which
+/// also keeps the field cache warm for the second property read (a new
+/// vreg from a second load evicted it).
+fn cse_get_index(p: &mut P, consts: &[Const], upval_srcs: &[Vec<UpvalSrc>]) -> bool {
+    let lead = leaders(p);
+    let mut changed = false;
+    // live record: (array reg, index reg, result reg)
+    let mut rec: Option<(u8, u8, u8)> = None;
+    for pc in 0..p.ins.len() {
+        if lead[pc] {
+            rec = None;
+        }
+        let i = p.ins[pc];
+        if i.op == Op::GetIndex {
+            if let Some((arr, idx, val)) = rec {
+                if i.b == arr && i.c == idx && i.a != val {
+                    p.ins[pc] = Instr::abc(Op::Move, i.a, val, 0);
+                    changed = true;
+                    continue;
+                }
+            }
+            rec = Some((i.a, i.b, i.c)).map(|(a, b, c)| (b, c, a));
+            continue;
+        }
+        let Some((arr, idx, val)) = rec else { continue };
+        let e = effects(p.ins[pc], consts, upval_srcs);
+        // `effectful` also covers "can throw", which a GetField between the
+        // two loads always is; only something that can write an element
+        // or run arbitrary code matters here
+        let heap_write = matches!(
+            p.ins[pc].op,
+            Op::Call | Op::SetIndex | Op::ArrayPush | Op::SetField | Op::StoreCell | Op::SetUpval | Op::Await
+        );
+        if heap_write || e.writes == Some(arr) || e.writes == Some(idx) || e.writes == Some(val) {
+            rec = None;
+        }
+    }
+    changed
+}
+
 fn dead_store_elim(
     p: &mut P,
     consts: &[Const],

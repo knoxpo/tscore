@@ -150,6 +150,12 @@ pub struct JitState {
     pub backedges: AtomicU32,
     /// Tier-2 deoptimization count (demote to Tier-1 at 10).
     pub deopts: AtomicU32,
+    /// A direct-call cache filled at a site this proto's compiled code
+    /// was built without (the callee was first seen after compilation —
+    /// a loop later in the function than the one that triggered OSR).
+    /// The next OSR entry or call recompiles with the cache in hand,
+    /// which is what lets that callee inline. Set at most once per site.
+    pub recompile: std::sync::atomic::AtomicBool,
     /// Arg-tag bitmasks observed during profiling: 1=number seen,
     /// 2=non-number seen. Fixed 8 slots (args beyond 8 unprofiled).
     pub arg_seen: [AtomicU8; 8],

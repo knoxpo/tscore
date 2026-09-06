@@ -383,17 +383,26 @@ impl C {
     /// Write a literal Obj at the address in `at` (x13): shape, vlen,
     /// the first `sn` values from their homes, undefined pads, and an
     /// empty overflow Vec. Shared by the nursery and old-space templates.
-    /// `checks[i]` asks for an Int32 check on value i (the shape's field
-    /// is Int32 but the value is only proven a number) — a miss takes
-    /// `slow`, whose helper widens the shape.
-    fn store_obj_lit(&mut self, at: u32, shape_ptr: u64, sn: u8, first: u8, checks: &[bool], slow: Label, o: HeapOffsets) {
+    /// `checks[i]` is what value i must be shown to be before it may
+    /// enter the shape's field: 0 nothing, 1 Int32 (value already known
+    /// a number), 2 number then Int32, 3 number. A miss takes `slow`,
+    /// whose helper widens the shape.
+    fn store_obj_lit(&mut self, at: u32, shape_ptr: u64, sn: u8, first: u8, checks: &[u8], slow: Label, o: HeapOffsets) {
         self.a.mov_imm64(14, shape_ptr);
         self.a.str_imm(14, at, 0);
         self.a.mov_imm64(14, sn as u64);
         self.a.str_imm(14, at, o.obj_vlen);
         for i in 0..sn {
             self.fetch_x(first + i, 9);
-            if checks.get(i as usize).copied().unwrap_or(false) {
+            // tag check on x11, not guard_number: that one uses x10, which
+            // holds the arena length this template bumps and returns
+            let cls = checks.get(i as usize).copied().unwrap_or(0);
+            if cls == 2 || cls == 3 {
+                self.a.lsr_imm(11, 9, 48);
+                self.a.cmp_reg(11, R_TAGLIM);
+                self.a.b_cond(Cond::Hs, slow);
+            }
+            if cls == 1 || cls == 2 {
                 self.int32_check(9, slow);
             }
             self.a.str_imm(9, at, o.obj_inline + i as u32 * 8);
@@ -453,6 +462,170 @@ impl C {
         self.a.ldr_imm(14, R_REALM, o.allocs_since_gc_off);
         self.a.add_imm(14, 14, 1);
         self.a.str_imm(14, R_REALM, o.allocs_since_gc_off);
+    }
+
+    /// Array literal of `n` values from vregs `first..`: inline bump
+    /// (nursery or, when pretenuring, the old arena) with the helper as
+    /// the slow path. Result in `dst`.
+    fn emit_arr_lit(&mut self, dst: u8, first: u8, n: usize) {
+        let c = self;
+        let slow = c.a.new_label();
+        let done = c.a.new_label();
+        let arr_bump = n <= 8 && c.offsets.filter(|o| o.bump_alloc).is_some();
+        if arr_bump {
+            // Inline array literal: the helper's whole job is a pooled
+            // buffer + a nursery slot, and both are Vec words the layout
+            // probes already located. Fast path needs nursery.arrs to
+            // have room (no realloc, so the base tables stay valid) and
+            // a pooled buffer on top with capacity >= n; anything else
+            // takes the helper, which also does the pop-until-fits walk.
+            let o = c.offsets.unwrap();
+            let old = c.a.new_label();
+            c.a.ldr_imm(9, R_REALM, o.pretenure_off);
+            c.a.cbnz(9, old);
+            c.a.ldr_imm(10, R_REALM, o.nursery_arrs_len);
+            c.a.ldr_imm(11, R_REALM, o.nursery_arrs_cap);
+            c.a.cmp_reg(10, 11);
+            c.a.b_cond(Cond::Hs, slow);
+            c.store_arr_lit(o.nursery_arrs_ptr, n, first, slow, o);
+            c.a.add_imm(9, 10, 1);
+            c.a.str_imm(9, R_REALM, o.nursery_arrs_len);
+            // nursery.bytes += 32 + cap * 8 (what young_arr counts)
+            c.a.ldr_imm(9, R_REALM, o.nursery_bytes_off);
+            c.a.add_imm(9, 9, 32);
+            c.a.add_reg_lsl(9, 9, 14, 3);
+            c.a.str_imm(9, R_REALM, o.nursery_bytes_off);
+            // result: TAG_ARR | YOUNG_BIT | index
+            c.a.mov_imm64(9, (0xFFFCu64 << 48) | 0x8000_0000);
+            c.a.orr_reg(0, 9, 10);
+            c.a.b(done);
+            // Pretenure mode: straight into the old arena. Needs an
+            // empty free list (slot reuse is the helper's job) and
+            // room in both the arena and its young log.
+            c.a.bind(old);
+            c.a.ldr_imm(9, R_REALM, o.free_arrs_len);
+            c.a.cbnz(9, slow);
+            c.a.ldr_imm(10, R_REALM, o.arrs_len);
+            c.a.ldr_imm(11, R_REALM, o.arrs_cap);
+            c.a.cmp_reg(10, 11);
+            c.a.b_cond(Cond::Hs, slow);
+            c.a.ldr_imm(9, R_REALM, o.arrs_young_len);
+            c.a.ldr_imm(11, R_REALM, o.arrs_young_cap);
+            c.a.cmp_reg(9, 11);
+            c.a.b_cond(Cond::Hs, slow);
+            c.store_arr_lit(o.realm_arrs_ptr, n, first, slow, o);
+            c.a.add_imm(9, 10, 1);
+            c.a.str_imm(9, R_REALM, o.arrs_len);
+            c.a.ldr_imm(12, R_REALM, o.arrs_young_len);
+            c.old_alloc_log(o.arrs_young_ptr, o.arrs_young_len, o);
+            c.a.mov_imm64(9, 0xFFFCu64 << 48);
+            c.a.orr_reg(0, 9, 10);
+            c.a.b(done);
+        }
+        c.a.bind(slow);
+        // helper reads values from slots — flush the ones living in
+        // d-registers (allocation never GCs, no reload needed)
+        for v in first..first + n as u8 {
+            if v < LOW {
+                c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
+            }
+        }
+        c.a.mov(0, R_REALM);
+        c.a.mov(1, R_BASE);
+        c.a.mov_imm64(2, first as u64);
+        c.a.mov_imm64(3, n as u64);
+        c.thin(c.helpers.new_array_lit);
+        c.a.bind(done);
+        c.put_x(dst, 0);
+    }
+
+    /// Object literal with a baked shape: `sn` values from vregs
+    /// `first..`, checked per `checks` (see store_obj_lit). Inline bump
+    /// for <= 3 fields, the shape-baked helper otherwise. Result in `dst`.
+    fn emit_obj_lit(&mut self, dst: u8, first: u8, sn: u8, shape_ptr: u64, checks: &[u8]) {
+        let c = self;
+        let bump = c.offsets.filter(|o| o.bump_alloc).is_some() && sn <= 3;
+        if bump {
+            // inline nursery bump: len<cap -> write the 64-byte Obj at
+            // the tail, bump len+bytes, result = len|YOUNG_BIT. Values
+            // read straight from d-reg homes (no slot flush).
+            let o = c.offsets.unwrap();
+            let slow = c.a.new_label();
+            let done = c.a.new_label();
+            let old = c.a.new_label();
+            c.a.ldr_imm(9, R_REALM, o.pretenure_off);
+            c.a.cbnz(9, old);
+            c.a.ldr_imm(10, R_REALM, o.nursery_objs_len);
+            c.a.ldr_imm(11, R_REALM, o.nursery_objs_cap);
+            c.a.cmp_reg(10, 11);
+            c.a.b_cond(Cond::Hs, slow); // full -> helper (realloc)
+            c.a.ldr_imm(12, R_REALM, o.nursery_objs_ptr);
+            c.a.add_reg_lsl(13, 12, 10, 6); // + len * 64
+            c.store_obj_lit(13, shape_ptr, sn, first, checks, slow, o);
+            c.a.add_imm(14, 10, 1);
+            c.a.str_imm(14, R_REALM, o.nursery_objs_len);
+            c.a.ldr_imm(14, R_REALM, o.nursery_bytes_off);
+            c.a.add_imm(14, 14, 72);
+            c.a.str_imm(14, R_REALM, o.nursery_bytes_off);
+            // result: TAG_OBJ | YOUNG_BIT | index
+            c.a.mov_imm64(9, (0xFFFBu64 << 48) | 0x8000_0000);
+            c.a.orr_reg(9, 9, 10);
+            c.put_x(dst, 9);
+            c.a.b(done);
+            // Pretenure mode: old arena directly (see emit_arr_lit).
+            c.a.bind(old);
+            c.a.ldr_imm(9, R_REALM, o.free_objs_len);
+            c.a.cbnz(9, slow);
+            c.a.ldr_imm(10, R_REALM, o.objs_len);
+            c.a.ldr_imm(11, R_REALM, o.objs_cap);
+            c.a.cmp_reg(10, 11);
+            c.a.b_cond(Cond::Hs, slow);
+            c.a.ldr_imm(12, R_REALM, o.objs_young_len);
+            c.a.ldr_imm(11, R_REALM, o.objs_young_cap);
+            c.a.cmp_reg(12, 11);
+            c.a.b_cond(Cond::Hs, slow);
+            c.a.ldr_imm(13, R_REALM, o.realm_objs_ptr);
+            c.a.add_reg_lsl(13, 13, 10, 6);
+            c.store_obj_lit(13, shape_ptr, sn, first, checks, slow, o);
+            c.a.add_imm(14, 10, 1);
+            c.a.str_imm(14, R_REALM, o.objs_len);
+            // x12 (young-log len) does not survive the Int32 checks
+            c.a.ldr_imm(12, R_REALM, o.objs_young_len);
+            c.old_alloc_log(o.objs_young_ptr, o.objs_young_len, o);
+            c.a.mov_imm64(9, 0xFFFBu64 << 48);
+            c.a.orr_reg(9, 9, 10);
+            c.put_x(dst, 9);
+            c.a.b(done);
+            c.a.bind(slow);
+            // helper reads values from slots — flush d-reg homes
+            for v in first..first + sn {
+                if v < LOW {
+                    c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
+                }
+            }
+            c.a.mov(0, R_REALM);
+            c.a.mov(1, R_BASE);
+            c.a.mov_imm64(2, first as u64);
+            c.a.mov_imm64(3, sn as u64);
+            c.a.mov_imm64(4, shape_ptr);
+            c.thin(c.helpers.new_object_lit2);
+            c.put_x(dst, 0);
+            c.a.bind(done);
+        } else {
+            for v in first..first + sn {
+                if v < LOW {
+                    c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
+                }
+            }
+            // shape baked at compile time: no per-alloc cache lookup
+            c.a.mov(0, R_REALM);
+            c.a.mov(1, R_BASE);
+            c.a.mov_imm64(2, first as u64);
+            c.a.mov_imm64(3, sn as u64);
+            c.a.mov_imm64(4, shape_ptr);
+            c.thin(c.helpers.new_object_lit2);
+            c.put_x(dst, 0);
+        }
     }
 
     /// The field-access CSE cache lives in x15 (validated obj address;
@@ -525,7 +698,7 @@ pub fn compile(
     ics_base: u64,
     tics_base: u64,
     lit_shapes: &[(u64, u32)],
-    inlines: &[Option<(u64, std::sync::Arc<FunctionProto>)>],
+    inlines: &[Option<(u64, std::sync::Arc<FunctionProto>, Vec<(u64, u32)>)>],
 ) -> Option<Vec<u32>> {
     let pbody = proto.body();
     if pbody.code.len() > crate::tier1::MAX_CODE {
@@ -1326,7 +1499,9 @@ pub fn inlinable(callee: &FunctionProto) -> bool {
         return false;
     }
     let b = callee.body();
-    if b.code.len() > 12 || b.n_regs > 24 {
+    // 16: a three-field literal with its arithmetic and the emitter's dead
+    // `LoadUndef; Return` epilogue is 14
+    if b.code.len() > 16 || b.n_regs > 24 {
         return false;
     }
     b.code.iter().all(|i| {
@@ -1355,6 +1530,11 @@ pub fn inlinable(callee: &FunctionProto) -> bool {
                 Op::LoadConst => {
                     matches!(b.consts.get(i.bx() as usize), Some(Const::Number(_)))
                 }
+                // small literals: the templates take a mapped register
+                // window and a baked shape; values are checked at run time
+                // against the shape since the callee carries no facts
+                Op::NewArrayLit => i.c as usize <= 8,
+                Op::NewObjectLit => matches!(b.consts.get(i.c as usize), Some(Const::Keys(k)) if k.len() <= 3),
                 Op::GetUpval => callee
                     .upvals
                     .get(i.b as usize)
@@ -1375,6 +1555,7 @@ fn emit_inline_call(
     ins: Instr,
     proto_word: u64,
     callee: &FunctionProto,
+    callee_lits: &[(u64, u32)],
     o: &HeapOffsets,
     fmod_addr: usize,
     generic: Label,
@@ -1411,8 +1592,30 @@ fn emit_inline_call(
         c.a.cmp_reg(10, R_TAGLIM);
         c.a.b_cond(Cond::Hs, g);
     };
-    for cins in callee.body().code.iter() {
+    for (cpc, cins) in callee.body().code.iter().enumerate() {
         match cins.op {
+            Op::NewArrayLit => {
+                c.emit_arr_lit(map(cins.a), map(cins.b), cins.c as usize);
+                c.a.movz(14, 0, 0); // closure addr clobbered; GetUpval reloads
+            }
+            Op::NewObjectLit => {
+                let Some(&(shape_ptr, sn)) = callee_lits.get(cpc).filter(|&&(sp, _)| sp != 0) else {
+                    c.a.b(generic);
+                    continue;
+                };
+                // no facts for the callee: every value proves itself
+                // against the field's current representation
+                let shape = unsafe { &*(shape_ptr as *const tsr_memory::ShapeData) };
+                let checks: Vec<u8> = (0..sn as usize)
+                    .map(|j| match shape.repr(j) {
+                        tsr_memory::Repr::Int32 => 2,
+                        tsr_memory::Repr::Number => 3,
+                        tsr_memory::Repr::Any => 0,
+                    })
+                    .collect();
+                c.emit_obj_lit(map(cins.a), map(cins.b), sn as u8, shape_ptr, &checks);
+                c.a.movz(14, 0, 0);
+            }
             Op::LoadInt => c.put_bits(map(cins.a), Value::number(cins.sbx() as f64).bits()),
             Op::LoadUndef => c.put_bits(map(cins.a), Value::UNDEFINED.bits()),
             Op::LoadNull => c.put_bits(map(cins.a), Value::NULL.bits()),
@@ -1559,7 +1762,7 @@ fn emit_op(
     fmod_addr: usize,
     pow_addr: usize,
     lit_shapes: &[(u64, u32)],
-    inlines: &[Option<(u64, std::sync::Arc<FunctionProto>)>],
+    inlines: &[Option<(u64, std::sync::Arc<FunctionProto>, Vec<(u64, u32)>)>],
     fcache: &mut Option<u8>,
     acache: &mut Option<u8>,
     in_lane: bool,
@@ -1612,8 +1815,19 @@ fn emit_op(
                 && known_int(c, ins.b, 0)
                 && known_int(c, ins.c, 1)
             {
-                let ib = c.int_src(ins.b, 10);
-                let ic = c.int_src(ins.c, 11);
+                // a known integer constant is an immediate, not a boxed
+                // home to reload and convert (`i + 1` did exactly that)
+                let const_at = |c: &mut C, side: usize, v: u8, scratch: u32| -> u32 {
+                    match facts.const_ops.get(pc).and_then(|o| o[side]) {
+                        Some(k) => {
+                            c.a.mov_imm64(scratch, k as u64);
+                            scratch
+                        }
+                        None => c.int_src(v, scratch),
+                    }
+                };
+                let ib = const_at(c, 0, ins.b, 10);
+                let ic = const_at(c, 1, ins.c, 11);
                 match ins.op {
                     Op::Add => c.a.add_reg(14, ib, ic),
                     Op::Sub => c.a.sub_reg(14, ib, ic),
@@ -1984,14 +2198,14 @@ fn emit_op(
             let inline_generic = c.a.new_label();
             let inline_done = c.a.new_label();
             let mut inlined = false;
-            if let (Some(o), Some(Some((pw, callee)))) =
+            if let (Some(o), Some(Some((pw, callee, lits)))) =
                 (c.offsets, inlines.get(pc))
             {
                 if callee.arity as usize == ins.b as usize
                     && (ins.a as usize + 1 + callee.body().n_regs as usize) < 256
                 {
                     emit_inline_call(
-                        c, ins, *pw, callee, &o, fmod_addr, inline_generic,
+                        c, ins, *pw, callee, lits, &o, fmod_addr, inline_generic,
                         inline_done,
                     );
                     inlined = true;
@@ -2372,8 +2586,13 @@ fn emit_op(
                 // An index the lane already holds as an integer needs no
                 // tag guard and no integrality check: it is a sign-extended
                 // i32, so a negative one fails the unsigned bounds compare.
+                let const_ix = facts
+                    .const_ops
+                    .get(pc)
+                    .and_then(|o| o[1])
+                    .filter(|&k| (0..=i32::MAX as i64).contains(&k));
                 let lane_ix = in_lane && (c.lane == Some(ins.c) || c.itmp == Some(ins.c));
-                if !lane_ix {
+                if !lane_ix && const_ix.is_none() {
                     // the index guard clobbers x10, so it has to run before
                     // the base pointer lands there
                     c.fetch_x(ins.c, 9);
@@ -2382,7 +2601,9 @@ fn emit_op(
                 let reuse = *acache == Some(ins.b) && c.int_lane;
                 c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, c.acache_on);
                 *acache = Some(ins.b);
-                if lane_ix {
+                if let Some(k) = const_ix {
+                    c.a.mov_imm64(13, k as u64);
+                } else if lane_ix {
                     let r = if c.lane == Some(ins.c) { R_LANE } else { R_ITMP };
                     c.a.mov(13, r);
                 } else {
@@ -2430,8 +2651,13 @@ fn emit_op(
                 // the index stays a boxed value in x9 (or the lane) until
                 // the base is derived: arena_base stages the young bit in
                 // x13, and the number guard clobbers x10
+                let const_ix = facts
+                    .const_ops
+                    .get(pc)
+                    .and_then(|o| o[0])
+                    .filter(|&k| (0..=i32::MAX as i64).contains(&k));
                 let lane_ix = in_lane && (c.lane == Some(ins.b) || c.itmp == Some(ins.b));
-                if !lane_ix {
+                if !lane_ix && const_ix.is_none() {
                     c.fetch_x(ins.b, 9);
                     c.guard_number(9, slow);
                 }
@@ -2466,7 +2692,9 @@ fn emit_op(
                 c.a.orr_reg32(12, 31, 8);
                 c.arena_base(10, 12, o.arr_bases_off);
                 c.index_addr(10, 10, 12, o.arr_size);
-                if lane_ix {
+                if let Some(k) = const_ix {
+                    c.a.mov_imm64(13, k as u64);
+                } else if lane_ix {
                     let r = if c.lane == Some(ins.b) { R_LANE } else { R_ITMP };
                     c.a.mov(13, r);
                 } else {
@@ -2654,180 +2882,29 @@ fn emit_op(
                     _ => unreachable!("NewObjectLit const is Keys"),
                 }
             };
-            let bump = ins.op == Op::NewObjectLit
-                && c.offsets.filter(|o| o.bump_alloc).is_some()
-                && lit_shapes
-                    .get(pc)
-                    .is_some_and(|&(sp, sn)| sp != 0 && (sn as usize) <= 3);
-            let arr_bump = ins.op == Op::NewArrayLit
-                && n <= 8
-                && c.offsets.filter(|o| o.bump_alloc).is_some();
-            if !bump && !arr_bump {
-                // helper reads values from slots — flush the ones living in
-                // d-registers (allocation never GCs, no reload needed)
+            if ins.op == Op::NewArrayLit {
+                c.emit_arr_lit(ins.a, ins.b, n);
+            } else if let Some(&(shape_ptr, sn)) = lit_shapes.get(pc).filter(|&&(sp, _)| sp != 0) {
+                // which literal values need an Int32 check: the field is
+                // Int32 (as of now — widening later only relaxes it) and
+                // the value is a number not proven integral
+                let checks: Vec<u8> = {
+                    let shape = unsafe { &*(shape_ptr as *const tsr_memory::ShapeData) };
+                    let classes = facts.lit_vals.get(pc).map(|v| v.as_slice()).unwrap_or(&[]);
+                    (0..sn as usize)
+                        .map(|j| {
+                            (classes.get(j).copied().unwrap_or(2) == 1
+                                && shape.repr(j) == tsr_memory::Repr::Int32) as u8
+                        })
+                        .collect()
+                };
+                c.emit_obj_lit(ins.a, ins.b, sn as u8, shape_ptr, &checks);
+            } else {
                 for v in ins.b..ins.b + n as u8 {
                     if v < LOW {
                         c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
                     }
                 }
-            }
-            if ins.op == Op::NewArrayLit {
-                let slow = c.a.new_label();
-                let done = c.a.new_label();
-                if arr_bump {
-                    // Inline array literal: the helper's whole job is a
-                    // pooled buffer + a nursery slot, and both are Vec
-                    // words the layout probes already located. Fast path
-                    // needs nursery.arrs to have room (no realloc, so the
-                    // base tables stay valid) and a pooled buffer on top
-                    // with capacity >= n; anything else takes the helper,
-                    // which also does the pop-until-fits walk.
-                    let o = c.offsets.unwrap();
-                    let old = c.a.new_label();
-                    c.a.ldr_imm(9, R_REALM, o.pretenure_off);
-                    c.a.cbnz(9, old);
-                    c.a.ldr_imm(10, R_REALM, o.nursery_arrs_len);
-                    c.a.ldr_imm(11, R_REALM, o.nursery_arrs_cap);
-                    c.a.cmp_reg(10, 11);
-                    c.a.b_cond(Cond::Hs, slow);
-                    c.store_arr_lit(o.nursery_arrs_ptr, n, ins.b, slow, o);
-                    c.a.add_imm(9, 10, 1);
-                    c.a.str_imm(9, R_REALM, o.nursery_arrs_len);
-                    // nursery.bytes += 32 + cap * 8 (what young_arr counts)
-                    c.a.ldr_imm(9, R_REALM, o.nursery_bytes_off);
-                    c.a.add_imm(9, 9, 32);
-                    c.a.add_reg_lsl(9, 9, 14, 3);
-                    c.a.str_imm(9, R_REALM, o.nursery_bytes_off);
-                    // result: TAG_ARR | YOUNG_BIT | index
-                    // in x0: the arm's shared put_x(ins.a, 0) below stores it
-                    c.a.mov_imm64(9, (0xFFFCu64 << 48) | 0x8000_0000);
-                    c.a.orr_reg(0, 9, 10);
-                    c.a.b(done);
-                    // Pretenure mode: straight into the old arena. Needs an
-                    // empty free list (slot reuse is the helper's job) and
-                    // room in both the arena and its young log.
-                    c.a.bind(old);
-                    c.a.ldr_imm(9, R_REALM, o.free_arrs_len);
-                    c.a.cbnz(9, slow);
-                    c.a.ldr_imm(10, R_REALM, o.arrs_len);
-                    c.a.ldr_imm(11, R_REALM, o.arrs_cap);
-                    c.a.cmp_reg(10, 11);
-                    c.a.b_cond(Cond::Hs, slow);
-                    c.a.ldr_imm(9, R_REALM, o.arrs_young_len);
-                    c.a.ldr_imm(11, R_REALM, o.arrs_young_cap);
-                    c.a.cmp_reg(9, 11);
-                    c.a.b_cond(Cond::Hs, slow);
-                    c.store_arr_lit(o.realm_arrs_ptr, n, ins.b, slow, o);
-                    c.a.add_imm(9, 10, 1);
-                    c.a.str_imm(9, R_REALM, o.arrs_len);
-                    c.a.ldr_imm(12, R_REALM, o.arrs_young_len);
-                    c.old_alloc_log(o.arrs_young_ptr, o.arrs_young_len, o);
-                    c.a.mov_imm64(9, 0xFFFCu64 << 48);
-                    c.a.orr_reg(0, 9, 10);
-                    c.a.b(done);
-                    c.a.bind(slow);
-                    for v in ins.b..ins.b + n as u8 {
-                        if v < LOW {
-                            c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
-                        }
-                    }
-                }
-                c.a.mov(0, R_REALM);
-                c.a.mov(1, R_BASE);
-                c.a.mov_imm64(2, ins.b as u64);
-                c.a.mov_imm64(3, n as u64);
-                c.thin(c.helpers.new_array_lit);
-                c.a.bind(done);
-            } else if let Some(&(shape_ptr, sn)) = lit_shapes.get(pc).filter(|&&(sp, _)| sp != 0) {
-                // which literal values need an Int32 check: the field is
-                // Int32 (as of now — widening later only relaxes it) and
-                // the value is a number not proven integral
-                let lit_checks: Vec<bool> = {
-                    let shape = unsafe { &*(shape_ptr as *const tsr_memory::ShapeData) };
-                    let classes = facts.lit_vals.get(pc).map(|v| v.as_slice()).unwrap_or(&[]);
-                    (0..sn as usize)
-                        .map(|j| {
-                            classes.get(j).copied().unwrap_or(2) == 1
-                                && shape.repr(j) == tsr_memory::Repr::Int32
-                        })
-                        .collect()
-                };
-                if bump {
-                    // inline nursery bump: len<cap -> write the 64-byte Obj
-                    // at the tail, bump len+bytes, result = len|YOUNG_BIT.
-                    // Values read straight from d-reg homes (no slot flush).
-                    let o = c.offsets.unwrap();
-                    let slow = c.a.new_label();
-                    let done = c.a.new_label();
-                    let old = c.a.new_label();
-                    c.a.ldr_imm(9, R_REALM, o.pretenure_off);
-                    c.a.cbnz(9, old);
-                    c.a.ldr_imm(10, R_REALM, o.nursery_objs_len);
-                    c.a.ldr_imm(11, R_REALM, o.nursery_objs_cap);
-                    c.a.cmp_reg(10, 11);
-                    c.a.b_cond(Cond::Hs, slow); // full -> helper (realloc)
-                    c.a.ldr_imm(12, R_REALM, o.nursery_objs_ptr);
-                    c.a.add_reg_lsl(13, 12, 10, 6); // + len * 64
-                    c.store_obj_lit(13, shape_ptr, sn as u8, ins.b, &lit_checks, slow, o);
-                    c.a.add_imm(14, 10, 1);
-                    c.a.str_imm(14, R_REALM, o.nursery_objs_len);
-                    c.a.ldr_imm(14, R_REALM, o.nursery_bytes_off);
-                    c.a.add_imm(14, 14, 72);
-                    c.a.str_imm(14, R_REALM, o.nursery_bytes_off);
-                    // result: TAG_OBJ | YOUNG_BIT | index
-                    c.a.mov_imm64(9, (0xFFFBu64 << 48) | 0x8000_0000);
-                    c.a.orr_reg(9, 9, 10);
-                    c.put_x(ins.a, 9);
-                    c.a.b(done);
-                    // Pretenure mode: old arena directly (see NewArrayLit).
-                    c.a.bind(old);
-                    c.a.ldr_imm(9, R_REALM, o.free_objs_len);
-                    c.a.cbnz(9, slow);
-                    c.a.ldr_imm(10, R_REALM, o.objs_len);
-                    c.a.ldr_imm(11, R_REALM, o.objs_cap);
-                    c.a.cmp_reg(10, 11);
-                    c.a.b_cond(Cond::Hs, slow);
-                    c.a.ldr_imm(12, R_REALM, o.objs_young_len);
-                    c.a.ldr_imm(11, R_REALM, o.objs_young_cap);
-                    c.a.cmp_reg(12, 11);
-                    c.a.b_cond(Cond::Hs, slow);
-                    c.a.ldr_imm(13, R_REALM, o.realm_objs_ptr);
-                    c.a.add_reg_lsl(13, 13, 10, 6);
-                    c.store_obj_lit(13, shape_ptr, sn as u8, ins.b, &lit_checks, slow, o);
-                    c.a.add_imm(14, 10, 1);
-                    c.a.str_imm(14, R_REALM, o.objs_len);
-                    // x12 (young-log len) does not survive the Int32 checks
-                    c.a.ldr_imm(12, R_REALM, o.objs_young_len);
-                    c.old_alloc_log(o.objs_young_ptr, o.objs_young_len, o);
-                    c.a.mov_imm64(9, 0xFFFBu64 << 48);
-                    c.a.orr_reg(9, 9, 10);
-                    c.put_x(ins.a, 9);
-                    c.a.b(done);
-                    c.a.bind(slow);
-                    // helper reads values from slots — flush d-reg homes
-                    for v in ins.b..ins.b + sn as u8 {
-                        if v < LOW {
-                            c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
-                        }
-                    }
-                    c.a.mov(0, R_REALM);
-                    c.a.mov(1, R_BASE);
-                    c.a.mov_imm64(2, ins.b as u64);
-                    c.a.mov_imm64(3, sn as u64);
-                    c.a.mov_imm64(4, shape_ptr);
-                    c.thin(c.helpers.new_object_lit2);
-                    c.put_x(ins.a, 0);
-                    c.a.bind(done);
-                } else {
-                    // shape baked at compile time: no per-alloc cache lookup
-                    c.a.mov(0, R_REALM);
-                    c.a.mov(1, R_BASE);
-                    c.a.mov_imm64(2, ins.b as u64);
-                    c.a.mov_imm64(3, sn as u64);
-                    c.a.mov_imm64(4, shape_ptr);
-                    c.thin(c.helpers.new_object_lit2);
-                }
-            } else {
                 c.a.mov(0, R_REALM);
                 c.a.mov(1, R_PROTO);
                 c.a.mov_imm64(2, pc as u64);
@@ -2835,8 +2912,6 @@ fn emit_op(
                 c.a.mov_imm64(4, ins.b as u64);
                 c.a.mov_imm64(5, ins.c as u64);
                 c.thin(c.helpers.new_object_lit);
-            }
-            if !bump {
                 c.put_x(ins.a, 0);
             }
         }

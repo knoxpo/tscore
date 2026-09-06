@@ -156,6 +156,9 @@ pub(crate) fn fill_call_ic(
         })) as *mut u8;
         if !pr.jit.tic_store(pr.body().code.len(), pc, ic) {
             drop(unsafe { Box::from_raw(ic as *mut CallIc) });
+        } else if !pr.jit.osr_code.load(Acquire).is_null() || !pr.jit.code.load(Acquire).is_null() {
+            // compiled without this cache: worth compiling again
+            pr.jit.recompile.store(true, Relaxed);
         }
     }
 }
@@ -1385,6 +1388,11 @@ pub fn tier_up(proto: &FunctionProto) -> Option<CompiledFn> {
     let jit = &proto.jit;
     let code = jit.code.load(Acquire);
     if !code.is_null() {
+        if jit.tier.load(Relaxed) == TIER_OPT && jit.recompile.swap(false, Relaxed) {
+            compile_now(proto);
+            let code = jit.code.load(Acquire);
+            return Some(unsafe { std::mem::transmute::<*mut u8, CompiledFn>(code) });
+        }
         return Some(unsafe { std::mem::transmute::<*mut u8, CompiledFn>(code) });
     }
     if !jit_enabled() || jit.tier.load(Relaxed) == TIER_REJECTED {
@@ -1445,7 +1453,7 @@ pub fn osr_threshold_pub() -> u32 {
 pub fn osr_slow(proto: &FunctionProto) -> Option<CompiledFn> {
     let jit = &proto.jit;
     let code = jit.osr_code.load(Acquire);
-    if !code.is_null() {
+    if !code.is_null() && !jit.recompile.swap(false, Relaxed) {
         return Some(unsafe { std::mem::transmute::<*mut u8, CompiledFn>(code) });
     }
     if !jit_enabled() {
@@ -1611,7 +1619,7 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
         .collect();
     // direct-call inlining: warmup filled CallIcs; a tiny eligible callee
     // gets spliced into the caller at compile time
-    let inlines: Vec<Option<(u64, Arc<FunctionProto>)>> = proto
+    let inlines: Vec<Option<(u64, Arc<FunctionProto>, Vec<(u64, u32)>)>> = proto
         .body()
         .code
         .iter()
@@ -1643,7 +1651,22 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
                 Arc::increment_strong_count(p);
                 Arc::from_raw(p)
             };
-            Some((ic.proto_word, arc))
+            // the callee's own literal shapes, by callee pc
+            let lits: Vec<(u64, u32)> = callee
+                .body()
+                .code
+                .iter()
+                .enumerate()
+                .map(|(cpc, ci)| {
+                    if ci.op == Op::NewObjectLit {
+                        let s = lit_shape(callee, cpc, ci.c as usize);
+                        (s as *const _ as u64, s.fields.len() as u32)
+                    } else {
+                        (0, 0)
+                    }
+                })
+                .collect();
+            Some((ic.proto_word, arc, lits))
         })
         .collect();
     tsr_jit::tier2::compile(
