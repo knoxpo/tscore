@@ -949,7 +949,9 @@ pub fn compile(
 /// (multiplier, shift) such that n/d == (smulh(n, m) >> s) + sign_fix.
 /// Standard Granlund-Montgomery derivation.
 fn magic_div(d: i64) -> Option<(i64, u32)> {
-    if d.abs() < 2 || d == i64::MIN {
+    // unsigned_abs, not abs: |i64::MIN| overflows, and the i64::MIN check
+    // is no use behind an operand that panics before it runs
+    if d.unsigned_abs() < 2 || d == i64::MIN {
         return None;
     }
     let ad = d.unsigned_abs();
