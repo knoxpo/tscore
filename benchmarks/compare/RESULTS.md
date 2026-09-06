@@ -77,7 +77,7 @@ Win = fastest median (highest throughput for long-running) on that row.
 |---|---|---|---|
 | tscore workers:1 | 135,639 | 1.0 | 136,885 **best/core** |
 | tscore workers:8 | 148,893 | 1.9 | 79,453 |
-| bun x8 reusePort | 68,544 | 1.0 | 67,581 |
+| bun x8 reusePort (darwin: 1 active, 7 idle) | 68,544 | 1.0 | 67,581 |
 | bun x1 | 64,928 | 1.0 | 65,325 |
 | node x1 | 63,863 | 1.0 | 64,328 |
 | node cluster x8 | 107,128 | 3.7 | 28,735 |
@@ -85,6 +85,14 @@ Win = fastest median (highest throughput for long-running) on that row.
 Total throughput is capped by this machine's loopback stack, not
 by any engine: four independent servers with four independent
 clients total the same as one. Compare the per-core column.
+
+bun has no working multi-core HTTP on darwin: SO_REUSEPORT there
+permits the shared bind but does not distribute, so one of the 8
+processes serves every connection and the rest idle. Its row is a
+second bun x1 measurement, not a multi-core one. node's cluster
+distributes in userspace via the primary, and tscore's workers
+share one listener with a kqueue per thread; both scale here.
+
 ## Runtime surface
 
 | category | status |
