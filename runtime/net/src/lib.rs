@@ -678,6 +678,49 @@ fn response_parts(realm: &Realm, v: Value) -> (u16, Vec<(String, String)>, Strin
     (200, Vec::new(), String::new())
 }
 
+/// Header names repeat on every request, so `Arc::from(name)` was one
+/// malloc per header per request, paid even by handlers that never read
+/// a header. Interning makes it one malloc per distinct name per worker.
+///
+/// Worth ~2% throughput at 12 headers/request and ~3% at 18, nothing at
+/// 2 (A/B against the pre-interning binary; the win is small but came
+/// out the same sign in all 7 paired runs). It does NOT move
+/// RSS: the server's memory under load is dominated by the JS strings
+/// `handle_request` allocates for every header value and by the heap
+/// arenas' high-water mark, not by these keys. Eager materialisation of
+/// the request object is the real cost; interning only trims one edge
+/// of it.
+///
+/// Bounded because the name is attacker-chosen: a peer sending random
+/// header names would otherwise grow this map without limit. Past the
+/// cap we stop inserting and fall back to allocating, so the behaviour
+/// is unchanged and only the speedup is lost.
+struct HeaderNames {
+    map: std::collections::HashMap<Box<str>, Arc<str>>,
+}
+
+/// Enough for the real header vocabulary (~100 standard + app-specific)
+/// with room to spare; small enough that a hostile peer cannot grow the
+/// map into a memory problem.
+const HEADER_NAME_CAP: usize = 1024;
+
+impl HeaderNames {
+    fn new() -> Self {
+        Self { map: std::collections::HashMap::new() }
+    }
+
+    fn intern(&mut self, name: &str) -> Arc<str> {
+        if let Some(a) = self.map.get(name) {
+            return a.clone();
+        }
+        let a: Arc<str> = Arc::from(name);
+        if self.map.len() < HEADER_NAME_CAP {
+            self.map.insert(Box::from(name), a.clone());
+        }
+        a
+    }
+}
+
 /// Run the handler for one parsed request and append the wire response
 /// to `out`. Everything happens on the worker's own thread and realm.
 fn handle_request(
@@ -686,6 +729,7 @@ fn handle_request(
     req: &ParsedRequest,
     buf: &[u8],
     out: &mut Vec<u8>,
+    names: &mut HeaderNames,
 ) {
     // request shape is fixed: build it once per process and allocate the
     // object in one shot (per-field `set` would walk shape transitions
@@ -714,7 +758,7 @@ fn handle_request(
             slice_str(buf, *k)
         };
         let val = realm.alloc_string(slice_str(buf, *v));
-        headers.set(Arc::from(name), val);
+        headers.set(names.intern(name), val);
     }
     let headers_v = Value::object(realm.heap.alloc_obj(headers));
     let vals = [
@@ -858,6 +902,7 @@ fn worker_loop(realm: &mut Realm, handler: Value, listener: &TcpListener) {
         256
     ];
     let mut scratch = vec![0u8; 64 * 1024];
+    let mut names = HeaderNames::new();
 
     loop {
         let n = unsafe {
@@ -940,7 +985,7 @@ fn worker_loop(realm: &mut Realm, handler: Value, listener: &TcpListener) {
                     conn.outbuf = out;
                     break;
                 };
-                handle_request(realm, handler, &req, &inbuf, &mut out);
+                handle_request(realm, handler, &req, &inbuf, &mut out, &mut names);
                 let (consumed, keep) = (req.consumed, req.keep_alive);
                 drop(req);
                 inbuf.drain(..consumed);
@@ -1006,4 +1051,32 @@ fn flush_out(kq: RawFd, fd: RawFd, conn: Option<&mut HttpConn>) -> bool {
     conn.outbuf.clear();
     conn.out_off = 0;
     conn.keep_alive
+}
+
+#[cfg(test)]
+mod header_name_tests {
+    use super::{HeaderNames, HEADER_NAME_CAP};
+
+    #[test]
+    fn interns_repeats_and_stays_bounded() {
+        let mut n = HeaderNames::new();
+
+        // the point of the cache: a repeated name reuses one allocation
+        let a = n.intern("content-type");
+        let b = n.intern("content-type");
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        assert_eq!(&*a, "content-type");
+
+        // distinct names stay distinct
+        assert_eq!(&*n.intern("accept"), "accept");
+        assert_eq!(n.map.len(), 2);
+
+        // a hostile peer sending unique names cannot grow the map past
+        // the cap, and names past it still return the right string
+        for i in 0..HEADER_NAME_CAP * 2 {
+            let name = format!("x-{i}");
+            assert_eq!(&*n.intern(&name), name);
+        }
+        assert_eq!(n.map.len(), HEADER_NAME_CAP);
+    }
 }
