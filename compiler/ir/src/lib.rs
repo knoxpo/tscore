@@ -156,6 +156,11 @@ pub struct JitState {
     /// The next OSR entry or call recompiles with the cache in hand,
     /// which is what lets that callee inline. Set at most once per site.
     pub recompile: std::sync::atomic::AtomicBool,
+    /// Integer-lane speculation withdrawn: a loop-carried value the
+    /// analysis took for an i32 left that range (an accumulator that
+    /// grew past 2^31), so the header guard kept deopting. Recompiled
+    /// once without it instead of demoting to baseline.
+    pub no_int_spec: std::sync::atomic::AtomicBool,
     /// Arg-tag bitmasks observed during profiling: 1=number seen,
     /// 2=non-number seen. Fixed 8 slots (args beyond 8 unprofiled).
     pub arg_seen: [AtomicU8; 8],

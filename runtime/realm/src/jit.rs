@@ -177,8 +177,7 @@ extern "C" fn h_call_resume(
     let base = (new_base_bytes / 8) as usize;
     match ret_val {
         2 => {
-            let deopts = pr.jit.deopts.fetch_add(1, Relaxed) + 1;
-            if deopts >= 10 && pr.jit.tier.load(Relaxed) == TIER_OPT {
+            if note_deopt(pr, false, ret_stack) && pr.jit.tier.load(Relaxed) == TIER_OPT {
                 compile_baseline(pr);
             }
             let resume_pc = ret_stack as usize;
@@ -1396,6 +1395,25 @@ pub fn osr_threshold_pub() -> u32 {
 /// threshold (interpreter keeps a one-load fast path). Compiles once,
 /// returns the code, or marks the proto permanently un-OSR-able
 /// (backedges = u32::MAX) so the fast path never returns here.
+
+/// A deopt of optimized code: the third one withdraws integer-lane
+/// speculation and asks for a recompile (an accumulator that outgrew i32
+/// deopts at every header guard otherwise); the tenth demotes to
+/// baseline. Returns true when the caller should demote.
+fn note_deopt(proto: &FunctionProto, osr: bool, resume: u64) -> bool {
+    let jit = &proto.jit;
+    let deopts = jit.deopts.fetch_add(1, Relaxed) + 1;
+    if std::env::var_os("TSC_DEOPT_DEBUG").is_some() {
+        eprintln!("[deopt] {}'{}' resume={resume} count={deopts}", if osr { "osr " } else { "" }, proto.name);
+    }
+    if deopts >= 3 && !jit.no_int_spec.swap(true, Relaxed) {
+        jit.deopts.store(0, Relaxed);
+        jit.recompile.store(true, Relaxed);
+        return false;
+    }
+    deopts >= 10
+}
+
 pub fn osr_slow(proto: &FunctionProto) -> Option<CompiledFn> {
     let jit = &proto.jit;
     let code = jit.osr_code.load(Acquire);
@@ -1449,7 +1467,7 @@ pub fn enter_osr(
             // An optimized entry guard failed mid-loop: resume interpreting at
             // the OSR pc; repeated failures reject OSR for this proto so
             // the back-edge fast path stops trying
-            if proto.jit.deopts.fetch_add(1, Relaxed) + 1 >= 10 {
+            if note_deopt(proto, true, ret.stack) {
                 proto.jit.backedges.store(u32::MAX, Relaxed);
             }
             let resume_pc = ret.stack as usize;
@@ -1540,7 +1558,7 @@ fn compile_optimizing(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> 
         const_ops: &typed.const_ops,
         ic_baked: &ic_baked,
         loop_spec: &typed.loop_spec,
-        int_spec: &typed.int_spec,
+        int_spec: if proto.jit.no_int_spec.load(Relaxed) { &[] } else { &typed.int_spec },
         field_repr: &field_repr,
         int_facts: &typed.int_facts,
         lit_vals: &typed.lit_vals,
@@ -1683,8 +1701,7 @@ pub fn enter_jit_frame(
     match ret.val {
         0 => Ok(crate::interpreter::FrameResult::Return(Value::from_bits(ret.stack))),
         2 => {
-            let deopts = proto.jit.deopts.fetch_add(1, Relaxed) + 1;
-            if deopts >= 10 && proto.jit.tier.load(Relaxed) == TIER_OPT {
+            if note_deopt(proto, false, ret.stack) && proto.jit.tier.load(Relaxed) == TIER_OPT {
                 compile_baseline(proto);
             }
             let resume_pc = ret.stack as usize;
@@ -1726,11 +1743,7 @@ pub fn enter_jit(
         2 => {
             // deopt: state fully materialized in slots; resume in the
             // interpreter. Repeated deopts demote the proto to the baseline compiler.
-            let deopts = proto.jit.deopts.fetch_add(1, Relaxed) + 1;
-            if std::env::var_os("TSC_DEOPT_DEBUG").is_some() {
-                eprintln!("[deopt] '{}' resume={} count={}", proto.name, ret.stack, deopts);
-            }
-            if deopts >= 10 && proto.jit.tier.load(Relaxed) == TIER_OPT {
+            if note_deopt(proto, false, ret.stack) && proto.jit.tier.load(Relaxed) == TIER_OPT {
                 compile_baseline(proto);
             }
             let resume_pc = ret.stack as usize;
