@@ -1,4 +1,4 @@
-//! Tier-1 baseline template compiler: one short native sequence per
+//! Baseline template compiler: one short native sequence per
 //! bytecode op, registers stay in their `realm.stack` slots (GC/deopt/
 //! error machinery unchanged). Fast paths inline for number arithmetic,
 //! comparisons and branches; every other op — and every slow case — calls
@@ -41,7 +41,7 @@ pub struct Helpers {
     pub push: usize,
     /// fn(realm, proto, pc, const_idx) -> JitRet{val, stack}
     pub get_global: usize,
-    // closure-cell thin helpers (Tier-2 only; args by value, no GC):
+    // closure-cell thin helpers (optimizing only; args by value, no GC):
     /// fn(realm, closure_u32, idx) -> JitRet{val, stack}
     pub get_upval: usize,
     /// fn(realm, closure_u32, idx, v_bits) -> JitRet
@@ -173,7 +173,7 @@ pub struct JitRet {
 /// extern "C" fn(realm, proto, base_bytes, closure_u32, depth, start_pc)
 /// -> JitRet where JitRet.val = 0 ok / 1 error / 2 deopt(resume_pc in
 /// stack), JitRet.stack = return Value bits when ok. `start_pc` != 0
-/// enters at that loop header (OSR; Tier-1 only — slots are the frame).
+/// enters at that loop header (OSR; baseline only — slots are the frame).
 pub type CompiledFn = extern "C" fn(
     *mut core::ffi::c_void,
     *const FunctionProto,
@@ -281,7 +281,7 @@ impl C {
     }
 }
 
-/// Compile a proto to Tier-1 native code. Returns None when ineligible.
+/// Compile a proto to baseline native code. Returns None when ineligible.
 /// `for_osr`: compiled as an OSR target — calls-in-loops allowed (the
 /// alternative there is staying interpreted, not a faster tier).
 pub fn compile(
@@ -361,7 +361,7 @@ pub fn compile(
     c.a.add_reg(R_SLOTS, 1, R_BASE);
 
     // OSR dispatch: start_pc != 0 jumps to the matching loop header
-    // (register state is the stack slots — always current in Tier-1)
+    // (register state is the stack slots — always current in baseline code)
     let normal = c.a.new_label();
     c.a.cbz(15, normal);
     let mut headers: Vec<usize> = pbody

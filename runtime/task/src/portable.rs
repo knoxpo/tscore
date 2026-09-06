@@ -176,7 +176,7 @@ pub fn rehydrate(pv: &PortableValue, heap: &mut Heap) -> Value {
             Value::object(heap.alloc_obj(obj))
         }
         PortableValue::Closure { proto, upvals } => {
-            // cell-ness must match the proto's declaration: the Tier-2
+            // cell-ness must match the proto's declaration: the optimizing compiler
             // inline GetUpval trusts UpvalSrc statically (ParentLocalValue
             // = plain value, no cell deref). Wrapping a value capture in a
             // cell hands compiled code the raw cell.

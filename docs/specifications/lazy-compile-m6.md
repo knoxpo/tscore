@@ -83,7 +83,7 @@ on first use (thread-safe by construction). Hot paths resolve the body
 once per frame entry and pass `&ProtoBody` down — the per-call cost is
 one `Acquire` load, same class as the existing tier check. Mechanical
 refactor: every `proto.code` / `proto.consts` / `proto.protos` /
-`proto.spans` / `proto.n_regs` read in interp / jit / tier1 / tier2 /
+`proto.spans` / `proto.n_regs` read in interp / jit / baseline / optimizing /
 types / optimizer goes through the body reference.
 
 ### 2. Captures without the enclosing emitter

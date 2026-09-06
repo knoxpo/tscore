@@ -1,14 +1,14 @@
-//! Unified Tier-2: compiles EVERY non-async function. Type facts from
+//! The optimizing compiler: compiles EVERY non-async function. Type facts from
 //! tsc-types pick lanes per site, they never reject:
 //!   - proven-Num ops   -> unboxed FP on d-registers, no guards
 //!   - unproven arith   -> tag-guarded inline fast path, h_step fallback
-//!   - object/array read-> tier1-style inline IC template (helper fallback)
+//!   - object/array read-> baseline-style inline IC template (helper fallback)
 //!   - mutations        -> thin helpers (args by value, no slot traffic)
 //!   - everything else  -> h_step with full spill/reload around it
 //!
 //! Register plan: vreg i < 8 lives in d(8+i) holding raw Value bits (a
 //! number's Value bits ARE its f64 bits); vreg >= 8 stays in its stack
-//! slot. GP plan matches Tier-1 (x19 realm, x20 base, x22 closure,
+//! slot. GP plan matches baseline (x19 realm, x20 base, x22 closure,
 //! w23 depth, w24 poll, x25 slots, x26 proto, x27 sentinel, x28 taglim).
 //!
 //! GC safety: only h_call and h_safepoint can collect (thin helpers and
@@ -23,7 +23,7 @@
 //! raw bits correctly whatever they are.
 
 use crate::asm::{Asm, Cond, Label, SP};
-use crate::tier1::{Helpers, HeapOffsets};
+use crate::baseline::{Helpers, HeapOffsets};
 use tsc_ir::{Const, FunctionProto, Instr, Op};
 use tsr_memory::{Value, JIT_AWAIT_SENTINEL, JIT_ERR_SENTINEL};
 
@@ -856,7 +856,7 @@ fn js_cond(op: Op) -> Cond {
 }
 
 /// Compile any non-async proto. Returns None only for the calls-in-loop
-/// policy (same discriminator as Tier-1: measured, keeps fnv-shaped
+/// policy (same discriminator as the baseline compiler: measured, keeps fnv-shaped
 /// native-call loops in the interpreter's faster inline call arm).
 #[allow(clippy::too_many_arguments)]
 pub fn compile(
@@ -873,7 +873,7 @@ pub fn compile(
     inlines: &[Option<(u64, std::sync::Arc<FunctionProto>, Vec<(u64, u32)>)>],
 ) -> Option<Vec<u32>> {
     let pbody = proto.body();
-    if pbody.code.len() > crate::tier1::MAX_CODE {
+    if pbody.code.len() > crate::baseline::MAX_CODE {
         return None;
     }
     let heap_op = |op: Op| {
@@ -940,7 +940,7 @@ pub fn compile(
     };
     let out = c.a.new_label();
 
-    // prologue: tier1 frame + only the d-pairs this fn actually uses as
+    // prologue: baseline frame + only the d-pairs this fn actually uses as
     // vreg homes (small leaf functions push/pop far less)
     let d_pairs = c.n_low.div_ceil(2) as u32;
     c.a.stp_pre(29, 30, SP, -16);

@@ -7,7 +7,7 @@
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::sync::Arc;
 use tsr_memory::{PromiseError, Value};
-use tsr_realm::interp::call_value;
+use tsr_realm::interpreter::call_value;
 use tsr_realm::{Completer, Realm, RtError};
 use tsr_task::portable::{clone_out, rehydrate};
 use tsr_task::PortableValue;

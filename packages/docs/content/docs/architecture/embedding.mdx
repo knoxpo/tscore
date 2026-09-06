@@ -43,7 +43,7 @@ std::thread::Builder::new()
         tsr_net::install(&mut realm);
         match (&program, &chunk) {
             (Some(p), _) => tsr_modules::run_program(&mut realm, p),
-            (None, Some(c)) => tsr_realm::interp::run_main(&mut realm, &c.main),
+            (None, Some(c)) => tsr_realm::interpreter::run_main(&mut realm, &c.main),
             _ => unreachable!(),
         }
     })?

@@ -88,7 +88,7 @@ tscore process. See [GC spec](docs/specifications/gc-m4.md).
 
 ## Native compilation (M5)
 
-Hot functions compile to hand-rolled ARM64. Tier-2 uses your TS
+Hot functions compile to hand-rolled ARM64. The optimizing compiler uses your TS
 annotations: `function work(n: number)` runs **unboxed** in FP registers —
 measured 7× over the interpreter, matching Node on numeric loops, and it
 multiplies with `parallel.map` (mandelbrot ×8 cores: 17ms vs Node's 22ms

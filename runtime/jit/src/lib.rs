@@ -1,9 +1,10 @@
 //! tsr-jit
 //!
-//! Hand-rolled ARM64 JIT: encoder, executable-page heap, baseline (Tier-1)
-//! and typed (Tier-2) compilers. See docs/specifications/native-compilation-m5.md.
+//! Hand-rolled ARM64 JIT: encoder, executable-page heap, and two compilers:
+//! `baseline` (one native template per bytecode op) and `optimizing` (typed,
+//! unboxed). See docs/specifications/native-compilation-m5.md.
 
 pub mod asm;
 pub mod heap;
-pub mod tier1;
-pub mod tier2;
+pub mod baseline;
+pub mod optimizing;

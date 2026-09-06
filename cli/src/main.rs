@@ -206,7 +206,7 @@ fn main() -> ExitCode {
                 }
                 let r = match (&program, &chunk) {
                     (Some(p), _) => tsr_modules::run_program(&mut realm, p),
-                    (None, Some(c)) => tsr_realm::interp::run_main(&mut realm, &c.main),
+                    (None, Some(c)) => tsr_realm::interpreter::run_main(&mut realm, &c.main),
                     _ => unreachable!(),
                 };
                 if std::env::var_os("TSC_COMPILE_PHASES").is_some() {

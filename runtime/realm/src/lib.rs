@@ -1,9 +1,9 @@
 //! tsr-realm
 //!
 //! A realm owns a heap, a globals table, and a native-function table, and
-//! executes bytecode on the register-machine interpreter in [`interp`].
+//! executes bytecode on the register-machine interpreter in [`interpreter`].
 
-pub mod interp;
+pub mod interpreter;
 pub mod jit;
 pub mod layout;
 

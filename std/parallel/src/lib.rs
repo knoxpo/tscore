@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tsr_memory::{PromiseError, Value};
-use tsr_realm::interp::{call_value, drive};
+use tsr_realm::interpreter::{call_value, drive};
 use tsr_realm::{Realm, RtError};
 use tsr_scheduler::Pool;
 use tsr_task::portable::{clone_out, rehydrate};

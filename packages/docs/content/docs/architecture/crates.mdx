@@ -14,7 +14,7 @@ The repository is a single Cargo workspace. Prefixes: `tsc-` compiler, `tsr-` ru
 | `tsc-modules` | `compiler/modules` | ES module graph: specifier resolution via `tscore.json`, BFS discovery, per-file compilation. |
 | `tsc-ir` | `compiler/ir` | `Op`, `Chunk`, `FunctionProto`, `TypeHint`, disassembler. The compiler↔runtime contract. |
 | `tsc-optimizer` | `compiler/optimizer` | Emit-time bytecode passes, run once per function before the proto is sealed. |
-| `tsc-types` | `compiler/types` | Forward type dataflow over bytecode from annotations; feeds Tier-2. |
+| `tsc-types` | `compiler/types` | Forward type dataflow over bytecode from annotations; feeds the optimizing compiler. |
 
 ## Runtime
 
@@ -23,7 +23,7 @@ The repository is a single Cargo workspace. Prefixes: `tsc-` compiler, `tsr-` ru
 | `tsr-realm` | `runtime/realm` | Realm: heap + globals + natives; the register-machine interpreter; object layout and shapes; JIT bridge, OSR, deopt. |
 | `tsr-memory` | `runtime/memory` | NaN-boxed `Value`, per-realm arena heap, nursery, ropes. |
 | `tsr-gc` | `runtime/gc` | Sticky generational mark-sweep, nursery evacuation, write-barrier support. |
-| `tsr-jit` | `runtime/jit` | ARM64 encoder, executable-page heap (W^X), Tier-1 and Tier-2 compilers. |
+| `tsr-jit` | `runtime/jit` | ARM64 encoder, executable-page heap (W^X), baseline and optimizing compilers. |
 | `tsr-scheduler` | `runtime/scheduler` | Work-stealing CPU pool, batches, pool statistics. |
 | `tsr-task` | `runtime/task` | `PortableValue` structured clone: `clone_out` / `rehydrate`. |
 | `tsr-actor` | `runtime/actor` | `actor()`: thread-per-actor realms, bounded mailboxes. |

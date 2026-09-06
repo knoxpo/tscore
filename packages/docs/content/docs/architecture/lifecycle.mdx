@@ -98,17 +98,17 @@ Compiled code is per `FunctionProto` and shared by every realm that runs it (`ru
   direction LR
   [*] --> COLD
   COLD --> COMPILING: 50th call
-  COMPILING --> OPT: Tier-2
-  COMPILING --> BASELINE: Tier-1
+  COMPILING --> OPT: optimizing
+  COMPILING --> BASELINE: baseline
   COMPILING --> REJECTED
   OPT --> BASELINE: 10 deopts`} />
 
-- **Tier-up** is a call counter on the proto. When it hits the threshold, a compare-and-swap moves the proto to `COMPILING` and the caller compiles synchronously. Tier-2 is tried first (`tsc-types` must prove the numeric dataflow, and the function must be free of async, upvalues, string/object ops and calls); otherwise Tier-1; otherwise `REJECTED` and the function stays interpreted forever.
-- **OSR** (on-stack replacement) fires at the 10,000th back-edge of a loop still running in the interpreter (`TSC_OSR_THRESHOLD`). Tier-1 keeps every register in its stack slot, so any loop header is a valid entry point. A failed OSR compile disables OSR for that proto permanently.
-- **Deopt** returns control to the interpreter at a given pc with the stack intact. Ten deopts from Tier-2 demote the function to Tier-1.
+- **Tier-up** is a call counter on the proto. When it hits the threshold, a compare-and-swap moves the proto to `COMPILING` and the caller compiles synchronously. The optimizing compiler is tried first (`tsc-types` must prove the numeric dataflow, and the function must be free of async, upvalues, string/object ops and calls); otherwise the baseline compiler; otherwise `REJECTED` and the function stays interpreted forever.
+- **OSR** (on-stack replacement) fires at the 10,000th back-edge of a loop still running in the interpreter (`TSC_OSR_THRESHOLD`). The optimizing compiler is tried first here too, with baseline as the fallback; baseline keeps every register in its stack slot, so any loop header is a valid entry point. A failed OSR compile disables OSR for that proto permanently.
+- **Deopt** returns control to the interpreter at a given pc with the stack intact. Ten deopts from optimized code demote the function to baseline.
 - **Async functions never compile.** Their frames must be snapshotted on `await`.
 
-See [Type annotations and the JIT](/docs/language/type-annotations-and-jit) for how to write code that reaches Tier-2.
+See [Type annotations and the JIT](/docs/language/type-annotations-and-jit) for how to write code that reaches the optimizing compiler.
 
 ## Exit
 

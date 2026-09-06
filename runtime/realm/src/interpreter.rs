@@ -216,7 +216,7 @@ fn start_async_fused(
 }
 
 /// Try the compiled entry for a frame start (async bodies included:
-/// Tier-2 lowers Await to a bail-out), else interpret. `start_pc != 0`
+/// the optimizing compiler lowers Await to a bail-out), else interpret. `start_pc != 0`
 /// resumes mid-frame — interpreter only (OSR re-enters native at the next
 /// back-edge).
 fn run_frame_tiered(
@@ -503,7 +503,7 @@ pub fn run_one(
     }
 }
 
-/// Resume a frame at an arbitrary pc (Tier-2 deopt continuation).
+/// Resume a frame at an arbitrary pc (optimizing-compiler deopt continuation).
 pub fn run_frame_pub(
     realm: &mut Realm,
     closure: Option<tsr_memory::Ref>,
@@ -642,7 +642,7 @@ fn run_frame(
                 if ins.sbx() < 0 {
                     // loop back-edge: cancellation + GC safepoint
                     realm.safepoint().map_err(|e| at(e, proto, pc))?;
-                    // OSR: hand a hot interpreted loop to Tier-1 native code
+                    // OSR: hand a hot interpreted loop to native code
                     // (slot-resident registers make any header enterable).
                     // Fast path is one load + one store; u32::MAX marks
                     // permanently rejected protos.

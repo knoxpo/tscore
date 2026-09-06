@@ -143,12 +143,12 @@ pub struct JitState {
     pub counter: AtomicU32,
     pub tier: AtomicU8,
     pub code: AtomicPtr<u8>,
-    /// Tier-1 code entered via OSR (loop-header dispatch); may coexist
-    /// with a Tier-2 `code` pointer used for normal calls.
+    /// Code entered via OSR (loop-header dispatch); may coexist with the
+    /// `code` pointer used for normal calls.
     pub osr_code: AtomicPtr<u8>,
     /// Interpreter back-edges observed (OSR trigger).
     pub backedges: AtomicU32,
-    /// Tier-2 deoptimization count (demote to Tier-1 at 10).
+    /// Optimized-code deoptimization count (demote to baseline at 10).
     pub deopts: AtomicU32,
     /// A direct-call cache filled at a site this proto's compiled code
     /// was built without (the callee was first seen after compilation —

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tsr_memory::Value;
-use tsr_realm::interp::call_value;
+use tsr_realm::interpreter::call_value;
 use tsr_realm::{Realm, RtError};
 use tsr_scheduler::Batch;
 use tsr_task::portable::{clone_out, rehydrate};

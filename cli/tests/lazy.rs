@@ -115,7 +115,7 @@ fn proto_filled_through_worker_boundary() {
 }
 
 #[test]
-fn lazy_proto_tiers_up() {
+fn lazy_proto_compiles() {
     // hot loop inside a lazily-filled function must OSR/tier-up cleanly;
     // forced-low thresholds vs no-JIT must agree
     let f = write_case(

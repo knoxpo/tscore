@@ -45,7 +45,7 @@ Needs `wrk`. Reports req/s **and** CPU consumed, because the loopback stack caps
 ./benchmarks/jitprof.sh benchmarks/programs/mandelbrot.ts --workers 1
 ```
 
-Runs the program with `TSC_JIT_MAP` set, samples it with macOS `sample`, and joins the two so JIT frames show as `tier1:`/`tier2:`/`osr:` plus the TypeScript function name, with the hottest offsets inside the top region. This is the starting point for any codegen change.
+Runs the program with `TSC_JIT_MAP` set, samples it with macOS `sample`, and joins the two so JIT frames show as `baseline:`/`optimizing:`/`osr:` plus the TypeScript function name, with the hottest offsets inside the top region. This is the starting point for any codegen change.
 
 ## Measurement discipline
 

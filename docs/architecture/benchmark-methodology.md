@@ -48,7 +48,7 @@ compare only numbers from one session, and trust ratios over absolutes.
 Two runtime hooks fix that:
 
 - `TSC_JIT_MAP=<file>` — one `<hex addr> <hex size> <name>` line per
-  published region (`tier1:`/`tier2:`/`osr:` + function name).
+  published region (`baseline:`/`optimizing:`/`osr:` + function name).
 - `TSC_JIT_DUMP=<dir>` — raw bytes per region, for offset-level
   disassembly (`clang -c` a `.long` listing, then `otool -tvV`).
 

@@ -52,7 +52,7 @@ free-list search for these kinds.
 - **JIT**: inline heap templates select old vs nursery arena base with
   one shifted load from a per-realm `[old, young]` base-pair table
   (`Heap::refresh_bases()` keeps it coherent across pointer moves), and
-  a Tier-2 field-access CSE cache (x15/x16: validated object address +
+  an optimizing-compiler field-access CSE cache (x15/x16: validated object address +
   shape id, zeroed on any cold-path call) collapses repeated accesses to
   the same object into single slot loads.
 - **Moving-GC invariant**: no obj/arr/str `Value` may live in a Rust

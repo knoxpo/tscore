@@ -20,7 +20,7 @@ Every value in the interpreter, in JIT registers and in the heap is one `u64`, N
 
 Consequences:
 
-- A number's `Value` bits **are** its `f64` bits, so Tier-2 can hold a value in a `d` register and do arithmetic on it with no unboxing.
+- A number's `Value` bits **are** its `f64` bits, so the optimizing compiler can hold a value in a `d` register and do arithmetic on it with no unboxing.
 - A `Ref` is a `u32` index into one arena of one realm. It does not encode its kind (the tag does) and it means nothing in any other realm.
 - Bit 31 of a `Ref` is the **young bit**: set when the object lives in the nursery. Only objects, arrays and strings can be young; closures, cells and foreigns are always allocated old because raw references to them sit in JIT registers and cross-thread completers, where a moving collector could not update them.
 
@@ -61,7 +61,7 @@ Consequences:
 
 ### Objects
 
-An `Obj` is a pointer to a shared **shape** (the ordered field list, interned) plus three inline value slots and an overflow `Vec`. Objects that share a literal site share a shape, which is what the Tier-1 inline cache compares against. Module namespace objects carry three hidden pad fields so their exports live in overflow slots, keeping the live-binding indirection out of the inline fast path.
+An `Obj` is a pointer to a shared **shape** (the ordered field list, interned) plus three inline value slots and an overflow `Vec`. Objects that share a literal site share a shape, which is what the baseline inline cache compares against. Module namespace objects carry three hidden pad fields so their exports live in overflow slots, keeping the live-binding indirection out of the inline fast path.
 
 ### Arrays and strings
 
@@ -103,6 +103,6 @@ Rules enforced by `clone_out`:
 - **Handles travel by core.** An object whose `__`-prefixed field points at a shared handle becomes `Handle(kind, arc)` and rehydrates as a fresh wrapper around the same core. Channels, sockets and byte buffers cross this way.
 - **Rejected:** bare cells, promises, coroutines, freed foreigns, native functions, actor and scope handles. The error names the offending value.
 
-`rehydrate` allocates realm-local copies; captured values are re-wrapped in cells except where the proto's upvalue table says Tier-2 reads them by value.
+`rehydrate` allocates realm-local copies; captured values are re-wrapped in cells except where the proto's upvalue table says the optimizing compiler reads them by value.
 
 This is the same shape as the structured clone that `postMessage` performs in a browser or Node worker, made the single mechanism for every boundary. See [How parallelism works](/docs/architecture/parallelism) for where it is invoked and the [comparison page](/docs/architecture/vs-v8-jsc#measured) for what it costs at various payload sizes.

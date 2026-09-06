@@ -10,10 +10,10 @@ All switches are read once, at the point of use. Setting a variable to any value
 | Variable | Effect |
 |---|---|
 | `TSC_NO_JIT` | Interpreter only. The baseline for every differential test. |
-| `TSC_NO_TIER2` | Allow Tier-1 (baseline templates) but never the typed Tier-2. |
+| `TSC_NO_OPT` | Allow the baseline compiler but never the typed optimizing compiler. |
 | `TSC_JIT_THRESHOLD=N` | Calls before a function is compiled. Default 50. `1` compiles on first call. |
 | `TSC_OSR_THRESHOLD=N` | Loop back-edges before on-stack replacement into compiled code. |
-| `TSC_INT_SPEC` | Toggle for the integer-lane specialisation in Tier-2. |
+| `TSC_INT_SPEC` | Toggle for the integer-lane specialisation in the optimizing compiler. |
 | `TSC_JIT_DEBUG` | Log compile decisions, tier-ups and demotions to stderr. |
 | `TSC_DEOPT_DEBUG` | Log every deoptimisation with its reason. |
 | `TSC_JIT_MAP=<file>` | Write one `<hex addr> <hex size> <name>` line per published code region. Lets `sample`/`perf` attribute time to TypeScript functions. Used by `benchmarks/jitprof.sh`. |

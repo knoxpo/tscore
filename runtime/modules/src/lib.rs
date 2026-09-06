@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tsc_ir::{Program, ReExport};
 use tsr_memory::{Obj, Value};
-use tsr_realm::{interp, Realm, RtError};
+use tsr_realm::{interpreter, Realm, RtError};
 use tsr_memory::{self};
 
 fn module_key(id: &str) -> Arc<str> {
@@ -106,7 +106,7 @@ fn eval_module(
     }
     materialize_reexports(realm, program, i);
     // run the module body to completion (drives top-level await)
-    let v = interp::run_main(realm, &program.modules[i].main)?;
+    let v = interpreter::run_main(realm, &program.modules[i].main)?;
     if i == program.entry {
         *entry_result = v;
     }

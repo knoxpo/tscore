@@ -258,7 +258,7 @@ impl Emitter {
         em.emit(Op::Halt, 0, 0, 0);
         let mut fs = em.fs.pop().unwrap();
         // Only stay async if top-level await was actually used: a sync
-        // <main> is eligible for OSR/Tier-2 (async frames never JIT).
+        // <main> is eligible for OSR and optimizing compilation (async frames never JIT).
         fs.is_async = fs.code.iter().any(|i| i.op == Op::Await);
         Ok(tsc_ir::Chunk {
             main: {

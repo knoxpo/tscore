@@ -1,14 +1,14 @@
 //! JIT bridge: helper shims the compiled code calls, tier management, and
-//! `enter_jit`. Helper semantics deliberately mirror `interp::run_frame`
+//! `enter_jit`. Helper semantics deliberately mirror `interpreter::run_frame`
 //! arm-for-arm — the differential test suite (interpreter vs JIT output on
 //! every golden program) is the drift detector.
 
-use crate::interp::{get_field_pub as get_field, start_async};
+use crate::interpreter::{get_field_pub as get_field, start_async};
 use crate::{Realm, RtError};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::Arc;
 use tsc_ir::{Const, FunctionProto, Op, UpvalSrc, TIER_BASELINE, TIER_COLD, TIER_COMPILING, TIER_OPT, TIER_REJECTED};
-use tsr_jit::tier1::{CompiledFn, Helpers, JitRet};
+use tsr_jit::baseline::{CompiledFn, Helpers, JitRet};
 use tsr_memory::{to_int32, to_uint32, Kind, Value, JIT_ERR_SENTINEL};
 
 fn realm<'a>(p: *mut core::ffi::c_void) -> &'a mut Realm {
@@ -180,14 +180,14 @@ extern "C" fn h_call_resume(
         2 => {
             let deopts = pr.jit.deopts.fetch_add(1, Relaxed) + 1;
             if deopts >= 10 && pr.jit.tier.load(Relaxed) == TIER_OPT {
-                compile_tier1(pr);
+                compile_baseline(pr);
             }
             let resume_pc = ret_stack as usize;
-            match crate::interp::run_frame_pub(r, Some(closure), pr, base, depth, resume_pc) {
-                Ok(crate::interp::FrameResult::Return(v)) => {
+            match crate::interpreter::run_frame_pub(r, Some(closure), pr, base, depth, resume_pc) {
+                Ok(crate::interpreter::FrameResult::Return(v)) => {
                     JitRet { val: v.bits(), stack: r.stack.as_mut_ptr() as u64 }
                 }
-                Ok(crate::interp::FrameResult::Await { .. }) => {
+                Ok(crate::interpreter::FrameResult::Await { .. }) => {
                     fail(r, RtError::new("internal: await in direct sync call"))
                 }
                 Err(e) => fail(r, e),
@@ -217,10 +217,10 @@ extern "C" fn h_call(
     let result = (|| -> Result<Value, RtError> {
         if let Some(c) = f.as_closure() {
             r.safepoint()?;
-            if depth >= crate::interp::MAX_CALL_DEPTH {
+            if depth >= crate::interpreter::MAX_CALL_DEPTH {
                 return Err(err_at(pr, pc, "stack overflow: maximum call depth exceeded".into()));
             }
-            // no Arc clone on the hot path (see interp Op::Call)
+            // no Arc clone on the hot path (see interpreter Op::Call)
             let callee: &FunctionProto =
                 unsafe { &*Arc::as_ptr(&r.heap.closure(c).proto) };
             let new_base = abs_a + 1;
@@ -247,7 +247,7 @@ extern "C" fn h_call(
             // direct-call IC: cache (proto identity -> compiled entry) so
             // the JIT can skip this helper entirely on the next call
             fill_call_ic(r, pr, pc, c, callee, argc);
-            crate::interp::run_one(r, Some(c), callee, new_base, depth + 1)
+            crate::interpreter::run_one(r, Some(c), callee, new_base, depth + 1)
         } else if let Kind::Native(i) = f.kind() {
             let native = r.natives[i as usize].clone();
             // args stay in their stack slots (GC fixup sees them)
@@ -1257,8 +1257,8 @@ extern "C" fn h_new_cell(p: *mut core::ffi::c_void, init_bits: u64) -> JitRet {
     JitRet { val: Value::cell(c).bits(), stack: r.stack.as_mut_ptr() as u64 }
 }
 
-fn heap_offsets() -> Option<tsr_jit::tier1::HeapOffsets> {
-    crate::layout::layout().map(|l| tsr_jit::tier1::HeapOffsets {
+fn heap_offsets() -> Option<tsr_jit::baseline::HeapOffsets> {
+    crate::layout::layout().map(|l| tsr_jit::baseline::HeapOffsets {
         realm_stack_ptr: l.realm_stack_ptr,
         realm_objs_ptr: l.realm_objs_ptr,
         realm_arrs_ptr: l.realm_arrs_ptr,
@@ -1355,7 +1355,7 @@ fn helpers() -> Helpers {
     }
 }
 
-/// Call threshold before Tier-1 compilation (overridable for testing).
+/// Call threshold before compilation (overridable for testing).
 /// A small, loop-free async function that awaits: nothing in it runs
 /// long enough compiled to pay for entering compiled code, the await
 /// helper and the exit through the promise machinery. One that never
@@ -1435,9 +1435,9 @@ extern "C" {
     fn pow(x: f64, y: f64) -> f64;
 }
 
-fn tier2_enabled() -> bool {
+fn optimizing_enabled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("TSC_NO_TIER2").is_none())
+    *E.get_or_init(|| std::env::var_os("TSC_NO_OPT").is_none())
 }
 
 /// OSR trigger threshold (interpreter back-edges in one function).
@@ -1470,8 +1470,8 @@ pub fn osr_slow(proto: &FunctionProto) -> Option<CompiledFn> {
         return None;
     }
     let ics = proto.jit.ics_base(proto.body().code.len()) as u64;
-    let code = compile_unified(proto, true)
-        .or_else(|| tsr_jit::tier1::compile(proto, helpers(), true, heap_offsets(), ics));
+    let code = compile_optimizing(proto, true)
+        .or_else(|| tsr_jit::baseline::compile(proto, helpers(), true, heap_offsets(), ics));
     match code {
         Some(code) => {
             let ptr = tsr_jit::heap::publish(&code) as *mut u8;
@@ -1486,7 +1486,9 @@ pub fn osr_slow(proto: &FunctionProto) -> Option<CompiledFn> {
     }
 }
 
-/// Enter Tier-1 code mid-function at a loop header (state = the slots).
+/// Enter `osr_code` mid-function at a loop header (state = the slots). The
+/// code there is whatever `osr_slow` published: the optimizing compiler when
+/// it accepted the function, the baseline compiler otherwise.
 pub fn enter_osr(
     realm: &mut Realm,
     f: CompiledFn,
@@ -1495,7 +1497,7 @@ pub fn enter_osr(
     closure: Option<u32>,
     depth: u32,
     target_pc: usize,
-) -> Result<crate::interp::FrameResult, RtError> {
+) -> Result<crate::interpreter::FrameResult, RtError> {
     let ret = f(
         realm as *mut Realm as *mut core::ffi::c_void,
         proto as *const FunctionProto,
@@ -1505,23 +1507,23 @@ pub fn enter_osr(
         target_pc as u64,
     );
     match ret.val {
-        0 => Ok(crate::interp::FrameResult::Return(Value::from_bits(ret.stack))),
+        0 => Ok(crate::interpreter::FrameResult::Return(Value::from_bits(ret.stack))),
         2 => {
-            // Tier-2 entry guard failed mid-loop: resume interpreting at
+            // An optimized entry guard failed mid-loop: resume interpreting at
             // the OSR pc; repeated failures reject OSR for this proto so
             // the back-edge fast path stops trying
             if proto.jit.deopts.fetch_add(1, Relaxed) + 1 >= 10 {
                 proto.jit.backedges.store(u32::MAX, Relaxed);
             }
             let resume_pc = ret.stack as usize;
-            crate::interp::run_frame_pub(realm, closure, proto, base, depth, resume_pc)
+            crate::interpreter::run_frame_pub(realm, closure, proto, base, depth, resume_pc)
         }
         3 => {
             let (awaited, dst, resume_pc) = realm
                 .jit_await
                 .take()
                 .expect("await exit without stashed info");
-            Ok(crate::interp::FrameResult::Await { awaited, dst, resume_pc })
+            Ok(crate::interpreter::FrameResult::Await { awaited, dst, resume_pc })
         }
         _ => Err(realm
             .jit_error
@@ -1530,9 +1532,9 @@ pub fn enter_osr(
     }
 }
 
-/// Unified Tier-2 compile. None = calls-in-loop policy or async/oversize.
-fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
-    if !tier2_enabled() {
+/// Optimizing compile. None = calls-in-loop policy or async/oversize.
+fn compile_optimizing(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
+    if !optimizing_enabled() {
         return None;
     }
     // warmed ICs baked as immediates (shape id, slot) — the site still
@@ -1574,16 +1576,16 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
         eprintln!("[ics] '{}': {warm}/{sites} field sites baked", proto.name);
     }
     let typed = tsc_types::analyze(proto, &field_repr);
-    if !typed.tier2_ok {
+    if !typed.opt_ok {
         return None;
     }
-    let jumpif: Vec<tsr_jit::tier2::JCond> = typed
+    let jumpif: Vec<tsr_jit::optimizing::JCond> = typed
         .jumpif
         .iter()
         .map(|c| match c {
-            tsc_types::CondFact::Num => tsr_jit::tier2::JCond::Num,
-            tsc_types::CondFact::Bool => tsr_jit::tier2::JCond::Bool,
-            tsc_types::CondFact::Other => tsr_jit::tier2::JCond::Other,
+            tsc_types::CondFact::Num => tsr_jit::optimizing::JCond::Num,
+            tsc_types::CondFact::Bool => tsr_jit::optimizing::JCond::Bool,
+            tsc_types::CondFact::Other => tsr_jit::optimizing::JCond::Other,
         })
         .collect();
     // TSC_INT_SPEC=1 dumps the integer-lane candidates per compiled
@@ -1594,7 +1596,7 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
             proto.name, typed.int_spec, typed.loop_spec
         );
     }
-    let facts = tsr_jit::tier2::Facts {
+    let facts = tsr_jit::optimizing::Facts {
         num: &typed.num_facts,
         jumpif: &jumpif,
         arg_guard: &typed.arg_guard,
@@ -1649,7 +1651,7 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
             let ic = unsafe { &*(tic as *const CallIc) };
             let callee: &FunctionProto =
                 unsafe { &*(ic.proto_data as *const FunctionProto) };
-            if !tsr_jit::tier2::inlinable(callee) {
+            if !tsr_jit::optimizing::inlinable(callee) {
                 if std::env::var_os("TSC_JIT_DEBUG").is_some() {
                     eprintln!("[inline] pc {pc}: callee '{}' not inlinable", callee.name);
                 }
@@ -1683,7 +1685,7 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
             Some((ic.proto_word, arc, lits))
         })
         .collect();
-    tsr_jit::tier2::compile(
+    tsr_jit::optimizing::compile(
         proto,
         helpers(),
         &facts,
@@ -1699,22 +1701,22 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
 }
 
 pub fn compile_now(proto: &FunctionProto) {
-    if let Some(code) = compile_unified(proto, false) {
+    if let Some(code) = compile_optimizing(proto, false) {
         let ptr = tsr_jit::heap::publish(&code) as *mut u8;
-        tsr_jit::heap::note_symbol(ptr, code.len() * 4, &format!("tier2:{}", proto.name));
+        tsr_jit::heap::note_symbol(ptr, code.len() * 4, &format!("opt:{}", proto.name));
         proto.jit.code.store(ptr, Release);
         proto.jit.tier.store(TIER_OPT, Release);
         return;
     }
-    compile_tier1(proto)
+    compile_baseline(proto)
 }
 
-fn compile_tier1(proto: &FunctionProto) {
+fn compile_baseline(proto: &FunctionProto) {
     let ics = proto.jit.ics_base(proto.body().code.len()) as u64;
-    match tsr_jit::tier1::compile(proto, helpers(), false, heap_offsets(), ics) {
+    match tsr_jit::baseline::compile(proto, helpers(), false, heap_offsets(), ics) {
         Some(code) => {
             let ptr = tsr_jit::heap::publish(&code) as *mut u8;
-            tsr_jit::heap::note_symbol(ptr, code.len() * 4, &format!("tier1:{}", proto.name));
+            tsr_jit::heap::note_symbol(ptr, code.len() * 4, &format!("baseline:{}", proto.name));
             proto.jit.code.store(ptr, Release);
             proto.jit.tier.store(TIER_BASELINE, Release);
         }
@@ -1732,7 +1734,7 @@ pub fn enter_jit_frame(
     base: usize,
     closure: Option<u32>,
     depth: u32,
-) -> Result<crate::interp::FrameResult, RtError> {
+) -> Result<crate::interpreter::FrameResult, RtError> {
     let ret = f(
         realm as *mut Realm as *mut core::ffi::c_void,
         proto as *const FunctionProto,
@@ -1742,21 +1744,21 @@ pub fn enter_jit_frame(
         0,
     );
     match ret.val {
-        0 => Ok(crate::interp::FrameResult::Return(Value::from_bits(ret.stack))),
+        0 => Ok(crate::interpreter::FrameResult::Return(Value::from_bits(ret.stack))),
         2 => {
             let deopts = proto.jit.deopts.fetch_add(1, Relaxed) + 1;
             if deopts >= 10 && proto.jit.tier.load(Relaxed) == TIER_OPT {
-                compile_tier1(proto);
+                compile_baseline(proto);
             }
             let resume_pc = ret.stack as usize;
-            crate::interp::run_frame_pub(realm, closure, proto, base, depth, resume_pc)
+            crate::interpreter::run_frame_pub(realm, closure, proto, base, depth, resume_pc)
         }
         3 => {
             let (awaited, dst, resume_pc) = realm
                 .jit_await
                 .take()
                 .expect("await exit without stashed info");
-            Ok(crate::interp::FrameResult::Await { awaited, dst, resume_pc })
+            Ok(crate::interpreter::FrameResult::Await { awaited, dst, resume_pc })
         }
         _ => Err(realm
             .jit_error
@@ -1786,18 +1788,18 @@ pub fn enter_jit(
         0 => Ok(Value::from_bits(ret.stack)),
         2 => {
             // deopt: state fully materialized in slots; resume in the
-            // interpreter. Repeated deopts demote the proto to Tier-1.
+            // interpreter. Repeated deopts demote the proto to the baseline compiler.
             let deopts = proto.jit.deopts.fetch_add(1, Relaxed) + 1;
             if std::env::var_os("TSC_DEOPT_DEBUG").is_some() {
                 eprintln!("[deopt] '{}' resume={} count={}", proto.name, ret.stack, deopts);
             }
             if deopts >= 10 && proto.jit.tier.load(Relaxed) == TIER_OPT {
-                compile_tier1(proto);
+                compile_baseline(proto);
             }
             let resume_pc = ret.stack as usize;
-            match crate::interp::run_frame_pub(realm, closure, proto, base, depth, resume_pc)? {
-                crate::interp::FrameResult::Return(v) => Ok(v),
-                crate::interp::FrameResult::Await { .. } => {
+            match crate::interpreter::run_frame_pub(realm, closure, proto, base, depth, resume_pc)? {
+                crate::interpreter::FrameResult::Return(v) => Ok(v),
+                crate::interpreter::FrameResult::Await { .. } => {
                     unreachable!("await in sync frame")
                 }
             }

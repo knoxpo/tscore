@@ -17,7 +17,9 @@ Engine facts for V8 and JSC come from their public design documentation (the V8 
     j1[LLInt interpreter] --> j2[Baseline JIT] --> j3[DFG] --> j4[FTL via B3]
   end
   subgraph tscore
-    t1[register interpreter] --> t2[Tier-1 templates] --> t3[Tier-2 typed, unboxed]
+    t1[register interpreter] --> t3[optimizing typed, unboxed]
+    t1 -.fallback.-> t2[baseline templates]
+    t3 -.10 deopts.-> t2
   end`} />
 
 | | V8 | JSC | tscore |
@@ -26,10 +28,10 @@ Engine facts for V8 and JSC come from their public design documentation (the V8 
 | Tiers above it | 3 | 3 | 2 |
 | What drives tier-up | invocation + loop counters, feedback vectors | execution counters | call counter (50) and back-edge counter (10,000) per function |
 | Speculation source | runtime type feedback | runtime type feedback | TypeScript annotations seed a forward dataflow; feedback only guards entry |
-| OSR | into every tier | into every tier | into Tier-1 only |
-| Deopt | to interpreter, feedback updated | to lower tier | to interpreter at the guarded pc; 10 deopts demotes to Tier-1 |
+| OSR | into every tier | into every tier | optimizing first, baseline as fallback |
+| Deopt | to interpreter, feedback updated | to lower tier | to interpreter at the guarded pc; 10 deopts demotes to baseline |
 | Async functions | compiled like anything else | compiled like anything else | interpreted, never compiled |
-| Calls in optimized code | inlined, direct | inlined, direct | Tier-2 excludes calls; Tier-1 excludes calls inside loops |
+| Calls in optimized code | inlined, direct | inlined, direct | optimizing excludes calls; baseline excludes calls inside loops |
 | Target ISAs | x64, ARM64, and more | x64, ARM64, and more | ARM64 only, hand-rolled encoder |
 
 The honest reading: V8 and JSC will beat tscore per core on any code that is object-heavy, call-heavy or polymorphic, because they have inlining, escape analysis, broad inline caches and years of tuning. tscore's typed tier matches or beats them on annotated `f64` leaf kernels, and that is the only per-core claim it makes. See [Type annotations and the JIT](/docs/language/type-annotations-and-jit).
@@ -158,7 +160,7 @@ Reading, and it cuts both ways:
 
 - tscore's **worst** pause is the shortest: no compaction, no full-heap marking on the young path, and minors are O(live young). Node's worst case is a mark-compact of the old generation.
 - tscore pauses **more often**: the p99.9 row shows a 16 MB nursery evacuating roughly every 2.4 ms of this workload, while V8's concurrent marking keeps almost every gap under the timer resolution.
-- tscore ran this loop **8.5× slower** than V8 per core. The loop is object + array + template-string allocation in Tier-1 code, which is exactly the object-heavy profile the main board already shows tscore losing on. A shorter worst-case pause is not a substitute for throughput; on this workload V8 does more work between its pauses than tscore does in total.
+- tscore ran this loop **8.5× slower** than V8 per core. The loop is object + array + template-string allocation in baseline code, which is exactly the object-heavy profile the main board already shows tscore losing on. A shorter worst-case pause is not a substitute for throughput; on this workload V8 does more work between its pauses than tscore does in total.
 
 ### Payload: what crossing a heap boundary costs by size
 

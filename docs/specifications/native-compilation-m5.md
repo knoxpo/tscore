@@ -1,7 +1,7 @@
 # Typed IR + Native Compilation (M5)
 
 Hand-rolled ARM64 JIT, two tiers, hot-function compilation (threshold 50
-calls, `TSC_JIT_THRESHOLD` override, `TSC_NO_JIT` / `TSC_NO_TIER2` kill
+calls, `TSC_JIT_THRESHOLD` override, `TSC_NO_JIT` / `TSC_NO_OPT` kill
 switches). Interpreter remains the general path; async functions stay
 interpreted.
 
@@ -13,7 +13,7 @@ reservation, bump-allocated; Apple Silicon W^X (per-thread
 `pthread_jit_write_protect_np`, `sys_icache_invalidate`) behind three
 functions in platform/macos.
 
-## Tier-1 (baseline templates)
+## The baseline compiler (templates)
 
 Every bytecode register keeps its `realm.stack` slot — GC rooting,
 safepoints, and error paths unchanged. Inline NaN-box fast paths for
@@ -22,7 +22,7 @@ interpreter semantics. Eligibility: any non-async proto, EXCEPT functions
 with calls inside loops (the helper hop per iteration loses to the
 interpreter's inline native-call arm — measured, not assumed).
 
-## Tier-2 (typed, unboxed)
+## The optimizing compiler (typed, unboxed)
 
 Key insight: NaN-boxing means a number's Value bits ARE its f64 bits, so
 d-registers hold raw Value bits and arithmetic runs on them directly — no
@@ -34,7 +34,7 @@ boxing, no guards where `tsc-types` proves operands numeric.
 - vregs 0-7 live in callee-saved d8-d15; higher vregs stay in slots.
   Guards exist only at entry (annotated args; violation deopts to pc 0)
   — deopt resumes in the interpreter via the same `start_pc` machinery
-  async uses. Repeated deopts demote the function to Tier-1.
+  async uses. Repeated deopts demote the function to baseline.
 - Disqualifiers: async, upvalues, string/object ops, non-number dataflow,
   and Call (spill-everything at call sites regressed call-in-loop
   functions; liveness-based spilling is the designed upgrade).
@@ -43,7 +43,7 @@ boxing, no guards where `tsc-types` proves operands numeric.
 
 ## Measured (Apple M5 Max, steady state)
 
-| workload | interp | Tier-1 | Tier-2 | node | bun |
+| workload | interp | baseline | optimizing | node | bun |
 |---|---|---|---|---|---|
 | annotated numeric loop | 495ms | 290ms | **70ms** | 66ms | 20ms |
 | fib(35) (call-bound) | 393ms | 348ms | — | — | 31ms |
@@ -56,14 +56,14 @@ so every worker realm shares one compilation).
 ## Known limits (deliberate, documented)
 
 - No OSR: a hot loop in a function called once stays interpreted.
-- Calls: Tier-2 excludes them; Tier-1 excludes them in loops. Direct
+- Calls: optimizing excludes them; baseline excludes them in loops. Direct
   native→native calls + liveness spilling are the next tier of work.
 - bun/JSC remains ahead on peak single-core (int32 specialization,
   bounds-check elimination, inlining — out of M5 scope).
 
 ## Inline heap reads (post-M5 push)
 
-Tier-1 templates inline the read hit paths — no helper call:
+baseline templates inline the read hit paths — no helper call:
 
 - `GetField`: tag check → shape-id load → per-pc IC compare → direct
   values-slot load (~19 instructions; helper only on IC miss, which
@@ -85,5 +85,5 @@ paths — a std/compiler layout change degrades speed, never correctness.
 
 Also fixed here: JS array-index semantics (`arr[-1]`, `arr[1.5]` are
 undefined, not element 0/1 — f64→usize saturation bug); OSR (on-stack
-replacement) at interpreter back-edges — Tier-1's slot-resident
+replacement) at interpreter back-edges — baseline's slot-resident
 registers make any loop header a valid entry point.

@@ -1,7 +1,7 @@
 //! tsc-optimizer
 //!
 //! Emit-time bytecode passes, run once per function before the proto is
-//! sealed. One canonical bytecode: interpreter, Tier-1 and Tier-2 all see
+//! sealed. One canonical bytecode: interpreter, the baseline compiler and the optimizing compiler all see
 //! the optimized form, and the golden differential suite verifies it.
 //!
 //! Passes (deliberately conservative — a skipped opportunity is fine, a
@@ -689,7 +689,7 @@ fn hoist_loop_consts(
 }
 
 /// Pass 4: renumber registers so the loop-hottest vregs get the lowest
-/// ids (Tier-2 keeps vregs 0..8 in FP registers). Gated to functions with
+/// ids (the optimizing compiler keeps vregs 0..8 in FP registers). Gated to functions with
 /// no Call/Closure ops: a Call clobbers every reg above its window (the
 /// callee frame overlaps), so stack discipline must be preserved there,
 /// and child protos' capture descriptors name parent regs by id.

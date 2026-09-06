@@ -693,7 +693,7 @@ fn response_parts(realm: &Realm, v: Value) -> (u16, Vec<(String, String)>, Strin
 /// This is a mitigation, not the cure. The request object is still
 /// materialised eagerly; a handler that never reads a header still pays
 /// to build one. The cure is lazy properties, which this object model
-/// has no room for: Tier-2 compiles GetField to a bare slot load with
+/// has no room for: the optimizing compiler lowers GetField to a bare slot load with
 /// no sentinel or accessor check, so making a field lazy would put a
 /// branch on the hottest opcode in the runtime to serve one subsystem.
 ///
@@ -818,7 +818,7 @@ fn handle_request(
     ];
     let req_v = Value::object(realm.heap.alloc_obj_lit(shape, &vals));
 
-    let outcome = tsr_realm::interp::call_value(realm, handler, &[req_v])
+    let outcome = tsr_realm::interpreter::call_value(realm, handler, &[req_v])
         .and_then(|r| tss_parallel::settle_if_promise(realm, r));
     let (status, hdrs, body) = match outcome {
         Ok(v) => response_parts(realm, v),

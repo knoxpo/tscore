@@ -1,6 +1,6 @@
 //! tsc-types
 //!
-//! Forward type dataflow over linear bytecode. Unified Tier-2 compiles
+//! Forward type dataflow over linear bytecode. The optimizing compiler compiles
 //! every op (guarded templates when types unproven), so analysis never
 //! rejects on op kind — facts only pick which sites get unguarded,
 //! unboxed FP lanes. Only async functions reject.
@@ -14,9 +14,9 @@ pub enum CondFact {
     Other,
 }
 
-/// Analysis result consumed by the Tier-2 compiler.
+/// Analysis result consumed by the optimizing compiler.
 pub struct TypedProto {
-    pub tier2_ok: bool,
+    pub opt_ok: bool,
     pub reason: &'static str,
     /// Per-pc, per-operand (a,b,c): operand register holds a proven
     /// number at instruction entry.
@@ -131,7 +131,7 @@ fn join(a: T, b: T) -> T {
 
 pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
     let reject = |reason: &'static str| TypedProto {
-        tier2_ok: false,
+        opt_ok: false,
         reason,
         num_facts: Vec::new(),
         jumpif: Vec::new(),
@@ -561,7 +561,7 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
     }
 
     TypedProto {
-        tier2_ok: true,
+        opt_ok: true,
         reason: "",
         num_facts,
         jumpif,
@@ -646,7 +646,7 @@ mod tests {
             ],
         );
         let t = analyze(&p, &[]);
-        assert!(t.tier2_ok);
+        assert!(t.opt_ok);
         assert!(t.arg_guard[0]);
         assert!(t.num_facts[1][1] && t.num_facts[1][2]);
     }
@@ -662,7 +662,7 @@ mod tests {
             ],
         );
         let t = analyze(&p, &[]);
-        assert!(t.tier2_ok);
+        assert!(t.opt_ok);
         assert!(!t.arg_guard[0]);
         assert!(!t.num_facts[1][1]); // NewObject result not Num
     }

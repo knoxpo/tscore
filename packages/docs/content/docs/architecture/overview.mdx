@@ -5,7 +5,7 @@ description: "From TypeScript source to native code, and how work reaches the co
 
 <Mermaid chart={`flowchart LR
   SRC[source] --> OXC[oxc parse + strip] --> RES[resolver] --> IR[bytecode] --> OPT[optimizer] --> INT[interpreter]
-  INT <--> JIT[Tier-1 / Tier-2]
+  INT <--> JIT[baseline / optimizing]
   INT --> SCHED[scheduler]
   SCHED --> W0[worker 0 + heap]
   SCHED --> W1[worker 1 + heap]
@@ -29,7 +29,7 @@ A Lua-style register machine: fixed 32-bit instructions with `ABC` and `ABx` for
 
 ## Execution
 
-A **realm** owns a heap, a globals table, a native-function table and an event loop, and runs bytecode on the interpreter. Hot functions tier up to hand-rolled ARM64: Tier-1 keeps every register in its stack slot and inlines the fast paths; Tier-2 uses type dataflow seeded from annotations to keep numbers unboxed in FP registers. Async functions stay interpreted. See [Type annotations and the JIT](/docs/language/type-annotations-and-jit).
+A **realm** owns a heap, a globals table, a native-function table and an event loop, and runs bytecode on the interpreter. Hot functions tier up to hand-rolled ARM64: baseline keeps every register in its stack slot and inlines the fast paths; optimizing uses type dataflow seeded from annotations to keep numbers unboxed in FP registers. Async functions stay interpreted. See [Type annotations and the JIT](/docs/language/type-annotations-and-jit).
 
 ## Scheduling
 
