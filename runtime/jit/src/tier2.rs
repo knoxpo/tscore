@@ -2370,6 +2370,80 @@ fn emit_op(
             c.a.bind(done);
         }
         Op::SetIndex => {
+            let slow = c.a.new_label();
+            let done = c.a.new_label();
+            if let Some(o) = c.offsets {
+                // In-bounds store, any value. The helper's other job is
+                // the write barrier, which does nothing for a young array
+                // or one that is not old yet, and nothing again once an
+                // old array is dirty (its whole contents are rescanned at
+                // the next minor). Only the first store into a clean old
+                // array — the one that must record it — takes the helper.
+                // Growth (i == len) takes it too; that one allocates.
+                let store = c.a.new_label();
+                c.fetch_x(ins.a, 8);
+                c.a.lsr_imm(10, 8, 48);
+                c.a.movz(11, 0xFFFC, 0); // TAG_ARR
+                c.a.cmp_reg(10, 11);
+                c.a.b_cond(Cond::Ne, slow);
+                // the index stays a boxed value in x9 (or the lane) until
+                // the base is derived: arena_base stages the young bit in
+                // x13, and the number guard clobbers x10
+                let lane_ix = in_lane && (c.lane == Some(ins.b) || c.itmp == Some(ins.b));
+                if !lane_ix {
+                    c.fetch_x(ins.b, 9);
+                    c.guard_number(9, slow);
+                }
+                c.a.ubfx32(11, 8, 31, 1); // YOUNG_BIT
+                c.a.cbnz(11, store);
+                // old-space array: old bit set and dirty bit clear -> helper
+                c.a.ubfx32(12, 8, 0, 31); // slot index
+                c.a.lsr_imm(11, 12, 6); // bitmap word
+                c.a.ldr_imm(14, R_REALM, o.arrs_old_len);
+                c.a.cmp_reg(11, 14);
+                c.a.b_cond(Cond::Hs, store); // beyond the bitmap: not old
+                c.a.ldr_imm(14, R_REALM, o.arrs_old_ptr);
+                c.a.ldr_reg_lsl3(14, 14, 11);
+                c.a.movz(17, 63, 0);
+                c.a.and_reg(17, 12, 17);
+                c.a.lsrv(14, 14, 17);
+                c.a.movz(17, 1, 0);
+                c.a.and_reg(14, 14, 17);
+                c.a.cbz(14, store); // not old
+                c.a.ldr_imm(14, R_REALM, o.arrs_dirty_len);
+                c.a.cmp_reg(11, 14);
+                c.a.b_cond(Cond::Hs, slow); // clean (no word yet)
+                c.a.ldr_imm(14, R_REALM, o.arrs_dirty_ptr);
+                c.a.ldr_reg_lsl3(14, 14, 11);
+                c.a.movz(17, 63, 0);
+                c.a.and_reg(17, 12, 17);
+                c.a.lsrv(14, 14, 17);
+                c.a.movz(17, 1, 0);
+                c.a.and_reg(14, 14, 17);
+                c.a.cbz(14, slow); // clean -> helper records it
+                c.a.bind(store);
+                c.a.orr_reg32(12, 31, 8);
+                c.arena_base(10, 12, o.arr_bases_off);
+                c.index_addr(10, 10, 12, o.arr_size);
+                if lane_ix {
+                    let r = if c.lane == Some(ins.b) { R_LANE } else { R_ITMP };
+                    c.a.mov(13, r);
+                } else {
+                    c.a.fmov_dx(0, 9);
+                    c.a.fcvtzs(13, 0);
+                    c.a.scvtf(1, 13);
+                    c.a.fcmp(1, 0);
+                    c.a.b_cond(Cond::Ne, slow);
+                }
+                c.a.ldr_imm(14, 10, o.vec_len);
+                c.a.cmp_reg(13, 14);
+                c.a.b_cond(Cond::Hs, slow); // growth or out of range
+                c.a.ldr_imm(17, 10, o.vec_ptr);
+                c.fetch_x(ins.c, 9);
+                c.a.str_reg_lsl3(9, 17, 13);
+                c.a.b(done);
+            }
+            c.a.bind(slow);
             c.a.mov(0, R_REALM);
             c.a.mov(1, R_PROTO);
             c.a.mov_imm64(2, pc as u64);
@@ -2377,6 +2451,7 @@ fn emit_op(
             c.fetch_x(ins.b, 4);
             c.fetch_x(ins.c, 5);
             c.thin(c.helpers.set_index);
+            c.a.bind(done);
         }
         Op::Len => {
             let slow = c.a.new_label();

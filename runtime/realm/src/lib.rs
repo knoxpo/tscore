@@ -132,6 +132,7 @@ pub type NativeFn =
 /// Entries in the string-constant intern cache. Fixed size keeps the
 /// probe a single indexed load; collisions just re-intern.
 const CONST_CACHE: usize = 512;
+const CONCAT_CACHE: usize = 4096;
 
 /// Ceiling on how far the major trigger backs off when collections stop
 /// reclaiming. Bounds floating garbage at roughly this multiple of the
@@ -187,6 +188,14 @@ pub struct Realm {
     /// A collision drops the cache entry but the slot stays rooted, so a
     /// stale entry can never be resurrected onto a reused ref.
     pub const_roots: Vec<Value>,
+    /// `str + smallInt` results: (old lhs ref, int, result). Keyed on
+    /// old refs only — a young slot is recycled every minor and would
+    /// alias — and cleared at every major, before which no old slot is
+    /// reused either. Results live in the old generation and are rooted
+    /// until that clear. Ten distinct keys serve alloc's five million
+    /// concats.
+    pub concat_cache: Vec<(u32, i32, Value)>,
+    pub concat_roots: Vec<Value>,
     /// Promises with an outstanding cross-thread Completer.
     pub external_pending: usize,
     /// While waiting for wakes, help execute pool work (set by
@@ -226,6 +235,8 @@ impl Realm {
             major_slack: 1,
             const_cache: vec![(0, Value::UNDEFINED); CONST_CACHE],
             const_roots: Vec::new(),
+            concat_cache: vec![(u32::MAX, 0, Value::UNDEFINED); CONCAT_CACHE],
+            concat_roots: Vec::new(),
             external_pending: 0,
             idle_helper: None,
             pool_busy: None,
@@ -295,6 +306,7 @@ impl Realm {
                 .chain(self.pinned.keys())
                 .map(|&r| Value::foreign(r))
                 .chain(self.const_roots.iter().copied())
+                .chain(self.concat_roots.iter().copied())
                 .collect();
             // major when the old generation grew ~50% since the last major
             // or the remembered set degenerated; minor otherwise
@@ -320,6 +332,9 @@ impl Realm {
                         &mut self.gc_stats,
                     );
                 }
+                // old slots may be reused after this: drop the cache
+                self.concat_cache.fill((u32::MAX, 0, Value::UNDEFINED));
+                self.concat_roots.clear();
                 tsr_gc::collect(
                     &mut self.heap,
                     &self.stack,
@@ -431,7 +446,21 @@ impl Realm {
             if c.is_number() {
                 let n = c.as_number();
                 if n.fract() == 0.0 && n.abs() < 9e15 {
-                    if let Some(r) = self.heap.alloc_concat_int(lb, n as i64) {
+                    let ni = n as i64;
+                    if lb & tsr_memory::YOUNG_BIT == 0 && (0..1024).contains(&ni) {
+                        let i = ((lb.wrapping_mul(0x9E37_79B1) ^ (ni as u32)) as usize) & (CONCAT_CACHE - 1);
+                        let e = self.concat_cache[i];
+                        if e.0 == lb && e.1 == ni as i32 {
+                            return e.2;
+                        }
+                        if let Some(r) = self.heap.concat_int_old(lb, ni) {
+                            let v = Value::str_ref(r);
+                            self.concat_cache[i] = (lb, ni as i32, v);
+                            self.concat_roots.push(v);
+                            return v;
+                        }
+                    }
+                    if let Some(r) = self.heap.alloc_concat_int(lb, ni) {
                         return Value::str_ref(r);
                     }
                 }

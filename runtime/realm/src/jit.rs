@@ -1285,6 +1285,10 @@ fn heap_offsets() -> Option<tsr_jit::tier1::HeapOffsets> {
         arrs_young_len: l.arrs_young_len,
         arrs_young_cap: l.arrs_young_cap,
         allocs_since_gc_off: l.allocs_since_gc_off,
+        arrs_old_ptr: l.arrs_old_ptr,
+        arrs_old_len: l.arrs_old_len,
+        arrs_dirty_ptr: l.arrs_dirty_ptr,
+        arrs_dirty_len: l.arrs_dirty_len,
         empty_vec_words: l.empty_vec_words,
         obj_vlen: l.obj_vlen,
         obj_overflow: l.obj_overflow,
@@ -1340,6 +1344,26 @@ fn helpers() -> Helpers {
 }
 
 /// Call threshold before Tier-1 compilation (overridable for testing).
+/// A small, loop-free async function that awaits: nothing in it runs
+/// long enough compiled to pay for entering compiled code, the await
+/// helper and the exit through the promise machinery. One that never
+/// awaits (a leaf returning a settled promise) still gains from
+/// compiling its arithmetic — measured 6% on the fanout half.
+fn tiny_async(proto: &FunctionProto) -> bool {
+    let body = proto.body();
+    proto.is_async
+        && body.code.len() <= tiny_async_ops()
+        && body.code.iter().any(|i| i.op == Op::Await)
+        && !body.code.iter().any(|i| i.op == Op::Jump && i.sbx() < 0)
+}
+
+fn tiny_async_ops() -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("TSC_TINY_ASYNC_OPS").ok().and_then(|s| s.parse().ok()).unwrap_or(24)
+    })
+}
+
 fn threshold() -> u32 {
     static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
@@ -1367,6 +1391,13 @@ pub fn tier_up(proto: &FunctionProto) -> Option<CompiledFn> {
         return None;
     }
     let n = jit.counter.fetch_add(1, Relaxed);
+    if n == threshold() && tiny_async(proto) {
+        // measured: the promise chain ran 25% slower compiled than
+        // interpreted — entry, an await helper call and the epilogue
+        // per call, around five ops of actual work
+        let _ = jit.tier.compare_exchange(TIER_COLD, TIER_REJECTED, AcqRel, Acquire);
+        return None;
+    }
     if n == threshold()
         && jit
             .tier

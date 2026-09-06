@@ -580,6 +580,14 @@ impl Obj {
 pub struct Bitmap(Vec<u64>);
 
 impl Bitmap {
+    /// Raw words, for the layout probes (the JIT reads old/dirty bits
+    /// inline to decide whether a store needs the barrier helper).
+    pub fn words(&self) -> &Vec<u64> {
+        &self.0
+    }
+    pub fn words_mut(&mut self) -> &mut Vec<u64> {
+        &mut self.0
+    }
     #[inline(always)]
     pub fn get(&self, i: Ref) -> bool {
         let w = (i >> 6) as usize;
@@ -1110,6 +1118,22 @@ impl Heap {
     /// benchmark for a two-character result. Returns `None` when the
     /// result would not fit inline, leaving the caller on the general
     /// path.
+    /// `alloc_concat_int` into the old generation: for the realm's
+    /// small-int concat cache, whose entries must not move.
+    pub fn concat_int_old(&mut self, a: Ref, v: i64) -> Option<Ref> {
+        let la = self.str_raw(a).byte_len();
+        let mut d = [0u8; 20];
+        let start = fmt_i64(&mut d, v);
+        let dl = d.len() - start;
+        if la + dl > STR_INLINE {
+            return None;
+        }
+        let mut buf = [0u8; STR_INLINE];
+        buf[..la].copy_from_slice(self.str_at(a).as_bytes());
+        buf[la..la + dl].copy_from_slice(&d[start..]);
+        Some(self.promote_str(HStr::Inline((la + dl) as u8, buf)))
+    }
+
     pub fn alloc_concat_int(&mut self, a: Ref, v: i64) -> Option<Ref> {
         let la = self.str_raw(a).byte_len();
         let mut d = [0u8; 20];
