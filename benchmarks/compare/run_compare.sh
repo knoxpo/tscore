@@ -199,10 +199,10 @@ mc "mandelbrot" benchmarks/programs/mandelbrot.ts "$DIR/bench/mc/mandel_workers.
 echo "== http ==" >&2
 if command -v wrk >/dev/null 2>&1; then
     # --repeat: one HTTP sweep says nothing about how much the box moved
-    # while it was taken, and this row is the noisiest on the board. Five
-    # sweeps cost ~4 minutes and buy the spread table underneath it. Drop
-    # the flag for a single quick sweep.
-    python3 "$DIR/http_bench.py" 8 --repeat 5 >>"$OUT" || echo "(http bench failed)" >>"$OUT"
+    # while it was taken, and this row is the noisiest on the board. Three
+    # sweeps cost ~2.5 minutes and buy the spread table underneath it.
+    # Raise it if the spread looks wide; drop the flag for a single sweep.
+    python3 "$DIR/http_bench.py" 8 --repeat 3 >>"$OUT" || echo "(http bench failed)" >>"$OUT"
 else
     { echo "## HTTP hello"; echo; echo "skipped — wrk not installed (\`brew install wrk\`)"; echo; } >>"$OUT"
 fi
