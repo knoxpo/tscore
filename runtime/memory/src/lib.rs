@@ -863,6 +863,11 @@ pub struct Heap {
     /// while allocation goes old. TSC_PRETENURE=1 pins it on.
     pub pretenure: usize,
     pub pretenure_fixed: bool,
+    /// Minors left that may bulk-promote the young logs without tracing.
+    /// Set to 1 by a traced minor that measured >= 90% survival in
+    /// pretenure mode: the next minor keeps everything, the one after
+    /// traces again. Bounds the garbage kept to one young log's worth.
+    pub pretenure_skip: u8,
     /// [old data ptr, nursery data ptr] — contiguous so the JIT selects
     /// an arena base with one shifted load on the young bit. Refreshed by
     /// `refresh_bases()` at every point a data pointer can move.
@@ -912,6 +917,7 @@ impl Default for Heap {
             nursery_on: std::env::var_os("TSC_NO_NURSERY").is_none(),
             pretenure: std::env::var_os("TSC_PRETENURE").is_some() as usize,
             pretenure_fixed: std::env::var_os("TSC_PRETENURE").is_some(),
+            pretenure_skip: 0,
             obj_bases: [0; 2],
             arr_bases: [0; 2],
             pool_arr_bufs: Vec::new(),

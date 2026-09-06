@@ -346,6 +346,12 @@ pub fn collect_minor<'a>(
     stats: &mut GcStats,
 ) {
     let t0 = std::time::Instant::now();
+    if heap.pretenure != 0 && heap.pretenure_skip > 0 {
+        heap.pretenure_skip -= 1;
+        bulk_promote(heap, stats);
+        stats.record_pause(t0);
+        return;
+    }
     // before the nursery is detached and before evacuation moves any
     // string ref — compaction rewrites indices in place
     heap.compact_ropes();
@@ -378,6 +384,7 @@ pub fn collect_minor<'a>(
         // pinned/microtask foreigns: non-moving, scan contents only
         let _ = forward(v, heap, &mut m, &mut nur);
     }
+    let t_roots = t0.elapsed();
     // remembered old containers: fix their edges, not themselves
     let remembered = std::mem::take(&mut heap.remembered);
     stats_remembered_peak(heap, remembered.len());
@@ -454,6 +461,7 @@ pub fn collect_minor<'a>(
         }
     }
 
+    let t_scan = t0.elapsed();
     // sweep young logs only
     let mut freed = 0usize;
     let mut promoted = 0usize;
@@ -547,6 +555,7 @@ pub fn collect_minor<'a>(
         }
     }
 
+    let t_sweep = t0.elapsed();
     // harvest backing buffers from dead nursery slots, then reset by
     // truncation — dead objects get only this salvage touch
     let mut evacuated = 0usize;
@@ -592,6 +601,7 @@ pub fn collect_minor<'a>(
     // measured 2.5x cheaper. Flip on when >= 3/4 of a real nursery
     // survived, back off when < 1/2 of the young log did — decided here,
     // with the nursery empty, so allocation never mixes modes mid-cycle.
+    heap.pretenure_skip = 0;
     if heap.nursery_on && !heap.pretenure_fixed {
         if heap.pretenure == 0 {
             if nursery_total >= 4096 && evacuated * 4 >= nursery_total * 3 {
@@ -601,6 +611,10 @@ pub fn collect_minor<'a>(
             let swept = promoted + freed;
             if swept >= 4096 && promoted * 2 < swept {
                 heap.pretenure = 0;
+            } else if swept >= 4096 && promoted * 10 >= swept * 9 {
+                // the trace just confirmed what allocation already assumed;
+                // let the next minor skip proving it again
+                heap.pretenure_skip = 1;
             }
         }
     }
@@ -628,14 +642,70 @@ pub fn collect_minor<'a>(
     stats.last_freed = freed;
     if std::env::var_os("TSC_GC_DEBUG").is_some() {
         eprintln!(
-            "[gc] minor us={} freed={freed} promoted={promoted} evac={evacuated} arena={} free_objs={} free_arrs={}",
+            "[gc] minor us={} roots={} scan={} sweep={} tail={} freed={freed} promoted={promoted} evac={evacuated} arena={} free_objs={} free_arrs={}",
             t0.elapsed().as_micros(),
+            t_roots.as_micros(),
+            (t_scan - t_roots).as_micros(),
+            (t_sweep - t_scan).as_micros(),
+            (t0.elapsed() - t_sweep).as_micros(),
             heap.objs.len() + heap.arrs.len(),
             heap.free_objs.len(),
             heap.free_arrs.len()
         );
     }
     stats.record_pause(t0);
+}
+
+/// Pretenure-mode minor without a trace: every young-log entry becomes
+/// old as if it had survived. Nothing young exists in this mode (the
+/// nursery is empty and allocation goes old), so the remembered set has
+/// no young edge to find; its dirty bits are just cleared. Whatever was
+/// actually dead waits for a major. Foreign slots freed explicitly keep
+/// their free-list invariant (old bit clear).
+fn bulk_promote(heap: &mut Heap, stats: &mut GcStats) {
+    let mut promoted = 0usize;
+    let mut promoted_bytes = 0usize;
+    macro_rules! bulk {
+        ($gen:ident, $bytes:expr) => {{
+            let young = std::mem::take(&mut heap.$gen.young);
+            for &r in &young {
+                heap.$gen.old.set(r);
+            }
+            promoted += young.len();
+            promoted_bytes += young.len() * $bytes;
+        }};
+    }
+    bulk!(gen_strs, 32);
+    bulk!(gen_objs, 72);
+    bulk!(gen_arrs, 64);
+    bulk!(gen_closures, 48);
+    bulk!(gen_cells, 8);
+    let young = std::mem::take(&mut heap.gen_foreigns.young);
+    for &r in &young {
+        if !matches!(heap.foreigns[r as usize], Foreign::Free) {
+            heap.gen_foreigns.old.set(r);
+            promoted += 1;
+            promoted_bytes += 96;
+        }
+    }
+    let remembered = std::mem::take(&mut heap.remembered);
+    for v in remembered {
+        match v.kind() {
+            Kind::Object(r) => heap.gen_objs.dirty.clear(r),
+            Kind::Array(r) => heap.gen_arrs.dirty.clear(r),
+            Kind::Cell(r) => heap.gen_cells.dirty.clear(r),
+            Kind::Foreign(r) => heap.gen_foreigns.dirty.clear(r),
+            _ => {}
+        }
+    }
+    heap.promoted_since_major += promoted;
+    heap.promoted_bytes_since_major += promoted_bytes;
+    heap.allocs_since_gc = 0;
+    stats.minor_collections += 1;
+    stats.last_freed = 0;
+    if std::env::var_os("TSC_GC_DEBUG").is_some() {
+        eprintln!("[gc] minor-bulk promoted={promoted} arena={}", heap.objs.len() + heap.arrs.len());
+    }
 }
 
 fn stats_remembered_peak(heap: &mut Heap, n: usize) {

@@ -1121,16 +1121,27 @@ fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> O
                 }
         })
     };
+    // Before that: an accumulator whose home is a stack slot. Boxed, each
+    // iteration is slot load -> fcvtzs -> add -> scvtf -> slot store, a
+    // ~13-cycle loop-carried chain that nothing else in the loop can
+    // hide behind — objects ran at exactly that pace with `acc` in slot
+    // r8 while the lane held the `% 7` temporary it fed.
+    let accumulates = |v: u8| {
+        pbody.code[h..=end].iter().any(|i| {
+            i.a == v && matches!(i.op, Op::Add | Op::Sub | Op::Mul) && (i.b == v || i.c == v)
+        })
+    };
     vs.iter()
         .copied()
-        .find(|&v| handled(v) && converted(v))
+        .find(|&v| v >= LOW && handled(v) && accumulates(v))
+        .or_else(|| vs.iter().copied().find(|&v| handled(v) && converted(v)))
         .or_else(|| vs.iter().copied().find(|&v| handled(v)))
 }
 
 /// Mod with a known integer divisor: the divisor needs no runtime
 /// integer check, and n/d becomes smulh+shift instead of sdiv (~10-cycle
 /// latency on Apple cores, and this sits in the loop-carried chain).
-fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_in: Option<u32>) {
+fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_in: Option<u32>, pc: usize) {
     let Some((m, sh)) = magic_div(d) else {
         // |d| < 2 or unrepresentable: fall back to the generic path
         c.a.mov_imm64(9, d as u64);
@@ -1181,9 +1192,17 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
     // the branch predicts and the extra instructions are pure loss (1.3%
     // on gc_churn, whose modulus is 1000000007).
     let dst = if a_reg < LOW { (8 + a_reg) as u32 } else { 2 };
+    // Inside a laned loop the integer remainder is worth keeping: the
+    // consumer is usually an accumulate, and reading it back from the
+    // boxed home costs the scvtf/fcvtzs pair on that loop-carried chain
+    // (objects ran at that chain's latency). |r| < |d| fits i32.
+    let keep = c.lane.is_some() && c.lane != Some(a_reg);
     if d.unsigned_abs() <= 16 {
         if c.lane == Some(a_reg) {
             c.a.mov(R_LANE, 13);
+        }
+        if keep {
+            c.a.mov(R_ITMP, 13);
         }
         c.a.scvtf(dst, 13);
         c.a.fmov_xd(14, dst);
@@ -1204,11 +1223,17 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
         if c.lane == Some(a_reg) {
             c.a.movz(R_LANE, 0, 0);
         }
+        if keep {
+            c.a.movz(R_ITMP, 0, 0);
+        }
         c.put_x(a_reg, 14);
         c.a.b(done);
         c.a.bind(nonzero);
         if c.lane == Some(a_reg) {
             c.a.mov(R_LANE, 13);
+        }
+        if keep {
+            c.a.mov(R_ITMP, 13);
         }
         c.a.scvtf(dst, 13);
         if a_reg >= LOW {
@@ -1225,8 +1250,22 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
     c.a.mov_imm64(8, fmod_addr as u64);
     c.a.blr(8);
     c.zero_cache();
+    if keep {
+        // a fractional result cannot be held as an integer; re-run the
+        // op in the interpreter (inputs are still in their homes)
+        let exact = c.a.new_label();
+        c.a.fcvtzs(R_ITMP, 0);
+        c.a.scvtf(1, R_ITMP);
+        c.a.fcmp(1, 0);
+        c.a.b_cond(Cond::Eq, exact);
+        c.deopt_at(pc);
+        c.a.bind(exact);
+    }
     c.put(a_reg, 0);
     c.a.bind(done);
+    if keep {
+        c.itmp = Some(a_reg);
+    }
 }
 
 /// Integer-fast-path Mod on numeric inputs in d{db}/d{dc}; falls back to
@@ -1656,7 +1695,7 @@ fn emit_op(
                         && (c.lane == Some(ins.b) || c.itmp == Some(ins.b)))
                         || facts.int_facts.get(pc).is_some_and(|f| f[1]))
                         .then(|| c.int_src(ins.b, 10));
-                    emit_mod_const(c, ins.a, db, d, fmod_addr, int_in);
+                    emit_mod_const(c, ins.a, db, d, fmod_addr, int_in, pc);
                     return;
                 }
                 let dc = c.fetch(ins.c, 1);
@@ -1670,7 +1709,7 @@ fn emit_op(
                 if let Some(d) = const_div {
                     // divisor is a compile-time integer: no fetch, no
                     // guard, no runtime integer round-trip for it
-                    emit_mod_const(c, ins.a, 0, d, fmod_addr, None);
+                    emit_mod_const(c, ins.a, 0, d, fmod_addr, None, pc);
                 } else {
                     c.fetch_x(ins.c, 9);
                     c.guard_number(9, slow);
