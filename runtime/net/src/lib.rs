@@ -682,14 +682,20 @@ fn response_parts(realm: &Realm, v: Value) -> (u16, Vec<(String, String)>, Strin
 /// malloc per header per request, paid even by handlers that never read
 /// a header. Interning makes it one malloc per distinct name per worker.
 ///
-/// Worth ~2% throughput at 12 headers/request and ~3% at 18, nothing at
-/// 2 (A/B against the pre-interning binary; the win is small but came
-/// out the same sign in all 7 paired runs). It does NOT move
-/// RSS: the server's memory under load is dominated by the JS strings
-/// `handle_request` allocates for every header value and by the heap
-/// arenas' high-water mark, not by these keys. Eager materialisation of
-/// the request object is the real cost; interning only trims one edge
-/// of it.
+/// Names are worth ~2% throughput at 12 headers/request and ~3% at 18,
+/// nothing at 2. Values are what move memory: `handle_request` builds
+/// the request object eagerly whether or not the handler ever looks at
+/// it, so a string per header value per request was the bulk of the
+/// server's RSS under load. Interning them roughly halves it (median
+/// 397MB -> 222MB at 18 headers/request over 5 paired runs) at no
+/// measurable throughput cost.
+///
+/// This is a mitigation, not the cure. The request object is still
+/// materialised eagerly; a handler that never reads a header still pays
+/// to build one. The cure is lazy properties, which this object model
+/// has no room for: Tier-2 compiles GetField to a bare slot load with
+/// no sentinel or accessor check, so making a field lazy would put a
+/// branch on the hottest opcode in the runtime to serve one subsystem.
 ///
 /// Bounded because the name is attacker-chosen: a peer sending random
 /// header names would otherwise grow this map without limit. Past the
@@ -697,6 +703,7 @@ fn response_parts(realm: &Realm, v: Value) -> (u16, Vec<(String, String)>, Strin
 /// is unchanged and only the speedup is lost.
 struct HeaderNames {
     map: std::collections::HashMap<Box<str>, Arc<str>>,
+    values: std::collections::HashMap<Box<str>, Value>,
 }
 
 /// Enough for the real header vocabulary (~100 standard + app-specific)
@@ -704,9 +711,26 @@ struct HeaderNames {
 /// map into a memory problem.
 const HEADER_NAME_CAP: usize = 1024;
 
+/// Interned values are pinned as GC roots for the worker's lifetime and
+/// every root is re-scanned on every collection, so this cap is the one
+/// that matters: it bounds both the retained bytes and the root-scan
+/// cost. 512 covers the values that actually repeat (user-agent, accept,
+/// accept-encoding, host...); per-user values like cookies will fill the
+/// rest and then fall through to plain allocation, which is exactly the
+/// behaviour we had before.
+const HEADER_VALUE_CAP: usize = 512;
+
+/// Long values are the ones least likely to repeat across clients
+/// (cookies, bearer tokens) and the most expensive to retain forever, so
+/// they are never interned.
+const HEADER_VALUE_MAX_LEN: usize = 128;
+
 impl HeaderNames {
     fn new() -> Self {
-        Self { map: std::collections::HashMap::new() }
+        Self {
+            map: std::collections::HashMap::new(),
+            values: std::collections::HashMap::new(),
+        }
     }
 
     fn intern(&mut self, name: &str) -> Arc<str> {
@@ -718,6 +742,31 @@ impl HeaderNames {
             self.map.insert(Box::from(name), a.clone());
         }
         a
+    }
+
+    /// A header value as a JS string, reusing the heap string when this
+    /// worker has seen the same bytes before.
+    ///
+    /// Safe to share because JS strings are immutable and this runtime
+    /// exposes no in-place mutation: a handler cannot reach through one
+    /// request's header value and change what a later request sees.
+    ///
+    /// The string is promoted straight to the old generation and pinned
+    /// in `const_roots`, so it neither moves under the copying nursery
+    /// nor gets collected while the cache still points at it.
+    fn intern_value(&mut self, realm: &mut Realm, s: &str) -> Value {
+        if let Some(v) = self.values.get(s) {
+            return *v;
+        }
+        if s.len() > HEADER_VALUE_MAX_LEN || self.values.len() >= HEADER_VALUE_CAP {
+            return realm.alloc_string(s);
+        }
+        let v = Value::str_ref(
+            realm.heap.promote_str(tsr_memory::HStr::Shared(Arc::from(s))),
+        );
+        realm.const_roots.push(v);
+        self.values.insert(Box::from(s), v);
+        v
     }
 }
 
@@ -757,7 +806,7 @@ fn handle_request(
         } else {
             slice_str(buf, *k)
         };
-        let val = realm.alloc_string(slice_str(buf, *v));
+        let val = names.intern_value(realm, slice_str(buf, *v));
         headers.set(names.intern(name), val);
     }
     let headers_v = Value::object(realm.heap.alloc_obj(headers));
@@ -1055,7 +1104,7 @@ fn flush_out(kq: RawFd, fd: RawFd, conn: Option<&mut HttpConn>) -> bool {
 
 #[cfg(test)]
 mod header_name_tests {
-    use super::{HeaderNames, HEADER_NAME_CAP};
+    use super::{HeaderNames, HEADER_NAME_CAP, HEADER_VALUE_CAP, HEADER_VALUE_MAX_LEN};
 
     #[test]
     fn interns_repeats_and_stays_bounded() {
@@ -1078,5 +1127,41 @@ mod header_name_tests {
             assert_eq!(&*n.intern(&name), name);
         }
         assert_eq!(n.map.len(), HEADER_NAME_CAP);
+    }
+
+    #[test]
+    fn value_interning_reuses_shares_and_stays_bounded() {
+        let mut realm = tsr_realm::Realm::new();
+        let mut n = HeaderNames::new();
+
+        // a repeated value is the same heap string, not a fresh copy
+        let a = n.intern_value(&mut realm, "gzip, deflate, br");
+        let b = n.intern_value(&mut realm, "gzip, deflate, br");
+        assert_eq!(a.bits(), b.bits());
+
+        // ...and interning must not merge values that merely look close
+        let c = n.intern_value(&mut realm, "gzip, deflate");
+        assert_ne!(a.bits(), c.bits());
+        assert_eq!(realm.heap.str_at(c.as_str_ref().unwrap()), "gzip, deflate");
+
+        // every interned value is pinned, or the copying nursery would
+        // move the string out from under the cache
+        assert_eq!(realm.const_roots.len(), n.values.len());
+
+        // long values are never interned: each call is its own string
+        let long = "x".repeat(HEADER_VALUE_MAX_LEN + 1);
+        let l1 = n.intern_value(&mut realm, &long);
+        let l2 = n.intern_value(&mut realm, &long);
+        assert_ne!(l1.bits(), l2.bits());
+        assert_eq!(realm.heap.str_at(l1.as_str_ref().unwrap()), long);
+
+        // a peer sending unique values cannot grow the cache past the
+        // cap, and values past it still read back correctly
+        for i in 0..HEADER_VALUE_CAP * 2 {
+            let v = format!("v-{i}");
+            let got = n.intern_value(&mut realm, &v);
+            assert_eq!(realm.heap.str_at(got.as_str_ref().unwrap()), v);
+        }
+        assert_eq!(n.values.len(), HEADER_VALUE_CAP);
     }
 }
