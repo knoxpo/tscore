@@ -1292,6 +1292,10 @@ fn heap_offsets() -> Option<tsr_jit::tier1::HeapOffsets> {
         arrs_old_len: l.arrs_old_len,
         arrs_dirty_ptr: l.arrs_dirty_ptr,
         arrs_dirty_len: l.arrs_dirty_len,
+        objs_old_ptr: l.objs_old_ptr,
+        objs_old_len: l.objs_old_len,
+        objs_dirty_ptr: l.objs_dirty_ptr,
+        objs_dirty_len: l.objs_dirty_len,
         empty_vec_words: l.empty_vec_words,
         obj_vlen: l.obj_vlen,
         obj_overflow: l.obj_overflow,
@@ -1559,6 +1563,11 @@ fn compile_unified(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> {
             _ => tsc_types::REPR_ANY,
         })
         .collect();
+    if std::env::var_os("TSC_JIT_DEBUG").is_some() {
+        let sites = proto.body().code.iter().filter(|i| matches!(i.op, Op::GetField | Op::SetField)).count();
+        let warm = ic_baked.iter().filter(|e| e.is_some()).count();
+        eprintln!("[ics] '{}': {warm}/{sites} field sites baked", proto.name);
+    }
     let typed = tsc_types::analyze(proto, &field_repr);
     if !typed.tier2_ok {
         return None;

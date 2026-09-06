@@ -77,6 +77,15 @@ pub struct Emitter {
     /// TSC_NO_LAZY=1.
     lazy: bool,
     cur_span: u32,
+    /// Set by an expression statement for the one `expr` call that
+    /// lowers its top-level expression: the value is discarded, so a
+    /// lowering with an optional result (push's returned length) may
+    /// skip producing it. Taken at `expr` entry, so nested calls never
+    /// see it.
+    discard_next: bool,
+    /// The value `expr` took for the expression it is currently lowering;
+    /// a lowering reads it before it lowers any sub-expression.
+    discard_cur: bool,
 }
 
 /// Everything a deferred body fill needs (payload of ir::LazySource).
@@ -140,6 +149,8 @@ fn fill_lazy(lz: &tsc_ir::LazySource) -> Result<tsc_ir::ProtoBody, (String, u32)
         module: p.module.clone(),
         lazy: false,
         cur_span: p.start,
+        discard_next: false,
+        discard_cur: false,
     };
     let mut fs = FuncState {
         name: p.name.clone(),
@@ -231,7 +242,9 @@ impl Emitter {
             module,
             lazy: lazy_enabled(),
             cur_span: 0,
-        };
+            discard_next: false,
+        discard_cur: false,
+    };
         em.fs.push(FuncState {
             name: "<main>".into(),
             scopes: vec![HashMap::new()],
@@ -712,7 +725,10 @@ impl Emitter {
             Statement::ExpressionStatement(e) => {
                 let mark = self.mark();
                 let tmp = self.alloc_reg(e.span.start)?;
-                self.expr(&e.expression, tmp)?;
+                self.discard_next = true;
+                let r = self.expr(&e.expression, tmp);
+                self.discard_next = false;
+                r?;
                 self.free_to(mark);
                 Ok(())
             }
@@ -1284,6 +1300,7 @@ impl Emitter {
     // ---------------- expressions ----------------
 
     fn expr(&mut self, e: &Expression, dst: u8) -> R {
+        self.discard_cur = std::mem::take(&mut self.discard_next);
         self.cur_span = e.span().start;
         match e {
             Expression::NumericLiteral(n) => {
@@ -1819,6 +1836,7 @@ impl Emitter {
         if let Expression::StaticMemberExpression(m) = &c.callee {
             match &*m.property.name {
                 "push" if c.arguments.len() == 1 => {
+                    let discard = self.discard_cur;
                     let mark = self.mark();
                     let recv = self.alloc_reg(m.span.start)?;
                     self.expr(&m.object, recv)?;
@@ -1831,7 +1849,9 @@ impl Emitter {
                         })?;
                     self.expr(e, arg)?;
                     self.emit(Op::ArrayPush, recv, arg, 0);
-                    self.emit(Op::Len, dst, recv, 0); // push returns new length
+                    if !discard {
+                        self.emit(Op::Len, dst, recv, 0); // push returns new length
+                    }
                     self.free_to(mark);
                     return Ok(());
                 }

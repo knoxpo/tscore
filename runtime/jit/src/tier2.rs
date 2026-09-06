@@ -354,6 +354,51 @@ impl C {
         }
     }
 
+    /// May the value in `xv` be stored inline into the object in `xobj`
+    /// (both boxed)? A number always. Anything else only when the field
+    /// admits it (`ref_ok`) and no barrier is owed: the object is young,
+    /// not yet old, or old and already dirty — the next minor rescans it
+    /// either way. The first store into a clean old object takes `fail`,
+    /// whose helper records it. Clobbers x11, x12, x14, x17.
+    fn ref_store_check(&mut self, xv: u32, xobj: u32, ref_ok: bool, o: HeapOffsets, fail: Label) {
+        let ok = self.a.new_label();
+        self.a.lsr_imm(11, xv, 48);
+        self.a.cmp_reg(11, R_TAGLIM);
+        if !ref_ok {
+            // numbers only: the plain guard, no extra branch on the fast path
+            self.a.b_cond(Cond::Hs, fail);
+            return;
+        }
+        self.a.b_cond(Cond::Lo, ok);
+        self.a.ubfx32(11, xobj, 31, 1); // YOUNG_BIT
+        self.a.cbnz(11, ok);
+        self.a.ubfx32(12, xobj, 0, 31); // slot index
+        self.a.lsr_imm(11, 12, 6);
+        self.a.ldr_imm(14, R_REALM, o.objs_old_len);
+        self.a.cmp_reg(11, 14);
+        self.a.b_cond(Cond::Hs, ok); // beyond the bitmap: not old
+        self.a.ldr_imm(14, R_REALM, o.objs_old_ptr);
+        self.a.ldr_reg_lsl3(14, 14, 11);
+        self.a.movz(17, 63, 0);
+        self.a.and_reg(17, 12, 17);
+        self.a.lsrv(14, 14, 17);
+        self.a.movz(17, 1, 0);
+        self.a.and_reg(14, 14, 17);
+        self.a.cbz(14, ok); // not old
+        self.a.ldr_imm(14, R_REALM, o.objs_dirty_len);
+        self.a.cmp_reg(11, 14);
+        self.a.b_cond(Cond::Hs, fail);
+        self.a.ldr_imm(14, R_REALM, o.objs_dirty_ptr);
+        self.a.ldr_reg_lsl3(14, 14, 11);
+        self.a.movz(17, 63, 0);
+        self.a.and_reg(17, 12, 17);
+        self.a.lsrv(14, 14, 17);
+        self.a.movz(17, 1, 0);
+        self.a.and_reg(14, 14, 17);
+        self.a.cbz(14, fail); // clean -> helper records it
+        self.a.bind(ok);
+    }
+
     /// Deopt to the interpreter at `pc`, which re-runs the instruction
     /// from the (still intact) register homes.
     fn deopt_at(&mut self, pc: usize) {
@@ -2462,6 +2507,10 @@ fn emit_op(
                     && !facts.int_facts.get(pc).is_some_and(|f| f[2])
                     && c.lane != Some(ins.c)
                     && c.itmp != Some(ins.c);
+                // a non-number may be stored inline only where the field is
+                // known to admit anything: a baked site whose repr is Any
+                let ref_ok = facts.ic_baked.get(pc).copied().flatten().is_some()
+                    && facts.field_repr.get(pc).copied().unwrap_or(2) == 2;
                 if *fcache == Some(ins.a) {
                     // CSE'd store: cached validated address in x15, shape
                     // id in x16 — only this pc's IC + number-value guard.
@@ -2478,7 +2527,10 @@ fn emit_op(
                         .filter(|&(_, slot)| (slot as usize) < o.obj_inline_n as usize);
                     c.a.cbz(15, full);
                     c.fetch_x(ins.c, 9);
-                    c.guard_number(9, full);
+                    if ref_ok {
+                        c.fetch_x(ins.a, 8); // the barrier check needs the ref
+                    }
+                    c.ref_store_check(9, 8, ref_ok, o, full);
                     if int32_field {
                         c.int32_check(9, full);
                     }
@@ -2516,7 +2568,7 @@ fn emit_op(
                     c.a.cmp_reg(10, 11);
                     c.a.b_cond(Cond::Ne, generic);
                     c.fetch_x(ins.c, 9);
-                    c.guard_number(9, generic); // heap values -> helper
+                    c.ref_store_check(9, 8, ref_ok, o, generic);
                     if int32_field {
                         c.int32_check(9, generic);
                     }

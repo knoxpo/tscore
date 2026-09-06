@@ -62,6 +62,12 @@ pub struct HeapLayout {
     pub arrs_old_len: u32,
     pub arrs_dirty_ptr: u32,
     pub arrs_dirty_len: u32,
+    /// gen_objs old / dirty bitmap words: a ref-valued SetField on an
+    /// old object stores inline when the object is already dirty.
+    pub objs_old_ptr: u32,
+    pub objs_old_len: u32,
+    pub objs_dirty_ptr: u32,
+    pub objs_dirty_len: u32,
     /// The three raw words of an empty Vec<Value> (written into a freshly
     /// bumped Obj's overflow field).
     pub empty_vec_words: [u64; 3],
@@ -420,6 +426,18 @@ pub fn discover() -> Option<HeapLayout> {
         |r: &Realm| r.heap.gen_arrs.dirty.words().as_ptr(),
         |r: &mut Realm| { let w = r.heap.gen_arrs.dirty.words_mut(); let c = w.capacity(); w.reserve(c + 8); }
     );
+    realm.heap.gen_objs.old.words_mut().reserve(16);
+    realm.heap.gen_objs.dirty.words_mut().reserve(16);
+    let (objs_old_ptr, objs_old_len, _) = vec_words!(
+        "objs_old",
+        |r: &Realm| r.heap.gen_objs.old.words().as_ptr(),
+        |r: &mut Realm| { let w = r.heap.gen_objs.old.words_mut(); let c = w.capacity(); w.reserve(c + 8); }
+    );
+    let (objs_dirty_ptr, objs_dirty_len, _) = vec_words!(
+        "objs_dirty",
+        |r: &Realm| r.heap.gen_objs.dirty.words().as_ptr(),
+        |r: &mut Realm| { let w = r.heap.gen_objs.dirty.words_mut(); let c = w.capacity(); w.reserve(c + 8); }
+    );
     let saved = realm.heap.allocs_since_gc;
     realm.heap.allocs_since_gc = 0xB0BA_0005_0001;
     let allocs_since_gc_off = probe!(
@@ -469,6 +487,10 @@ pub fn discover() -> Option<HeapLayout> {
         arrs_old_len,
         arrs_dirty_ptr,
         arrs_dirty_len,
+        objs_old_ptr,
+        objs_old_len,
+        objs_dirty_ptr,
+        objs_dirty_len,
         empty_vec_words,
         obj_vlen,
         obj_overflow,
