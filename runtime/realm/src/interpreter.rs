@@ -22,7 +22,7 @@ pub fn call_value(realm: &mut Realm, f: Value, args: &[Value]) -> Result<Value, 
             r
         }
         Kind::Closure(c) => {
-            let proto = realm.heap.closure(c).proto.clone();
+            let proto = realm.heap.closure(c).proto_arc();
             realm.stack.resize(base + proto.body().n_regs as usize, Value::UNDEFINED);
             if let Some((msg, span)) = proto.fill_error() {
                 return Err(RtError { msg: msg.clone(), span: Some(*span), cancelled: false, source: proto.source_name_arc() });
@@ -689,7 +689,7 @@ fn run_frame(
                     // never moves (only the Arc handle lives in the arena),
                     // and the callee closure is rooted via stack[a]
                     let callee: &FunctionProto =
-                        unsafe { &*Arc::as_ptr(&realm.heap.closure(c).proto) };
+                        unsafe { &*realm.heap.closure(c).proto_ptr() };
                     let new_base = a + 1;
                     let need = new_base + callee.body().n_regs as usize;
                     if let Some((msg, span)) = callee.fill_error() {
@@ -712,7 +712,7 @@ fn run_frame(
                     let result = if callee.is_async {
                         // async path owns the proto (coroutine may outlive
                         // the frame): clone here, off the sync hot path
-                        let callee = realm.heap.closure(c).proto.clone();
+                        let callee = realm.heap.closure(c).proto_arc();
                         // `await f()` fusion: when the very next op awaits
                         // this result, skip the promise unless the body
                         // actually suspends (await of a plain value is
@@ -809,13 +809,13 @@ fn run_frame(
                         }
                         UpvalSrc::ParentUpval(idx) => {
                             let c = closure.expect("upval capture outside closure");
-                            realm.heap.closure(c).upvals[idx as usize]
+                            realm.heap.closure(c).upvals()[idx as usize]
                         }
                     };
                     upvals[up_i] = entry;
                     up_i += 1;
                 }
-                let r = realm.heap.alloc_closure_reuse(child, upvals);
+                let r = realm.heap.alloc_closure(child, upvals);
                 set_reg!(realm, a, Value::closure(r));
             }
             Op::NewCell => {
@@ -836,7 +836,7 @@ fn run_frame(
             },
             Op::GetUpval => {
                 let c = closure.expect("GetUpval outside closure");
-                let entry = realm.heap.closure(c).upvals[ins.b as usize];
+                let entry = realm.heap.closure(c).upvals()[ins.b as usize];
                 let v = match entry.as_cell() {
                     Some(r) => *realm.heap.cell(r),
                     None => entry, // immutable value capture
@@ -845,7 +845,7 @@ fn run_frame(
             }
             Op::SetUpval => {
                 let c = closure.expect("SetUpval outside closure");
-                let entry = realm.heap.closure(c).upvals[ins.a as usize];
+                let entry = realm.heap.closure(c).upvals()[ins.a as usize];
                 let cell = entry.as_cell().expect("SetUpval on value capture");
                 realm.heap.barrier_cell(cell);
                 *realm.heap.cell_mut(cell) = reg!(realm, base + ins.b as usize);
@@ -935,7 +935,8 @@ fn run_frame(
                                 None => crate::jit::set_field_add(
                                     proto,
                                     pc,
-                                    objref,
+                                    &mut realm.heap,
+                                    r,
                                     sid,
                                     || const_str_arc(proto, ins.b as usize),
                                     v,
@@ -975,14 +976,14 @@ fn run_frame(
                     match target.as_array() {
                         Some(r) => {
                             realm.heap.barrier_arr(r);
-                            let arr = realm.heap.arr_mut(r);
+                            let n = realm.heap.arr_len(r);
                             // non-index number keys (negative/fractional):
                             // array expando properties unsupported — ignored
                             if let Some(i) = tsr_memory::array_index(idx.as_number()) {
-                                if i < arr.len() {
-                                    arr[i] = v;
-                                } else if i == arr.len() {
-                                    arr.push(v);
+                                if i < n {
+                                    realm.heap.arr_mut(r)[i] = v;
+                                } else if i == n {
+                                    realm.heap.arr_push(r, v);
                                     realm.heap.allocs_since_gc += 1;
                                 } else {
                                     return Err(err(proto, pc,
@@ -996,7 +997,7 @@ fn run_frame(
                 } else if let (Some(r), Some(s)) = (target.as_object(), idx.as_str_ref()) {
                     let name = realm.heap.str_arc(s);
                     realm.heap.barrier_obj(r);
-                    realm.heap.obj_mut(r).set(name, v);
+                    realm.heap.obj_set(r, name, v);
                 } else {
                     return Err(err(proto, pc, format!(
                         "cannot index-assign {} with {}", target.type_of(), idx.type_of())));
@@ -1021,7 +1022,7 @@ fn run_frame(
                         // element growth is allocation pressure too
                         realm.heap.allocs_since_gc += 1;
                         realm.heap.barrier_arr(r);
-                        realm.heap.arr_mut(r).push(v)
+                        realm.heap.arr_push(r, v)
                     }
                     None => return Err(err(proto, pc, format!(
                         "cannot push onto {}", reg!(realm, a).type_of()))),

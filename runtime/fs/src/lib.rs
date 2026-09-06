@@ -421,11 +421,11 @@ fn fs_members(realm: &mut Realm) -> Vec<(&'static str, Value)> {
 
 /// Build a namespace object from `(name, native)` pairs.
 fn namespace(realm: &mut Realm, members: Vec<(&'static str, Value)>) -> Value {
-    let mut obj = tsr_memory::Obj::default();
+    let obj = realm.heap.alloc_obj_host();
     for (k, v) in members {
-        obj.set(Arc::from(k), v);
+        realm.heap.obj_set(obj, Arc::from(k), v);
     }
-    Value::object(realm.heap.alloc_obj(obj))
+    Value::object(obj)
 }
 
 pub fn install(realm: &mut Realm) {
@@ -450,9 +450,9 @@ pub fn install(realm: &mut Realm) {
         .and_then(|v| v.as_object())
     {
         realm.heap.barrier_obj(rt);
-        realm.heap.obj_mut(rt).set(Arc::from("fs"), fs_ns);
-        realm.heap.obj_mut(rt).set(Arc::from("bytes"), bytes_ns);
-        realm.heap.obj_mut(rt).set(Arc::from("path"), path_ns);
+        realm.heap.obj_set(rt, Arc::from("fs"), fs_ns);
+        realm.heap.obj_set(rt, Arc::from("bytes"), bytes_ns);
+        realm.heap.obj_set(rt, Arc::from("path"), path_ns);
     } else {
         realm.set_global_obj(
             "runtime",

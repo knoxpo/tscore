@@ -77,11 +77,11 @@ pub fn install(realm: &mut Realm) {
             Ok(Value::UNDEFINED)
         });
 
-        let mut obj = tsr_memory::Obj::default();
-        obj.set(Arc::from("send"), send);
-        obj.set(Arc::from("post"), post);
-        obj.set(Arc::from("stop"), stop);
-        Ok(Value::object(realm.heap.alloc_obj(obj)))
+        let obj = realm.heap.alloc_obj_host();
+        realm.heap.obj_set(obj, Arc::from("send"), send);
+        realm.heap.obj_set(obj, Arc::from("post"), post);
+        realm.heap.obj_set(obj, Arc::from("stop"), stop);
+        Ok(Value::object(obj))
     });
     realm.set_global("actor", spawn);
 }

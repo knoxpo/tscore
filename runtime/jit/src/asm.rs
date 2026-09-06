@@ -199,6 +199,12 @@ impl Asm {
     }
     /// UBFX Wd, Wn, #lsb, #width (byte-verified vs clang: 0x53007909 =
     /// ubfx w9, w8, #0, #31).
+    /// UBFX Xd, Xn, #lsb, #width (UBFM with N=1).
+    pub fn ubfx64(&mut self, rd: Reg, rn: Reg, lsb: u32, width: u32) {
+        let immr = lsb;
+        let imms = lsb + width - 1;
+        self.push(0xD340_0000 | immr << 16 | imms << 10 | rn << 5 | rd);
+    }
     pub fn ubfx32(&mut self, rd: Reg, rn: Reg, lsb: u32, width: u32) {
         let immr = lsb;
         let imms = lsb + width - 1;

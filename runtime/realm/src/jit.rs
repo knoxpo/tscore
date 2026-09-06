@@ -74,7 +74,8 @@ pub(crate) fn lit_shape(
 pub(crate) fn set_field_add(
     pr: &FunctionProto,
     pc: usize,
-    obj: &mut tsr_memory::Obj,
+    heap: &mut tsr_memory::Heap,
+    o: tsr_memory::Ref,
     sid: u32,
     name: impl FnOnce() -> std::sync::Arc<str>,
     v: Value,
@@ -83,22 +84,22 @@ pub(crate) fn set_field_add(
     if !tic.is_null() {
         let e = unsafe { &*(tic as *const TransIc) };
         if e.old_sid == sid {
-            e.shape.absorb(obj.shape);
-            obj.shape = e.shape;
-            obj.push_val(v);
+            e.shape.absorb(heap.obj(o).shape);
+            heap.obj_mut(o).shape = e.shape;
+            heap.obj_push_val(o, v);
             return;
         }
     }
-    let ns = obj.shape.with_field(name());
+    let ns = heap.obj(o).shape.with_field(name());
     if tic.is_null() {
         let b = Box::into_raw(Box::new(TransIc { old_sid: sid, shape: ns })) as *mut u8;
         if !pr.jit.tic_store(pr.body().code.len(), pc, b) {
             drop(unsafe { Box::from_raw(b as *mut TransIc) });
         }
     }
-    ns.absorb(obj.shape);
-    obj.shape = ns;
-    obj.push_val(v);
+    ns.absorb(heap.obj(o).shape);
+    heap.obj_mut(o).shape = ns;
+    heap.obj_push_val(o, v);
 }
 
 extern "C" fn h_stack_ptr(p: *mut core::ffi::c_void) -> JitRet {
@@ -144,9 +145,7 @@ pub(crate) fn fill_call_ic(
         && callee.arity as usize == argc
         && pr.jit.tic_load(pr.body().code.len(), pc).is_null()
     {
-        let proto_word = unsafe {
-            *(&r.heap.closure(c).proto as *const Arc<FunctionProto> as *const u64)
-        };
+        let proto_word = r.heap.closure(c).proto_ptr() as u64;
         let ic = Box::into_raw(Box::new(CallIc {
             proto_word,
             proto_data: callee as *const FunctionProto as u64,
@@ -222,7 +221,7 @@ extern "C" fn h_call(
             }
             // no Arc clone on the hot path (see interpreter Op::Call)
             let callee: &FunctionProto =
-                unsafe { &*Arc::as_ptr(&r.heap.closure(c).proto) };
+                unsafe { &*r.heap.closure(c).proto_ptr() };
             let new_base = abs_a + 1;
             let need = new_base + callee.body().n_regs as usize;
             if let Some((msg, span)) = callee.fill_error() {
@@ -240,7 +239,7 @@ extern "C" fn h_call(
                 r.stack[new_base + reg] = Value::UNDEFINED;
             }
             if callee.is_async {
-                let callee = r.heap.closure(c).proto.clone();
+                let callee = r.heap.closure(c).proto_arc();
                 let pr_ref = start_async(r, Some(c), callee, new_base);
                 return Ok(Value::foreign(pr_ref));
             }
@@ -479,13 +478,13 @@ fn step(
                     UpvalSrc::ParentLocalValue(reg) => realm.stack[base + reg as usize],
                     UpvalSrc::ParentUpval(idx) => {
                         let c = closure.expect("upval capture outside closure");
-                        realm.heap.closure(c).upvals[idx as usize]
+                        realm.heap.closure(c).upvals()[idx as usize]
                     }
                 };
                 upvals[up_i] = entry;
                 up_i += 1;
             }
-            let r = realm.heap.alloc_closure_reuse(child, upvals);
+            let r = realm.heap.alloc_closure(child, upvals);
             realm.stack[a] = Value::closure(r);
             Ok(0)
         }
@@ -512,7 +511,7 @@ fn step(
         },
         Op::GetUpval => {
             let c = closure.expect("GetUpval outside closure");
-            let entry = realm.heap.closure(c).upvals[ins.b as usize];
+            let entry = realm.heap.closure(c).upvals()[ins.b as usize];
             realm.stack[a] = match entry.as_cell() {
                 Some(r) => *realm.heap.cell(r),
                 None => entry,
@@ -521,7 +520,7 @@ fn step(
         }
         Op::SetUpval => {
             let c = closure.expect("SetUpval outside closure");
-            let entry = realm.heap.closure(c).upvals[ins.a as usize];
+            let entry = realm.heap.closure(c).upvals()[ins.a as usize];
             let cell = entry.as_cell().expect("SetUpval on value capture");
             realm.heap.barrier_cell(cell);
             *realm.heap.cell_mut(cell) = rb(realm);
@@ -573,7 +572,7 @@ fn step(
             match realm.stack[a].as_object() {
                 Some(r) => {
                     realm.heap.barrier_obj(r);
-                    realm.heap.obj_mut(r).set(name, v);
+                    realm.heap.obj_set(r, name, v);
                     Ok(0)
                 }
                 None => Err(e(format!(
@@ -619,16 +618,16 @@ fn step(
                     Some(r) => {
                         realm.heap.allocs_since_gc += 1;
                         realm.heap.barrier_arr(r);
-                        let arr = realm.heap.arr_mut(r);
+                        let n = realm.heap.arr_len(r);
                         let Some(i) = tsr_memory::array_index(idx.as_number()) else {
                             // non-index number key: array expando
                             // properties unsupported — ignored
                             return Ok(0);
                         };
-                        if i < arr.len() {
-                            arr[i] = v;
-                        } else if i == arr.len() {
-                            arr.push(v);
+                        if i < n {
+                            realm.heap.arr_mut(r)[i] = v;
+                        } else if i == n {
+                            realm.heap.arr_push(r, v);
                         } else {
                             return Err(e("sparse arrays not supported in M1".into()));
                         }
@@ -642,7 +641,7 @@ fn step(
             } else if let (Some(r), Some(s)) = (target.as_object(), idx.as_str_ref()) {
                 let name = realm.heap.str_arc(s);
                 realm.heap.barrier_obj(r);
-                realm.heap.obj_mut(r).set(name, v);
+                realm.heap.obj_set(r, name, v);
                 Ok(0)
             } else {
                 Err(e(format!(
@@ -670,7 +669,7 @@ fn step(
                 Some(r) => {
                     realm.heap.allocs_since_gc += 1;
                     realm.heap.barrier_arr(r);
-                    realm.heap.arr_mut(r).push(v);
+                    realm.heap.arr_push(r, v);
                     Ok(0)
                 }
                 None => Err(e(format!("cannot push onto {}", realm.stack[a].type_of()))),
@@ -802,7 +801,7 @@ extern "C" fn h_set_field(
                         pr.jit.ic_store(pr.body().code.len(), pc as usize, sid, i);
                         obj.store(i, v);
                     }
-                    None => set_field_add(pr, pc as usize, obj, sid, || {
+                    None => set_field_add(pr, pc as usize, &mut r.heap, o, sid, || {
                         match &pr.body().consts[cidx as usize] {
                             Const::Str(s) => s.clone(),
                             Const::Number(n) => {
@@ -882,16 +881,16 @@ extern "C" fn h_set_index(
         if let Some(ar) = target.as_array() {
             r.heap.allocs_since_gc += 1;
             r.heap.barrier_arr(ar);
-            let arr = r.heap.arr_mut(ar);
+            let n = r.heap.arr_len(ar);
             let Some(i) = tsr_memory::array_index(idx.as_number()) else {
                 // non-index number key: array expando properties
                 // unsupported — silently ignored
                 return ok(r, 0);
             };
-            if i < arr.len() {
-                arr[i] = v;
-            } else if i == arr.len() {
-                arr.push(v);
+            if i < n {
+                r.heap.arr_mut(ar)[i] = v;
+            } else if i == n {
+                r.heap.arr_push(ar, v);
             } else {
                 return fail(
                     r,
@@ -912,7 +911,7 @@ extern "C" fn h_set_index(
     if let (Some(o), Some(sref)) = (target.as_object(), idx.as_str_ref()) {
         let name = r.heap.str_arc(sref);
         r.heap.barrier_obj(o);
-        r.heap.obj_mut(o).set(name, v);
+        r.heap.obj_set(o, name, v);
         return ok(r, 0);
     }
     fail(
@@ -972,7 +971,7 @@ extern "C" fn h_push(
         Some(ar) => {
             r.heap.allocs_since_gc += 1;
             r.heap.barrier_arr(ar);
-            r.heap.arr_mut(ar).push(Value::from_bits(v_bits));
+            r.heap.arr_push(ar, Value::from_bits(v_bits));
             ok(r, 0)
         }
         None => fail(
@@ -1002,7 +1001,7 @@ extern "C" fn h_get_global(
 
 extern "C" fn h_get_upval(p: *mut core::ffi::c_void, closure_u32: u64, idx: u64) -> JitRet {
     let r = realm(p);
-    let entry = r.heap.closure(closure_u32).upvals[idx as usize];
+    let entry = r.heap.closure(closure_u32).upvals()[idx as usize];
     let v = match entry.as_cell() {
         Some(c) => *r.heap.cell(c),
         None => entry, // immutable value capture
@@ -1017,7 +1016,7 @@ extern "C" fn h_set_upval(
     v_bits: u64,
 ) -> JitRet {
     let r = realm(p);
-    let entry = r.heap.closure(closure_u32).upvals[idx as usize];
+    let entry = r.heap.closure(closure_u32).upvals()[idx as usize];
     let cell = entry.as_cell().expect("SetUpval on value capture");
     r.heap.barrier_cell(cell);
     *r.heap.cell_mut(cell) = Value::from_bits(v_bits);
@@ -1139,11 +1138,11 @@ extern "C" fn h_new_closure(
             UpvalSrc::ParentLocalValue(reg) => r.stack[base + reg as usize],
             UpvalSrc::ParentUpval(idx) => {
                 debug_assert!(closure != NO_CLOSURE, "upval capture outside closure");
-                r.heap.closure(closure).upvals[idx as usize]
+                r.heap.closure(closure).upvals()[idx as usize]
             }
         };
     }
-    let cr = r.heap.alloc_closure_reuse(child, upvals);
+    let cr = r.heap.alloc_closure(child, upvals);
     JitRet { val: Value::closure(cr).bits(), stack: r.stack.as_mut_ptr() as u64 }
 }
 
@@ -1258,69 +1257,7 @@ extern "C" fn h_new_cell(p: *mut core::ffi::c_void, init_bits: u64) -> JitRet {
 }
 
 fn heap_offsets() -> Option<tsr_jit::baseline::HeapOffsets> {
-    crate::layout::layout().map(|l| tsr_jit::baseline::HeapOffsets {
-        realm_stack_ptr: l.realm_stack_ptr,
-        realm_objs_ptr: l.realm_objs_ptr,
-        realm_arrs_ptr: l.realm_arrs_ptr,
-        nursery_objs_ptr: l.nursery_objs_ptr,
-        nursery_arrs_ptr: l.nursery_arrs_ptr,
-        obj_bases_off: l.obj_bases_off,
-        arr_bases_off: l.arr_bases_off,
-        nursery_objs_len: l.nursery_objs_len,
-        nursery_objs_cap: l.nursery_objs_cap,
-        nursery_bytes_off: l.nursery_bytes_off,
-        nursery_arrs_len: l.nursery_arrs_len,
-        nursery_arrs_cap: l.nursery_arrs_cap,
-        pool_arr_ptr: l.pool_arr_ptr,
-        pool_arr_len: l.pool_arr_len,
-        pool_arr_cap: l.pool_arr_cap,
-        pretenure_off: l.pretenure_off,
-        objs_len: l.objs_len,
-        objs_cap: l.objs_cap,
-        arrs_len: l.arrs_len,
-        arrs_cap: l.arrs_cap,
-        free_objs_len: l.free_objs_len,
-        free_arrs_len: l.free_arrs_len,
-        objs_young_ptr: l.objs_young_ptr,
-        objs_young_len: l.objs_young_len,
-        objs_young_cap: l.objs_young_cap,
-        arrs_young_ptr: l.arrs_young_ptr,
-        arrs_young_len: l.arrs_young_len,
-        arrs_young_cap: l.arrs_young_cap,
-        allocs_since_gc_off: l.allocs_since_gc_off,
-        arrs_old_ptr: l.arrs_old_ptr,
-        arrs_old_len: l.arrs_old_len,
-        arrs_dirty_ptr: l.arrs_dirty_ptr,
-        arrs_dirty_len: l.arrs_dirty_len,
-        objs_old_ptr: l.objs_old_ptr,
-        objs_old_len: l.objs_old_len,
-        objs_dirty_ptr: l.objs_dirty_ptr,
-        objs_dirty_len: l.objs_dirty_len,
-        const_cache_ptr: l.const_cache_ptr,
-        free_closures_len: l.free_closures_len,
-        closures_young_ptr: l.closures_young_ptr,
-        closures_young_len: l.closures_young_len,
-        closures_young_cap: l.closures_young_cap,
-        empty_vec_words: l.empty_vec_words,
-        obj_vlen: l.obj_vlen,
-        obj_overflow: l.obj_overflow,
-        bump_alloc: std::env::var_os("TSC_NO_NURSERY").is_none(),
-        obj_size: l.obj_size,
-        obj_shape_arc: l.obj_shape_arc,
-        shape_id_delta: l.shape_id_delta,
-        obj_inline: l.obj_inline,
-        obj_inline_n: tsr_memory::OBJ_INLINE as u32,
-        realm_closures_ptr: l.realm_closures_ptr,
-        realm_cells_ptr: l.realm_cells_ptr,
-        closure_size: l.closure_size,
-        closure_upvals_ptr: l.closure_upvals_ptr,
-        closure_proto_off: l.closure_proto_off,
-        realm_stack_len: l.realm_stack_len,
-        arr_size: l.arr_size,
-        vec_ptr: l.vec_ptr,
-        vec_len: l.vec_len,
-        vec_cap: l.vec_cap,
-    })
+    crate::layout::layout().copied()
 }
 
 fn helpers() -> Helpers {

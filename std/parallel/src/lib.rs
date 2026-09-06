@@ -75,20 +75,17 @@ pub fn install(realm: &mut Realm, workers: Option<usize>) {
     realm.set_global_obj("parallel", vec![("map", map), ("for", for_)]);
 
     // runtime.cpu.count
-    let mut cpu = tsr_memory::Obj::default();
-    cpu.set(Arc::from("count"), Value::number(n_workers as f64));
-    let cpu_ref = realm.heap.alloc_obj(cpu);
+    let cpu = realm.heap.alloc_obj_host();
+    realm.heap.obj_set(cpu, Arc::from("count"), Value::number(n_workers as f64));
+    let cpu_ref = cpu;
 
     // runtime.gc.{stats, collect}
     let gc_stats = realm.add_native(|realm, _| {
         let st = realm.gc_stats;
-        let heap_slots = realm.heap.objs.len()
-            + realm.heap.arrs.len()
+        let heap_slots = realm.heap.cell_bytes() / 8
             + realm.heap.strs.len()
-            + realm.heap.closures.len()
-            + realm.heap.cells.len()
             + realm.heap.foreigns.len();
-        let mut o = tsr_memory::Obj::default();
+        let o = realm.heap.alloc_obj_host();
         let fields: Vec<(&str, f64)> = vec![
             ("minorCollections", st.minor_collections as f64),
             ("majorCollections", st.major_collections as f64),
@@ -102,9 +99,9 @@ pub fn install(realm: &mut Realm, workers: Option<usize>) {
             ("rememberedPeak", realm.heap.remembered_peak as f64),
         ];
         for (k, v) in fields {
-            o.set(Arc::from(k), Value::number(v));
+            realm.heap.obj_set(o, Arc::from(k), Value::number(v));
         }
-        Ok(Value::object(realm.heap.alloc_obj(o)))
+        Ok(Value::object(o))
     });
     let gc_collect = realm.add_native(|realm, _| {
         let extra: Vec<Value> = realm
@@ -113,10 +110,7 @@ pub fn install(realm: &mut Realm, workers: Option<usize>) {
             .chain(realm.pinned.keys())
             .map(|&r| Value::foreign(r))
             .collect();
-        if !realm.heap.nursery.objs.is_empty()
-            || !realm.heap.nursery.arrs.is_empty()
-            || !realm.heap.nursery.strs.is_empty()
-        {
+        if realm.heap.young.used() > 0 || !realm.heap.nursery.strs.is_empty() {
             tsr_gc::collect_minor(
                 &mut realm.heap,
                 &mut realm.stack,
@@ -133,15 +127,15 @@ pub fn install(realm: &mut Realm, workers: Option<usize>) {
         );
         Ok(Value::UNDEFINED)
     });
-    let mut gc = tsr_memory::Obj::default();
-    gc.set(Arc::from("stats"), gc_stats);
-    gc.set(Arc::from("collect"), gc_collect);
-    let gc_ref = realm.heap.alloc_obj(gc);
+    let gc = realm.heap.alloc_obj_host();
+    realm.heap.obj_set(gc, Arc::from("stats"), gc_stats);
+    realm.heap.obj_set(gc, Arc::from("collect"), gc_collect);
+    let gc_ref = gc;
 
     // runtime.stats(): scheduler + actors + gc counters
     let stats = realm.add_native(|realm, _| {
         let ps = shared_pool().stats();
-        let mut o = tsr_memory::Obj::default();
+        let o = realm.heap.alloc_obj_host();
         let fields: Vec<(&str, f64)> = vec![
             ("workers", ps.workers as f64),
             ("tasksExecuted", ps.tasks_executed as f64),
@@ -156,9 +150,9 @@ pub fn install(realm: &mut Realm, workers: Option<usize>) {
             ("gcMajor", realm.gc_stats.major_collections as f64),
         ];
         for (k, v) in fields {
-            o.set(Arc::from(k), Value::number(v));
+            realm.heap.obj_set(o, Arc::from(k), Value::number(v));
         }
-        Ok(Value::object(realm.heap.alloc_obj(o)))
+        Ok(Value::object(o))
     });
 
     realm.set_global_obj(
@@ -204,7 +198,7 @@ fn run_parallel(
     let n_items = realm.heap.arr(arr).len();
     if n_items == 0 {
         return Ok(if collect {
-            Value::array(realm.heap.alloc_arr(Vec::new()))
+            Value::array(realm.heap.alloc_arr_host(&[]))
         } else {
             Value::UNDEFINED
         });
@@ -216,7 +210,7 @@ fn run_parallel(
     // clone captures + input out of the caller realm
     let pv_fn = Arc::new(clone_out(&realm.heap, f).map_err(RtError::new)?);
     let items: Vec<PortableValue> = {
-        let vals = realm.heap.arr(arr).clone();
+        let vals = realm.heap.arr(arr).to_vec();
         vals.into_iter()
             .map(|v| clone_out(&realm.heap, v))
             .collect::<Result<_, _>>()

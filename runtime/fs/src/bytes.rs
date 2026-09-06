@@ -21,9 +21,9 @@ pub(crate) fn make_bytes(realm: &mut Realm, data: Arc<Vec<u8>>) -> Value {
     let f = realm
         .heap
         .alloc_foreign(tsr_memory::Foreign::Handle(BYTES_KIND, data));
-    let mut obj = tsr_memory::Obj::default();
-    obj.set(Arc::from("__bytes"), Value::foreign(f));
-    Value::object(realm.heap.alloc_obj(obj))
+    let obj = realm.heap.alloc_obj_host();
+    realm.heap.obj_set(obj, Arc::from("__bytes"), Value::foreign(f));
+    Value::object(obj)
 }
 
 pub(crate) fn bytes_of(realm: &Realm, v: Value, who: &str) -> Result<Arc<Vec<u8>>, RtError> {
@@ -283,7 +283,7 @@ pub fn members(realm: &mut Realm) -> Vec<(&'static str, Value)> {
             .as_array()
             .ok_or_else(|| RtError::new("bytes.fromArray: expected an array"))?;
         // copy out of the heap before allocating anything
-        let vals = realm.heap.arr(arr).clone();
+        let vals = realm.heap.arr(arr).to_vec();
         let mut out = Vec::with_capacity(vals.len());
         for (i, v) in vals.iter().enumerate() {
             if !v.is_number() {
@@ -305,7 +305,7 @@ pub fn members(realm: &mut Realm) -> Vec<(&'static str, Value)> {
     let to_array = realm.add_native(|realm, args| {
         let b = arg_bytes(realm, args, 0, "bytes.toArray")?;
         let vals: Vec<Value> = b.iter().map(|&x| Value::number(x as f64)).collect();
-        Ok(Value::array(realm.heap.alloc_arr_lit(&vals)))
+        Ok(Value::array(realm.heap.alloc_arr_host(&vals)))
     });
 
     vec![

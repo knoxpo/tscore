@@ -323,7 +323,7 @@ impl Realm {
             if major {
                 // evacuate first when the nursery is live: the major trace
                 // indexes old arenas raw and must never see a young ref
-                if self.heap.nursery.bytes > 0 || !self.heap.nursery.objs.is_empty() {
+                if self.heap.nursery.bytes > 0 || self.heap.young.used() > 0 {
                     tsr_gc::collect_minor(
                         &mut self.heap,
                         &mut self.stack,
@@ -384,11 +384,9 @@ impl Realm {
             hub.gc_last_pause_us.store(self.gc_stats.last_pause_us, Relaxed);
             hub.gc_max_pause_us.store(self.gc_stats.max_pause_us, Relaxed);
             hub.live_bytes.store(self.gc_stats.last_live_bytes as u64, Relaxed);
-            let slots = self.heap.objs.len()
-                + self.heap.arrs.len()
+            // cells are bytes now; report 8-byte words plus the arena kinds
+            let slots = self.heap.cell_bytes() / 8
                 + self.heap.strs.len()
-                + self.heap.closures.len()
-                + self.heap.cells.len()
                 + self.heap.foreigns.len();
             hub.heap_slots.store(slots as u64, Relaxed);
         }
@@ -423,11 +421,10 @@ impl Realm {
 
     /// Build an object global out of named members, e.g. `console`, `Math`.
     pub fn set_global_obj(&mut self, name: &str, members: Vec<(&str, Value)>) {
-        let mut obj = tsr_memory::Obj::default();
+        let r = self.heap.alloc_obj_host();
         for (k, v) in members {
-            obj.set(Arc::from(k), v);
+            self.heap.obj_set(r, Arc::from(k), v);
         }
-        let r = self.heap.alloc_obj(obj);
         self.set_global(name, Value::object(r));
     }
 

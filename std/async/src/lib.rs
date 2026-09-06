@@ -121,10 +121,10 @@ fn task_scope(
         s.cancel_children();
         Ok(Value::UNDEFINED)
     });
-    let mut obj = tsr_memory::Obj::default();
-    obj.set(Arc::from("spawn"), spawn);
-    obj.set(Arc::from("cancel"), cancel);
-    let scope_obj = Value::object(realm.heap.alloc_obj(obj));
+    let obj = realm.heap.alloc_obj_host();
+    realm.heap.obj_set(obj, Arc::from("spawn"), spawn);
+    realm.heap.obj_set(obj, Arc::from("cancel"), cancel);
+    let scope_obj = Value::object(obj);
 
     // callback runs synchronously in the caller's realm
     let cb_result = call_value(realm, cb, &[scope_obj]);
@@ -201,10 +201,10 @@ fn spawn_child(
             Err(f) => Err(RtError::new(format!("task failed: {}", f.msg))),
         }
     });
-    let mut obj = tsr_memory::Obj::default();
-    obj.set(Arc::from("cancel"), cancel);
-    obj.set(Arc::from("join"), join);
-    Ok(Value::object(realm.heap.alloc_obj(obj)))
+    let obj = realm.heap.alloc_obj_host();
+    realm.heap.obj_set(obj, Arc::from("cancel"), cancel);
+    realm.heap.obj_set(obj, Arc::from("join"), join);
+    Ok(Value::object(obj))
 }
 
 /// Run one child task in a scratch realm wired to its cancel flag.

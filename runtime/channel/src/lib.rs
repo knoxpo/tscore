@@ -35,9 +35,9 @@ pub fn make_handle(realm: &mut Realm, core: Arc<ChannelCore>) -> Value {
     let f = realm
         .heap
         .alloc_foreign(Foreign::Handle(HANDLE_KIND, core));
-    let mut obj = tsr_memory::Obj::default();
-    obj.set(Arc::from(HANDLE_FIELD), Value::foreign(f));
-    Value::object(realm.heap.alloc_obj(obj))
+    let obj = realm.heap.alloc_obj_host();
+    realm.heap.obj_set(obj, Arc::from(HANDLE_FIELD), Value::foreign(f));
+    Value::object(obj)
 }
 
 fn core_of(realm: &Realm, v: Value) -> Result<Arc<ChannelCore>, RtError> {

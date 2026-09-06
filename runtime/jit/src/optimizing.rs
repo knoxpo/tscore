@@ -223,20 +223,17 @@ impl C {
     }
 
 
-    /// x{base} = arena data pointer selected by payload bit 31 of
-    /// w{refr} (old vs nursery); leaves the masked index in w{refr}.
-    /// One shifted load from the realm's [old, young] base-pair table
-    /// (refreshed by Heap::refresh_bases on every pointer move).
-    fn arena_base(&mut self, base: u32, refr: u32, table_off: u32) {
-        self.a.lsr_imm(13, refr, 31);
-        if table_off < 4096 {
-            self.a.add_imm(11, R_REALM, table_off);
-        } else {
-            self.a.mov_imm64(11, table_off as u64);
-            self.a.add_reg(11, R_REALM, 11);
-        }
-        self.a.ldr_reg_lsl3(base, 11, 13);
-        self.a.ubfx32(refr, refr, 0, 31);
+    /// x{dst} = the cell address in the boxed value x{src} (low 48 bits).
+    fn unbox(&mut self, dst: u32, src: u32) {
+        self.a.ubfx64(dst, src, 0, 48);
+    }
+    /// Branch to `young` when the cell at x{addr} is in the nursery.
+    /// Clobbers x{scratch}.
+    fn young_test(&mut self, addr: u32, scratch: u32, o: &HeapOffsets, young: Label) {
+        self.a.ldr_imm(scratch, R_REALM, o.young_base);
+        self.a.eor_reg(scratch, scratch, addr);
+        self.a.lsr_imm(scratch, scratch, o.young_shift);
+        self.a.cbz(scratch, young);
     }
     /// x{dst} = x{base} + w{idx} * size.
     fn index_addr(&mut self, dst: u32, base: u32, idx: u32, size: u32) {
@@ -323,15 +320,10 @@ impl C {
         }
     }
 
-    /// x{dst} = the array's `Vec<Value>` address, tag-checked.
-    ///
-    /// Deriving this is thirteen instructions — fetch the value, check the
-    /// tag, select the arena on the young bit, scale by the slot stride —
-    /// and a loop reading `a.length` then `a[i]` derives the same pointer
-    /// twice. When `reuse` is set the previous one is still in R_ACACHE
-    /// (zeroed by any safepoint or slow path) and it collapses to a test
-    /// and a move.
-    fn array_base(&mut self, dst: u32, v: u8, off: u32, size: u32, slow: Label, reuse: bool, cache: bool) {
+    /// x{dst} = the array cell address, tag-checked. When `reuse` is set
+    /// the previous one is still in R_ACACHE (zeroed by any safepoint or
+    /// slow path) and it collapses to a test and a move.
+    fn array_base(&mut self, dst: u32, v: u8, slow: Label, reuse: bool, cache: bool) {
         let derived = self.a.new_label();
         let cached = self.a.new_label();
         if reuse {
@@ -342,9 +334,7 @@ impl C {
         self.a.movz(11, 0xFFFC, 0); // TAG_ARR
         self.a.cmp_reg(10, 11);
         self.a.b_cond(Cond::Ne, slow);
-        self.a.orr_reg32(12, 31, 8);
-        self.arena_base(dst, 12, off);
-        self.index_addr(dst, dst, 12, size);
+        self.unbox(dst, 8);
         if cache {
             self.a.mov(R_ACACHE, dst);
         }
@@ -355,13 +345,23 @@ impl C {
             self.a.bind(derived);
         }
     }
+    /// x{len} = length of the array cell at x{arr} (meta high word).
+    fn arr_len(&mut self, len: u32, arr: u32) {
+        self.a.ldr_imm(len, arr, 0);
+        self.a.lsr_imm(len, len, 32);
+    }
+    /// x{vals} = address of element 0 of the array cell at x{arr}.
+    fn arr_vals(&mut self, vals: u32, arr: u32, o: &HeapOffsets) {
+        self.a.ldr_imm(vals, arr, o.arr_elems);
+        self.a.add_imm(vals, vals, o.elems_vals);
+    }
 
     /// May the value in `xv` be stored inline into the object in `xobj`
     /// (both boxed)? A number always. Anything else only when the field
     /// admits it (`ref_ok`) and no barrier is owed: the object is young,
-    /// not yet old, or old and already dirty — the next minor rescans it
-    /// either way. The first store into a clean old object takes `fail`,
-    /// whose helper records it. Clobbers x11, x12, x14, x17.
+    /// not yet aged, or aged and already dirty — the next minor rescans
+    /// it either way. The first store into a clean aged object takes
+    /// `fail`, whose helper records it. Clobbers x11, x12, x14, x17.
     fn ref_store_check(&mut self, xv: u32, xobj: u32, ref_ok: bool, o: HeapOffsets, fail: Label) {
         let ok = self.a.new_label();
         self.a.lsr_imm(11, xv, 48);
@@ -372,44 +372,79 @@ impl C {
             return;
         }
         self.a.b_cond(Cond::Lo, ok);
-        self.a.ubfx32(11, xobj, 31, 1); // YOUNG_BIT
-        self.a.cbnz(11, ok);
-        self.a.ubfx32(12, xobj, 0, 31); // slot index
-        self.a.lsr_imm(11, 12, 6);
-        self.a.ldr_imm(14, R_REALM, o.objs_old_len);
-        self.a.cmp_reg(11, 14);
-        self.a.b_cond(Cond::Hs, ok); // beyond the bitmap: not old
-        self.a.ldr_imm(14, R_REALM, o.objs_old_ptr);
-        self.a.ldr_reg_lsl3(14, 14, 11);
-        self.a.movz(17, 63, 0);
-        self.a.and_reg(17, 12, 17);
-        self.a.lsrv(14, 14, 17);
-        self.a.movz(17, 1, 0);
+        self.unbox(12, xobj);
+        self.young_test(12, 14, &o, ok);
+        self.a.ldr_imm(14, 12, 0); // meta
+        self.a.movz(17, (tsr_memory::cells::M_AGED | tsr_memory::cells::M_DIRTY) as u16, 0);
         self.a.and_reg(14, 14, 17);
-        self.a.cbz(14, ok); // not old
-        self.a.ldr_imm(14, R_REALM, o.objs_dirty_len);
-        self.a.cmp_reg(11, 14);
-        self.a.b_cond(Cond::Hs, fail);
-        self.a.ldr_imm(14, R_REALM, o.objs_dirty_ptr);
-        self.a.ldr_reg_lsl3(14, 14, 11);
-        self.a.movz(17, 63, 0);
-        self.a.and_reg(17, 12, 17);
-        self.a.lsrv(14, 14, 17);
-        self.a.movz(17, 1, 0);
-        self.a.and_reg(14, 14, 17);
-        self.a.cbz(14, fail); // clean -> helper records it
+        self.a.cmp_imm(14, tsr_memory::cells::M_AGED as u32);
+        self.a.b_cond(Cond::Eq, fail); // aged and clean -> helper records it
         self.a.bind(ok);
     }
 
-    /// Closure creation. Fast path reuses a freed slot whose proto is
-    /// already `child` (no Arc traffic) and whose upvals buffer has room:
-    /// pop the free list, write the captured values, log it young. The
-    /// helper covers everything else — empty free list, a slot that held
-    /// another proto, a small buffer, a capture that is not a cell.
-    /// `reg(r)` maps the child's parent-register sources to vregs (the
-    /// window for an inlined callee); `clo` gives the current closure's
-    /// ref in a register for ParentUpval sources; the slow path gets the
-    /// helper's (proto, pc, base) triple.
+    /// x13 = a fresh cell of `words` words: nursery bump, or the old
+    /// space's bump region when pretenuring. `slow` when the region is
+    /// full (the helper starts a chunk / runs past the soft limit).
+    /// Clobbers x9, x14. Allocation never collects.
+    fn bump(&mut self, words: u32, o: &HeapOffsets, slow: Label) {
+        let young = self.a.new_label();
+        let done = self.a.new_label();
+        self.a.ldr_imm(9, R_REALM, o.pretenure_off);
+        self.a.cbz(9, young);
+        self.bump_region(words, o.old_top, o.old_limit, slow);
+        self.a.b(done);
+        self.a.bind(young);
+        self.bump_region(words, o.young_top, o.young_limit, slow);
+        self.a.bind(done);
+    }
+    /// Old-space cell of `words` (closures, cells: never young): pop the
+    /// size-class free list and log the boxed cell in the born buffer,
+    /// else bump (the born range logs those). `slow` when neither has
+    /// room. Leaves x13 = cell, x0 = the cell boxed with `tag`; clobbers
+    /// x9, x14.
+    fn bump_old(&mut self, words: u32, tag: u64, o: &HeapOffsets, slow: Label) {
+        let bump = self.a.new_label();
+        let done = self.a.new_label();
+        self.a.ldr_imm(13, R_REALM, o.old_small + words * 8);
+        self.a.cbz(13, bump);
+        self.a.ldr_imm(9, R_REALM, o.born_len);
+        self.a.ldr_imm(14, R_REALM, o.born_cap);
+        self.a.cmp_reg(9, 14);
+        self.a.b_cond(Cond::Hs, slow); // buffer full: the helper drains it
+        self.a.ldr_imm(14, 13, 8); // next free
+        self.a.str_imm(14, R_REALM, o.old_small + words * 8);
+        self.a.mov_imm64(14, tag << 48);
+        self.a.orr_reg(0, 14, 13);
+        self.a.ldr_imm(14, R_REALM, o.born_ptr);
+        self.a.str_reg_lsl3(0, 14, 9);
+        self.a.add_imm(9, 9, 1);
+        self.a.str_imm(9, R_REALM, o.born_len);
+        self.a.b(done);
+        self.a.bind(bump);
+        self.bump_region(words, o.old_top, o.old_limit, slow);
+        self.tag_addr(0, tag);
+        self.a.bind(done);
+    }
+    fn bump_region(&mut self, words: u32, top: u32, limit: u32, slow: Label) {
+        self.a.ldr_imm(13, R_REALM, top);
+        self.a.ldr_imm(9, R_REALM, limit);
+        self.a.add_imm(14, 13, words * 8);
+        self.a.cmp_reg(14, 9);
+        self.a.b_cond(Cond::Hi, slow);
+        self.a.str_imm(14, R_REALM, top);
+    }
+    /// Box the cell address in x13 with `tag` into x{dst}.
+    fn tag_addr(&mut self, dst: u32, tag: u64) {
+        self.a.mov_imm64(9, tag << 48);
+        self.a.orr_reg(dst, 9, 13);
+    }
+
+    /// Closure creation: an old-space bump with the proto pointer and
+    /// the captured values written in place. `reg(r)` maps the child's
+    /// parent-register sources to vregs (the window for an inlined
+    /// callee); `clo` gives the current closure's address in a register
+    /// for ParentUpval sources; the helper gets the (proto, pc, base)
+    /// triple and covers a full chunk or a capture that is not a cell.
     #[allow(clippy::too_many_arguments)]
     fn emit_closure(
         &mut self,
@@ -426,28 +461,13 @@ impl C {
         let done = self.a.new_label();
         let n = child.upvals.len();
         if let Some(o) = o.filter(|_| n <= 8) {
-            let child_word = unsafe { *(child as *const std::sync::Arc<FunctionProto> as *const u64) };
-            self.a.ldr_imm(12, R_REALM, o.free_closures_len);
-            self.a.cbz(12, slow);
-            self.a.ldr_imm(9, R_REALM, o.closures_young_len);
-            self.a.ldr_imm(11, R_REALM, o.closures_young_cap);
-            self.a.cmp_reg(9, 11);
-            self.a.b_cond(Cond::Hs, slow);
-            self.a.sub_imm(12, 12, 1);
-            self.a.ldr_imm(13, R_REALM, o.free_closures_len - o.vec_len + o.vec_ptr); // free list data ptr
-            self.a.add_reg_lsl(13, 13, 12, 2); // Vec<u32> entries
-            self.a.ldr_w_imm(10, 13, 0); // r = free_closures[len-1]
-            self.a.ldr_imm(13, R_REALM, o.realm_closures_ptr);
-            self.a.add_reg_lsl(13, 13, 10, 5); // &closures[r] (32 bytes each)
-            self.a.ldr_imm(11, 13, o.closure_proto_off);
-            self.a.mov_imm64(14, child_word);
-            self.a.cmp_reg(11, 14);
-            self.a.b_cond(Cond::Ne, slow); // other proto: helper swaps the Arc
-            let up_base = o.closure_upvals_ptr - o.vec_ptr;
-            self.a.ldr_imm(11, 13, up_base + o.vec_cap);
-            self.a.cmp_imm(11, n as u32);
-            self.a.b_cond(Cond::Lo, slow);
-            self.a.ldr_imm(17, 13, o.closure_upvals_ptr); // upvals data
+            // the cell stores a raw proto pointer: keep the target alive
+            tsr_memory::hold_proto(child);
+            self.bump_old(2 + n as u32, 0xFFFD, &o, slow); // TAG_CLOSURE
+            self.a.mov_imm64(14, tsr_memory::cells::meta(tsr_memory::cells::K_CLOSURE, 2 + n, n));
+            self.a.str_imm(14, 13, 0);
+            self.a.mov_imm64(14, std::sync::Arc::as_ptr(child) as u64);
+            self.a.str_imm(14, 13, o.closure_proto);
             for (i, u) in child.upvals.iter().enumerate() {
                 match *u {
                     tsc_ir::UpvalSrc::ParentLocal(r) => {
@@ -460,23 +480,12 @@ impl C {
                     tsc_ir::UpvalSrc::ParentLocalValue(r) => self.fetch_x(reg(r), 9),
                     tsc_ir::UpvalSrc::ParentUpval(idx) => {
                         let cr = clo(self);
-                        self.a.ldr_imm(11, R_REALM, o.realm_closures_ptr);
-                        self.a.add_reg_lsl(11, 11, cr, 5);
-                        self.a.ldr_imm(11, 11, o.closure_upvals_ptr);
-                        self.a.ldr_imm(9, 11, idx as u32 * 8);
+                        self.a.ldr_imm(9, cr, o.closure_upvals + idx as u32 * 8);
                     }
                 }
-                self.a.str_imm(9, 17, i as u32 * 8);
+                self.a.str_imm(9, 13, o.closure_upvals + i as u32 * 8);
             }
-            self.a.mov_imm64(11, n as u64);
-            self.a.str_imm(11, 13, up_base + o.vec_len);
-            self.a.str_imm(12, R_REALM, o.free_closures_len); // pop
-            // young log + allocation count
-            self.a.ldr_imm(12, R_REALM, o.closures_young_len);
-            self.old_alloc_log(o.closures_young_ptr, o.closures_young_len, o);
-            self.a.mov_imm64(9, 0xFFFDu64 << 48); // TAG_CLOSURE
-            self.a.orr_reg(0, 9, 10);
-            self.a.b(done);
+            self.a.b(done); // x0 = the boxed closure
         }
         self.a.bind(slow);
         // flush the d-reg homes the helper's upval sources read from slots
@@ -538,148 +547,30 @@ impl C {
         self.a.b_cond(Cond::Eq, fail);
     }
 
-    /// Write a literal Obj at the address in `at` (x13): shape, vlen,
-    /// the first `sn` values from their homes, undefined pads, and an
-    /// empty overflow Vec. Shared by the nursery and old-space templates.
-    /// `checks[i]` is what value i must be shown to be before it may
-    /// enter the shape's field: 0 nothing, 1 Int32 (value already known
-    /// a number), 2 number then Int32, 3 number. A miss takes `slow`,
-    /// whose helper widens the shape.
-    fn store_obj_lit(&mut self, at: u32, shape_ptr: u64, sn: u8, first: u8, checks: &[u8], slow: Label, o: HeapOffsets) {
-        self.a.mov_imm64(14, shape_ptr);
-        self.a.str_imm(14, at, 0);
-        self.a.mov_imm64(14, sn as u64);
-        self.a.str_imm(14, at, o.obj_vlen);
-        for i in 0..sn {
-            self.fetch_x(first + i, 9);
-            // tag check on x11, not guard_number: that one uses x10, which
-            // holds the arena length this template bumps and returns
-            let cls = checks.get(i as usize).copied().unwrap_or(0);
-            if cls == 2 || cls == 3 {
-                self.a.lsr_imm(11, 9, 48);
-                self.a.cmp_reg(11, R_TAGLIM);
-                self.a.b_cond(Cond::Hs, slow);
-            }
-            if cls == 1 || cls == 2 {
-                self.int32_check(9, slow);
-            }
-            self.a.str_imm(9, at, o.obj_inline + i as u32 * 8);
-        }
-        // slots past vlen are never read (every reader bounds on vlen and
-        // a later add writes before it bumps), so no pads. The empty
-        // overflow Vec is two zero words and a dangling pointer: the zero
-        // register stores the zeros.
-        for (i, &w) in o.empty_vec_words.iter().enumerate() {
-            if w == 0 {
-                self.a.str_imm(31, at, o.obj_overflow + i as u32 * 8); // xzr
-            } else {
-                self.a.mov_imm64(9, w);
-                self.a.str_imm(9, at, o.obj_overflow + i as u32 * 8);
-            }
-        }
-    }
-
-    /// Array literal body: pop a pooled buffer with capacity >= n (else
-    /// `slow`), fill it from the value homes, and write the 24-byte Vec
-    /// slot at index x10 of the arena whose data pointer sits at
-    /// `arena_ptr_off`. Leaves the buffer capacity in x14.
-    fn store_arr_lit(&mut self, arena_ptr_off: u32, n: usize, first: u8, slow: Label, o: HeapOffsets) {
-        self.a.ldr_imm(12, R_REALM, o.pool_arr_len);
-        self.a.cbz(12, slow);
-        self.a.sub_imm(12, 12, 1);
-        self.a.ldr_imm(13, R_REALM, o.pool_arr_ptr);
-        self.a.mov_imm64(14, o.arr_size as u64);
-        self.a.mul(14, 12, 14);
-        self.a.add_reg(13, 13, 14); // &pool[len-1]
-        self.a.ldr_imm(14, 13, o.vec_cap);
-        self.a.cmp_imm(14, n as u32);
-        self.a.b_cond(Cond::Lo, slow);
-        self.a.str_imm(12, R_REALM, o.pool_arr_len); // pop
-        self.a.ldr_imm(17, 13, o.vec_ptr);
-        for i in 0..n {
-            self.fetch_x(first + i as u8, 9);
-            self.a.str_imm(9, 17, i as u32 * 8);
-        }
-        self.a.ldr_imm(11, R_REALM, arena_ptr_off);
-        self.a.mov_imm64(9, o.arr_size as u64);
-        self.a.mul(9, 10, 9);
-        self.a.add_reg(11, 11, 9);
-        self.a.str_imm(17, 11, o.vec_ptr);
-        self.a.str_imm(14, 11, o.vec_cap);
-        self.a.mov_imm64(9, n as u64);
-        self.a.str_imm(9, 11, o.vec_len);
-    }
-
-    /// Old-space bookkeeping after an inline arena push at index x10:
-    /// young-log push (x12 = its len, x13 = its data ptr) and the
-    /// allocation counter the minor-GC trigger reads.
-    fn old_alloc_log(&mut self, young_ptr: u32, young_len: u32, o: HeapOffsets) {
-        self.a.ldr_imm(13, R_REALM, young_ptr);
-        self.a.add_reg_lsl(13, 13, 12, 2);
-        self.a.str_w_imm(10, 13, 0);
-        self.a.add_imm(12, 12, 1);
-        self.a.str_imm(12, R_REALM, young_len);
-        self.a.ldr_imm(14, R_REALM, o.allocs_since_gc_off);
-        self.a.add_imm(14, 14, 1);
-        self.a.str_imm(14, R_REALM, o.allocs_since_gc_off);
-    }
-
-    /// Array literal of `n` values from vregs `first..`: inline bump
-    /// (nursery or, when pretenuring, the old arena) with the helper as
+    /// Array literal of `n` values from vregs `first..`: one bump holding
+    /// the array cell and its element chunk back to back, the helper as
     /// the slow path. Result in `dst`.
     fn emit_arr_lit(&mut self, dst: u8, first: u8, n: usize) {
         let c = self;
         let slow = c.a.new_label();
         let done = c.a.new_label();
-        let arr_bump = n <= 8 && c.offsets.filter(|o| o.bump_alloc).is_some();
-        if arr_bump {
-            // Inline array literal: the helper's whole job is a pooled
-            // buffer + a nursery slot, and both are Vec words the layout
-            // probes already located. Fast path needs nursery.arrs to
-            // have room (no realloc, so the base tables stay valid) and
-            // a pooled buffer on top with capacity >= n; anything else
-            // takes the helper, which also does the pop-until-fits walk.
-            let o = c.offsets.unwrap();
-            let old = c.a.new_label();
-            c.a.ldr_imm(9, R_REALM, o.pretenure_off);
-            c.a.cbnz(9, old);
-            c.a.ldr_imm(10, R_REALM, o.nursery_arrs_len);
-            c.a.ldr_imm(11, R_REALM, o.nursery_arrs_cap);
-            c.a.cmp_reg(10, 11);
-            c.a.b_cond(Cond::Hs, slow);
-            c.store_arr_lit(o.nursery_arrs_ptr, n, first, slow, o);
-            c.a.add_imm(9, 10, 1);
-            c.a.str_imm(9, R_REALM, o.nursery_arrs_len);
-            // nursery.bytes += 32 + cap * 8 (what young_arr counts)
-            c.a.ldr_imm(9, R_REALM, o.nursery_bytes_off);
-            c.a.add_imm(9, 9, 32);
-            c.a.add_reg_lsl(9, 9, 14, 3);
-            c.a.str_imm(9, R_REALM, o.nursery_bytes_off);
-            // result: TAG_ARR | YOUNG_BIT | index
-            c.a.mov_imm64(9, (0xFFFCu64 << 48) | 0x8000_0000);
-            c.a.orr_reg(0, 9, 10);
-            c.a.b(done);
-            // Pretenure mode: straight into the old arena. Needs an
-            // empty free list (slot reuse is the helper's job) and
-            // room in both the arena and its young log.
-            c.a.bind(old);
-            c.a.ldr_imm(9, R_REALM, o.free_arrs_len);
-            c.a.cbnz(9, slow);
-            c.a.ldr_imm(10, R_REALM, o.arrs_len);
-            c.a.ldr_imm(11, R_REALM, o.arrs_cap);
-            c.a.cmp_reg(10, 11);
-            c.a.b_cond(Cond::Hs, slow);
-            c.a.ldr_imm(9, R_REALM, o.arrs_young_len);
-            c.a.ldr_imm(11, R_REALM, o.arrs_young_cap);
-            c.a.cmp_reg(9, 11);
-            c.a.b_cond(Cond::Hs, slow);
-            c.store_arr_lit(o.realm_arrs_ptr, n, first, slow, o);
-            c.a.add_imm(9, 10, 1);
-            c.a.str_imm(9, R_REALM, o.arrs_len);
-            c.a.ldr_imm(12, R_REALM, o.arrs_young_len);
-            c.old_alloc_log(o.arrs_young_ptr, o.arrs_young_len, o);
-            c.a.mov_imm64(9, 0xFFFCu64 << 48);
-            c.a.orr_reg(0, 9, 10);
+        if let Some(o) = c.offsets.filter(|o| o.bump_alloc && n <= 8) {
+            use tsr_memory::cells::{meta, K_ARR, K_ELEMS};
+            let cap = n.max(4);
+            let words = 2 + 1 + cap;
+            c.bump(words as u32, &o, slow);
+            c.a.mov_imm64(14, meta(K_ARR, 2, n));
+            c.a.str_imm(14, 13, 0);
+            c.a.add_imm(14, 13, 16);
+            c.a.str_imm(14, 13, o.arr_elems);
+            c.a.mov_imm64(14, meta(K_ELEMS, 1 + cap, cap));
+            c.a.str_imm(14, 13, 16);
+            for i in 0..n {
+                c.fetch_x(first + i as u8, 9);
+                c.a.str_imm(9, 13, 16 + o.elems_vals + i as u32 * 8);
+            }
+            // slack past `n` is never read
+            c.tag_addr(0, 0xFFFC); // TAG_ARR
             c.a.b(done);
         }
         c.a.bind(slow);
@@ -700,90 +591,55 @@ impl C {
     }
 
     /// Object literal with a baked shape: `sn` values from vregs
-    /// `first..`, checked per `checks` (see store_obj_lit). Inline bump
-    /// for <= 3 fields, the shape-baked helper otherwise. Result in `dst`.
+    /// `first..`, one bump for objects that fit the inline slots, the
+    /// shape-baked helper otherwise. `checks[i]` is what value i must be
+    /// shown to be before it may enter the shape's field: 0 nothing, 1
+    /// Int32 (value already known a number), 2 number then Int32, 3
+    /// number. A miss takes the helper, which widens the shape. Result
+    /// in `dst`.
     fn emit_obj_lit(&mut self, dst: u8, first: u8, sn: u8, shape_ptr: u64, checks: &[u8]) {
         let c = self;
-        let bump = c.offsets.filter(|o| o.bump_alloc).is_some() && sn <= 3;
-        if bump {
-            // inline nursery bump: len<cap -> write the 64-byte Obj at
-            // the tail, bump len+bytes, result = len|YOUNG_BIT. Values
-            // read straight from d-reg homes (no slot flush).
-            let o = c.offsets.unwrap();
-            let slow = c.a.new_label();
-            let done = c.a.new_label();
-            let old = c.a.new_label();
-            c.a.ldr_imm(9, R_REALM, o.pretenure_off);
-            c.a.cbnz(9, old);
-            c.a.ldr_imm(10, R_REALM, o.nursery_objs_len);
-            c.a.ldr_imm(11, R_REALM, o.nursery_objs_cap);
-            c.a.cmp_reg(10, 11);
-            c.a.b_cond(Cond::Hs, slow); // full -> helper (realloc)
-            c.a.ldr_imm(12, R_REALM, o.nursery_objs_ptr);
-            c.a.add_reg_lsl(13, 12, 10, 6); // + len * 64
-            c.store_obj_lit(13, shape_ptr, sn, first, checks, slow, o);
-            c.a.add_imm(14, 10, 1);
-            c.a.str_imm(14, R_REALM, o.nursery_objs_len);
-            // no nursery.bytes update: the trigger counts objs.len() * 72
-            // result: TAG_OBJ | YOUNG_BIT | index
-            c.a.mov_imm64(9, (0xFFFBu64 << 48) | 0x8000_0000);
-            c.a.orr_reg(9, 9, 10);
-            c.put_x(dst, 9);
-            c.a.b(done);
-            // Pretenure mode: old arena directly (see emit_arr_lit).
-            c.a.bind(old);
-            c.a.ldr_imm(9, R_REALM, o.free_objs_len);
-            c.a.cbnz(9, slow);
-            c.a.ldr_imm(10, R_REALM, o.objs_len);
-            c.a.ldr_imm(11, R_REALM, o.objs_cap);
-            c.a.cmp_reg(10, 11);
-            c.a.b_cond(Cond::Hs, slow);
-            c.a.ldr_imm(12, R_REALM, o.objs_young_len);
-            c.a.ldr_imm(11, R_REALM, o.objs_young_cap);
-            c.a.cmp_reg(12, 11);
-            c.a.b_cond(Cond::Hs, slow);
-            c.a.ldr_imm(13, R_REALM, o.realm_objs_ptr);
-            c.a.add_reg_lsl(13, 13, 10, 6);
-            c.store_obj_lit(13, shape_ptr, sn, first, checks, slow, o);
-            c.a.add_imm(14, 10, 1);
-            c.a.str_imm(14, R_REALM, o.objs_len);
-            // x12 (young-log len) does not survive the Int32 checks
-            c.a.ldr_imm(12, R_REALM, o.objs_young_len);
-            c.old_alloc_log(o.objs_young_ptr, o.objs_young_len, o);
-            c.a.mov_imm64(9, 0xFFFBu64 << 48);
-            c.a.orr_reg(9, 9, 10);
-            c.put_x(dst, 9);
-            c.a.b(done);
-            c.a.bind(slow);
-            // helper reads values from slots — flush d-reg homes
-            for v in first..first + sn {
-                if v < LOW {
-                    c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
+        let slow = c.a.new_label();
+        let done = c.a.new_label();
+        if let Some(o) = c.offsets.filter(|o| o.bump_alloc && sn as u32 <= o.obj_inline_n) {
+            use tsr_memory::cells::{meta, K_OBJ};
+            c.bump(o.obj_words, &o, slow);
+            c.a.mov_imm64(14, meta(K_OBJ, o.obj_words as usize, sn as usize));
+            c.a.str_imm(14, 13, 0);
+            c.a.mov_imm64(14, shape_ptr);
+            c.a.str_imm(14, 13, o.obj_shape);
+            for i in 0..sn {
+                c.fetch_x(first + i, 9);
+                let cls = checks.get(i as usize).copied().unwrap_or(0);
+                if cls == 2 || cls == 3 {
+                    c.a.lsr_imm(11, 9, 48);
+                    c.a.cmp_reg(11, R_TAGLIM);
+                    c.a.b_cond(Cond::Hs, slow);
                 }
-            }
-            c.a.mov(0, R_REALM);
-            c.a.mov(1, R_BASE);
-            c.a.mov_imm64(2, first as u64);
-            c.a.mov_imm64(3, sn as u64);
-            c.a.mov_imm64(4, shape_ptr);
-            c.thin_keep_arrays(c.helpers.new_object_lit2);
-            c.put_x(dst, 0);
-            c.a.bind(done);
-        } else {
-            for v in first..first + sn {
-                if v < LOW {
-                    c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
+                if cls == 1 || cls == 2 {
+                    c.int32_check(9, slow);
                 }
+                c.a.str_imm(9, 13, o.obj_inline + i as u32 * 8);
             }
-            // shape baked at compile time: no per-alloc cache lookup
-            c.a.mov(0, R_REALM);
-            c.a.mov(1, R_BASE);
-            c.a.mov_imm64(2, first as u64);
-            c.a.mov_imm64(3, sn as u64);
-            c.a.mov_imm64(4, shape_ptr);
-            c.thin_keep_arrays(c.helpers.new_object_lit2);
-            c.put_x(dst, 0);
+            c.a.str_imm(31, 13, o.obj_spill); // xzr: no spill
+            c.tag_addr(0, 0xFFFB); // TAG_OBJ
+            c.a.b(done);
         }
+        c.a.bind(slow);
+        for v in first..first + sn {
+            if v < LOW {
+                c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
+            }
+        }
+        // shape baked at compile time: no per-alloc cache lookup
+        c.a.mov(0, R_REALM);
+        c.a.mov(1, R_BASE);
+        c.a.mov_imm64(2, first as u64);
+        c.a.mov_imm64(3, sn as u64);
+        c.a.mov_imm64(4, shape_ptr);
+        c.thin_keep_arrays(c.helpers.new_object_lit2);
+        c.a.bind(done);
+        c.put_x(dst, 0);
     }
 
     /// The field-access CSE cache lives in x15 (validated obj address;
@@ -1836,14 +1692,12 @@ fn emit_inline_call(
     c.a.movz(11, 0xFFFD, 0); // TAG_CLOSURE
     c.a.cmp_reg(10, 11);
     c.a.b_cond(Cond::Ne, generic);
-    c.a.orr_reg32(12, 31, 8);
-    c.a.ldr_imm(10, R_REALM, o.realm_closures_ptr);
-    c.index_addr(10, 10, 12, o.closure_size);
-    c.a.ldr_imm(11, 10, o.closure_proto_off);
+    c.unbox(10, 8);
+    c.a.ldr_imm(11, 10, o.closure_proto);
     c.a.mov_imm64(12, proto_word);
     c.a.cmp_reg(11, 12);
     c.a.b_cond(Cond::Ne, generic);
-    // x14 = closure arena address (kept for GetUpval; arith avoids x14
+    // x14 = closure cell address (kept for GetUpval; arith avoids x14
     // except Mod, whose int path uses 10-14 — reload there if needed)
     c.a.mov(14, 10);
 
@@ -1948,7 +1802,7 @@ fn emit_inline_call(
                     &|r| map(r),
                     &|c: &mut C| {
                         c.fetch_x(call_a, 8);
-                        c.a.orr_reg32(4, 31, 8);
+                        c.unbox(4, 8);
                         4
                     },
                     callee as *const FunctionProto as u64,
@@ -2018,19 +1872,15 @@ fn emit_inline_call(
                 let have = c.a.new_label();
                 c.a.cbnz(14, have);
                 c.fetch_x(ins.a, 8);
-                c.a.orr_reg32(12, 31, 8);
-                c.a.ldr_imm(14, R_REALM, o.realm_closures_ptr);
-                c.index_addr(14, 14, 12, o.closure_size);
+                c.unbox(14, 8);
                 c.a.bind(have);
-                c.a.ldr_imm(11, 14, o.closure_upvals_ptr);
-                c.a.ldr_imm(8, 11, cins.b as u32 * 8);
+                c.a.ldr_imm(8, 14, o.closure_upvals + cins.b as u32 * 8);
                 match callee.upvals[cins.b as usize] {
                     tsc_ir::UpvalSrc::ParentLocalValue(_) => {}
                     _ => {
                         // cell deref (cells are old-only, non-moving)
-                        c.a.orr_reg32(9, 31, 8);
-                        c.a.ldr_imm(10, R_REALM, o.realm_cells_ptr);
-                        c.a.ldr_reg_lsl3(8, 10, 9);
+                        c.unbox(9, 8);
+                        c.a.ldr_imm(8, 9, o.cell_val);
                     }
                 }
                 c.put_x(map(cins.a), 8);
@@ -2555,11 +2405,9 @@ fn emit_op(
                 c.a.mov_imm64(13, c.tics_base + (pc as u64) * 8);
                 c.a.ldr_imm(13, 13, 0);
                 c.a.cbz(13, slow);
-                // proto identity: stored Arc word in the closure slot
-                c.a.orr_reg32(12, 31, 9); // w12 = closure ref
-                c.a.ldr_imm(14, R_REALM, o.realm_closures_ptr);
-                c.index_addr(14, 14, 12, o.closure_size);
-                c.a.ldr_imm(15, 14, o.closure_proto_off);
+                // proto identity: the proto pointer in the closure cell
+                c.unbox(12, 9); // x12 = closure address
+                c.a.ldr_imm(15, 12, o.closure_proto);
                 c.a.ldr_imm(16, 13, 0); // ic.proto_word
                 c.a.cmp_reg(15, 16);
                 c.a.b_cond(Cond::Ne, slow);
@@ -2594,6 +2442,9 @@ fn emit_op(
                 // refresh slots base (callee frames may have grown the stack)
                 c.a.ldr_imm(16, R_REALM, o.realm_stack_ptr);
                 c.a.add_reg(R_SLOTS, 16, R_BASE);
+                // the callee's own safepoints may have moved young cells:
+                // drop the cached object / array addresses
+                c.zero_cache();
                 let resume = c.a.new_label();
                 c.a.cbnz(0, resume);
                 // success: x1 holds the return value bits
@@ -2608,9 +2459,8 @@ fn emit_op(
                 c.a.ldr_imm(13, 13, 0);
                 c.a.ldr_imm(1, 13, 8); // ic.proto_data
                 c.a.add_imm(4, R_BASE, (ins.a as u32 + 1) * 8);
-                c.a.ldr_imm(14, R_REALM, o.realm_closures_ptr);
                 c.a.ldr_imm(5, R_SLOTS, C::slot(ins.a));
-                c.a.orr_reg32(5, 31, 5); // closure ref
+                c.unbox(5, 5); // closure address
                 let d = c.depth(6);
                 c.a.add_imm(6, d, 1);
                 c.thin(c.helpers.call_resume);
@@ -2710,11 +2560,9 @@ fn emit_op(
                     c.a.movz(11, 0xFFFB, 0); // TAG_OBJ
                     c.a.cmp_reg(10, 11);
                     c.a.b_cond(Cond::Ne, miss);
-                    c.a.orr_reg32(9, 31, 8);
-                    c.arena_base(10, 9, o.obj_bases_off);
-                    c.index_addr(10, 10, 9, o.obj_size);
-                    c.a.ldr_imm(11, 10, o.obj_shape_arc);
-                    c.a.ldr_w_imm(12, 11, o.shape_id_delta);
+                    c.unbox(10, 8);
+                    c.a.ldr_imm(11, 10, o.obj_shape);
+                    c.a.ldr_w_imm(12, 11, o.shape_id);
                     c.cmp_sid(12, sid);
                     c.a.b_cond(Cond::Ne, miss);
                     c.a.mov(15, 10); // CSE cache: validated address
@@ -2734,11 +2582,9 @@ fn emit_op(
                 c.a.movz(11, 0xFFFB, 0); // TAG_OBJ
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
-                c.a.orr_reg32(9, 31, 8); // w9 = payload ref
-                c.arena_base(10, 9, o.obj_bases_off);
-                c.index_addr(10, 10, 9, o.obj_size);
-                c.a.ldr_imm(11, 10, o.obj_shape_arc);
-                c.a.ldr_w_imm(12, 11, o.shape_id_delta);
+                c.unbox(10, 8);
+                c.a.ldr_imm(11, 10, o.obj_shape);
+                c.a.ldr_w_imm(12, 11, o.shape_id);
                 c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
                     c.a.ldr_imm(14, 13, 0);
                 c.a.lsr_imm(13, 14, 32);
@@ -2856,11 +2702,9 @@ fn emit_op(
                     if int32_field {
                         c.int32_check(9, generic);
                     }
-                    c.a.orr_reg32(12, 31, 8);
-                    c.arena_base(10, 12, o.obj_bases_off);
-                    c.index_addr(10, 10, 12, o.obj_size);
-                    c.a.ldr_imm(11, 10, o.obj_shape_arc);
-                    c.a.ldr_w_imm(12, 11, o.shape_id_delta);
+                    c.unbox(10, 8);
+                    c.a.ldr_imm(11, 10, o.obj_shape);
+                    c.a.ldr_w_imm(12, 11, o.shape_id);
                     c.cmp_sid(12, sid);
                     c.a.b_cond(Cond::Ne, generic);
                     c.a.mov(15, 10);
@@ -2879,11 +2723,9 @@ fn emit_op(
                 c.a.b_cond(Cond::Ne, slow);
                 c.fetch_x(ins.c, 9);
                 c.guard_number(9, slow); // heap values -> helper (barrier)
-                c.a.orr_reg32(12, 31, 8); // w12 = payload ref
-                c.arena_base(10, 12, o.obj_bases_off);
-                c.index_addr(10, 10, 12, o.obj_size);
-                c.a.ldr_imm(11, 10, o.obj_shape_arc);
-                c.a.ldr_w_imm(12, 11, o.shape_id_delta);
+                c.unbox(10, 8);
+                c.a.ldr_imm(11, 10, o.obj_shape);
+                c.a.ldr_w_imm(12, 11, o.shape_id);
                 c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
                     c.a.ldr_imm(14, 13, 0);
                 c.a.lsr_imm(13, 14, 32);
@@ -2938,7 +2780,7 @@ fn emit_op(
                 }
                 let reuse = *acache == Some(ins.b) && c.int_lane;
                 let cache = c.acache_on && primary.is_none_or(|p| p == ins.b);
-                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, cache);
+                c.array_base(10, ins.b, slow, reuse, cache);
                 if cache {
                     *acache = Some(ins.b);
                 }
@@ -2957,10 +2799,10 @@ fn emit_op(
                     c.a.fcmp(1, 0);
                     c.a.b_cond(Cond::Ne, slow);
                 }
-                c.a.ldr_imm(14, 10, o.vec_len);
+                c.arr_len(14, 10);
                 c.a.cmp_reg(13, 14);
                 c.a.b_cond(Cond::Hs, slow);
-                c.a.ldr_imm(16, 10, o.vec_ptr);
+                c.arr_vals(16, 10, &o);
                 c.a.ldr_reg_lsl3(8, 16, 13);
                 c.put_x(ins.a, 8);
                 c.a.b(done);
@@ -3005,37 +2847,15 @@ fn emit_op(
                     c.fetch_x(ins.b, 9);
                     c.guard_number(9, slow);
                 }
-                c.a.ubfx32(11, 8, 31, 1); // YOUNG_BIT
-                c.a.cbnz(11, store);
-                // old-space array: old bit set and dirty bit clear -> helper
-                c.a.ubfx32(12, 8, 0, 31); // slot index
-                c.a.lsr_imm(11, 12, 6); // bitmap word
-                c.a.ldr_imm(14, R_REALM, o.arrs_old_len);
-                c.a.cmp_reg(11, 14);
-                c.a.b_cond(Cond::Hs, store); // beyond the bitmap: not old
-                c.a.ldr_imm(14, R_REALM, o.arrs_old_ptr);
-                c.a.ldr_reg_lsl3(14, 14, 11);
-                c.a.movz(17, 63, 0);
-                c.a.and_reg(17, 12, 17);
-                c.a.lsrv(14, 14, 17);
-                c.a.movz(17, 1, 0);
+                c.unbox(10, 8);
+                c.young_test(10, 11, &o, store);
+                // aged and clean -> helper records it
+                c.a.ldr_imm(14, 10, 0);
+                c.a.movz(17, (tsr_memory::cells::M_AGED | tsr_memory::cells::M_DIRTY) as u16, 0);
                 c.a.and_reg(14, 14, 17);
-                c.a.cbz(14, store); // not old
-                c.a.ldr_imm(14, R_REALM, o.arrs_dirty_len);
-                c.a.cmp_reg(11, 14);
-                c.a.b_cond(Cond::Hs, slow); // clean (no word yet)
-                c.a.ldr_imm(14, R_REALM, o.arrs_dirty_ptr);
-                c.a.ldr_reg_lsl3(14, 14, 11);
-                c.a.movz(17, 63, 0);
-                c.a.and_reg(17, 12, 17);
-                c.a.lsrv(14, 14, 17);
-                c.a.movz(17, 1, 0);
-                c.a.and_reg(14, 14, 17);
-                c.a.cbz(14, slow); // clean -> helper records it
+                c.a.cmp_imm(14, tsr_memory::cells::M_AGED as u32);
+                c.a.b_cond(Cond::Eq, slow);
                 c.a.bind(store);
-                c.a.orr_reg32(12, 31, 8);
-                c.arena_base(10, 12, o.arr_bases_off);
-                c.index_addr(10, 10, 12, o.arr_size);
                 if let Some(k) = const_ix {
                     c.a.mov_imm64(13, k as u64);
                 } else if lane_ix {
@@ -3048,10 +2868,10 @@ fn emit_op(
                     c.a.fcmp(1, 0);
                     c.a.b_cond(Cond::Ne, slow);
                 }
-                c.a.ldr_imm(14, 10, o.vec_len);
+                c.arr_len(14, 10);
                 c.a.cmp_reg(13, 14);
                 c.a.b_cond(Cond::Hs, slow); // growth or out of range
-                c.a.ldr_imm(17, 10, o.vec_ptr);
+                c.arr_vals(17, 10, &o);
                 c.fetch_x(ins.c, 9);
                 c.a.str_reg_lsl3(9, 17, 13);
                 c.a.b(done);
@@ -3069,14 +2889,14 @@ fn emit_op(
         Op::Len => {
             let slow = c.a.new_label();
             let done = c.a.new_label();
-            if let Some(o) = c.offsets {
+            if c.offsets.is_some() {
                 let reuse = *acache == Some(ins.b) && c.int_lane;
                 let cache = c.acache_on && primary.is_none_or(|p| p == ins.b);
-                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, cache);
+                c.array_base(10, ins.b, slow, reuse, cache);
                 if cache {
                     *acache = Some(ins.b);
                 }
-                c.a.ldr_imm(14, 10, o.vec_len);
+                c.arr_len(14, 10);
                 c.a.scvtf(0, 14);
                 c.put(ins.a, 0);
                 c.a.b(done);
@@ -3110,24 +2930,29 @@ fn emit_op(
                 // young check needs the value; the slot address comes from
                 // the cache when this is the loop's primary array (the
                 // helper slow path zeroes x22, and growth keeps the slot)
-                c.fetch_x(ins.a, 8);
-                c.a.ubfx32(13, 8, 31, 1); // YOUNG_BIT
-                c.a.cbz(13, slow); // old array -> helper (barrier)
                 let reuse = *acache == Some(ins.a) && c.int_lane;
                 let cache = c.acache_on && primary.is_none_or(|p| p == ins.a);
-                c.array_base(10, ins.a, o.arr_bases_off, o.arr_size, slow, reuse, cache);
+                c.array_base(10, ins.a, slow, reuse, cache);
                 if cache {
                     *acache = Some(ins.a);
                 }
-                c.a.ldr_imm(13, 10, o.vec_len);
-                c.a.ldr_imm(14, 10, o.vec_cap);
+                let young = c.a.new_label();
+                c.young_test(10, 13, &o, young);
+                c.a.b(slow); // aged array -> helper (barrier)
+                c.a.bind(young);
+                c.a.ldr_imm(12, 10, 0); // meta: len in the high word
+                c.a.lsr_imm(13, 12, 32);
+                c.a.ldr_imm(17, 10, o.arr_elems);
+                c.a.ldr_imm(14, 17, 0); // chunk meta: cap in the high word
+                c.a.lsr_imm(14, 14, 32);
                 c.a.cmp_reg(13, 14);
-                c.a.b_cond(Cond::Hs, slow); // full -> helper (realloc)
-                c.a.ldr_imm(17, 10, o.vec_ptr);
+                c.a.b_cond(Cond::Hs, slow); // full -> helper (regrow)
+                c.a.add_imm(17, 17, o.elems_vals);
                 c.fetch_x(ins.b, 9);
                 c.a.str_reg_lsl3(9, 17, 13);
-                c.a.add_imm(13, 13, 1);
-                c.a.str_imm(13, 10, o.vec_len);
+                c.a.mov_imm64(14, 1u64 << 32);
+                c.a.add_reg(12, 12, 14);
+                c.a.str_imm(12, 10, 0);
                 c.a.b(done);
             }
             c.a.bind(slow);
@@ -3159,15 +2984,11 @@ fn emit_op(
             };
             match (c.offsets, kind) {
                 (Some(o), Some(is_cell)) => {
-                    c.a.ldr_imm(10, R_REALM, o.realm_closures_ptr);
                     let cl = c.closure(9);
-                    c.index_addr(10, 10, cl, o.closure_size);
-                    c.a.ldr_imm(11, 10, o.closure_upvals_ptr);
-                    c.a.ldr_imm(8, 11, ins.b as u32 * 8);
+                    c.a.ldr_imm(8, cl, o.closure_upvals + ins.b as u32 * 8);
                     if is_cell {
-                        c.a.orr_reg32(9, 31, 8); // w9 = cell ref payload
-                        c.a.ldr_imm(10, R_REALM, o.realm_cells_ptr);
-                        c.a.ldr_reg_lsl3(8, 10, 9);
+                        c.unbox(9, 8);
+                        c.a.ldr_imm(8, 9, o.cell_val);
                     }
                     c.put_x(ins.a, 8);
                 }
@@ -3217,9 +3038,22 @@ fn emit_op(
             c.put_x(ins.a, 0);
         }
         Op::NewCell => {
+            let slow = c.a.new_label();
+            let done = c.a.new_label();
+            if let Some(o) = c.offsets {
+                use tsr_memory::cells::{meta, K_CELL};
+                c.bump_old(2, 0xFFFE, &o, slow); // TAG_CELL
+                c.a.mov_imm64(14, meta(K_CELL, 2, 0));
+                c.a.str_imm(14, 13, 0);
+                c.fetch_x(ins.a, 9);
+                c.a.str_imm(9, 13, o.cell_val);
+                c.a.b(done); // x0 = the boxed cell
+            }
+            c.a.bind(slow);
             c.a.mov(0, R_REALM);
             c.fetch_x(ins.a, 1);
             c.thin_keep_arrays(c.helpers.new_cell);
+            c.a.bind(done);
             c.put_x(ins.a, 0);
         }
         Op::NewObjectLit | Op::NewArrayLit => {

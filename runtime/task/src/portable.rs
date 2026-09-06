@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tsc_ir::FunctionProto;
-use tsr_memory::{Closure, Foreign, Heap, Kind, Obj, Ref, Value};
+use tsr_memory::{Foreign, Heap, Kind, Ref, Value};
 
 /// Realm-independent value tree. `Send + Sync`: safe to hand to any worker.
 #[derive(Clone)]
@@ -111,7 +111,7 @@ fn clone_rec(
             }
             let c = heap.closure(r);
             let upvals = c
-                .upvals
+                .upvals()
                 .iter()
                 .map(|&entry| match entry.as_cell() {
                     Some(cell) => clone_rec(heap, *heap.cell(cell), visiting),
@@ -120,8 +120,8 @@ fn clone_rec(
                 .collect::<Result<_, _>>()?;
             // force-fill before crossing threads: the fill machinery (and
             // any failed-fill error) stays on the owning realm's side
-            let _ = c.proto.body();
-            let pv = PortableValue::Closure { proto: c.proto.clone(), upvals };
+            let _ = c.proto().body();
+            let pv = PortableValue::Closure { proto: c.proto_arc(), upvals };
             visiting.remove(&(2, r));
             pv
         }
@@ -159,21 +159,24 @@ pub fn rehydrate(pv: &PortableValue, heap: &mut Heap) -> Value {
         PortableValue::Str(s) => Value::str_ref(heap.alloc_str(s.clone())),
         PortableValue::Array(items) => {
             let vals: Vec<Value> = items.iter().map(|x| rehydrate(x, heap)).collect();
-            Value::array(heap.alloc_arr(vals))
+            Value::array(heap.alloc_arr_host(&vals))
         }
         PortableValue::Object(fields) => {
-            let mut obj = Obj::default();
-            for (k, x) in fields {
-                let v = rehydrate(x, heap);
-                obj.set(k.clone(), v);
+            // values first: a nested rehydrate must not run between the
+            // object's allocation and its stores (the object could move)
+            let vals: Vec<(Arc<str>, Value)> =
+                fields.iter().map(|(k, x)| (k.clone(), rehydrate(x, heap))).collect();
+            let o = heap.alloc_obj_host();
+            for (k, v) in vals {
+                heap.obj_set(o, k, v);
             }
-            Value::object(heap.alloc_obj(obj))
+            Value::object(o)
         }
         PortableValue::Handle(kind, any) => {
             let f = heap.alloc_foreign(Foreign::Handle(kind, any.clone()));
-            let mut obj = Obj::default();
-            obj.set(Arc::from(format!("__{kind}").as_str()), Value::foreign(f));
-            Value::object(heap.alloc_obj(obj))
+            let o = heap.alloc_obj_host();
+            heap.obj_set(o, Arc::from(format!("__{kind}").as_str()), Value::foreign(f));
+            Value::object(o)
         }
         PortableValue::Closure { proto, upvals } => {
             // cell-ness must match the proto's declaration: the optimizing compiler
@@ -191,10 +194,7 @@ pub fn rehydrate(pv: &PortableValue, heap: &mut Heap) -> Value {
                     }
                 })
                 .collect();
-            Value::closure(heap.alloc_closure(Closure {
-                proto: proto.clone(),
-                upvals: cells,
-            }))
+            Value::closure(heap.alloc_closure(proto, &cells))
         }
     }
 }
@@ -207,11 +207,10 @@ mod tests {
     fn roundtrip_nested() {
         let mut a = Heap::new();
         let s = a.alloc_str(Arc::from("hi"));
-        let inner = a.alloc_arr(vec![Value::number(1.0), Value::str_ref(s)]);
-        let mut obj = Obj::default();
-        obj.set(Arc::from("xs"), Value::array(inner));
-        obj.set(Arc::from("ok"), Value::bool(true));
-        let o = a.alloc_obj(obj);
+        let inner = a.alloc_arr_host(&[Value::number(1.0), Value::str_ref(s)]);
+        let o = a.alloc_obj_host();
+        a.obj_set(o, Arc::from("xs"), Value::array(inner));
+        a.obj_set(o, Arc::from("ok"), Value::bool(true));
 
         let pv = clone_out(&a, Value::object(o)).unwrap();
         let mut b = Heap::new();
@@ -221,7 +220,7 @@ mod tests {
         let Some(xr) = xs.as_array() else { panic!() };
         assert_eq!(b.arr(xr).len(), 2);
         // mutation isolation: heap a untouched by heap b writes
-        b.arr_mut(xr).push(Value::number(3.0));
+        b.arr_push(xr, Value::number(3.0));
         assert_eq!(a.arr(inner).len(), 2);
     }
 
@@ -231,13 +230,12 @@ mod tests {
         // mutable export, and an export still uninitialized (TDZ)
         let mut a = Heap::new();
         let cell = a.alloc_cell(Value::number(7.0));
-        let mut ns = Obj::default();
+        let o = a.alloc_obj_host();
         for pad in ["\0p0", "\0p1", "\0p2"] {
-            ns.set(Arc::from(pad), Value::UNDEFINED);
+            a.obj_set(o, Arc::from(pad), Value::UNDEFINED);
         }
-        ns.set(Arc::from("counter"), Value::cell(cell));
-        ns.set(Arc::from("later"), Value::from_bits(tsr_memory::TDZ_SENTINEL));
-        let o = a.alloc_obj(ns);
+        a.obj_set(o, Arc::from("counter"), Value::cell(cell));
+        a.obj_set(o, Arc::from("later"), Value::from_bits(tsr_memory::TDZ_SENTINEL));
 
         let pv = clone_out(&a, Value::object(o)).unwrap();
         let mut b = Heap::new();
@@ -254,16 +252,16 @@ mod tests {
     #[test]
     fn cycle_detected() {
         let mut h = Heap::new();
-        let arr = h.alloc_arr(vec![]);
-        h.arr_mut(arr).push(Value::array(arr));
+        let arr = h.alloc_arr_host(&[]);
+        h.arr_push(arr, Value::array(arr));
         assert!(clone_out(&h, Value::array(arr)).unwrap_err().contains("cyclic"));
     }
 
     #[test]
     fn sibling_references_are_not_cycles() {
         let mut h = Heap::new();
-        let shared = h.alloc_arr(vec![Value::number(1.0)]);
-        let outer = h.alloc_arr(vec![Value::array(shared), Value::array(shared)]);
+        let shared = h.alloc_arr_host(&[Value::number(1.0)]);
+        let outer = h.alloc_arr_host(&[Value::array(shared), Value::array(shared)]);
         clone_out(&h, Value::array(outer)).unwrap();
     }
 }

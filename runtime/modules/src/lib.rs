@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tsc_ir::{Program, ReExport};
-use tsr_memory::{Obj, Value};
+use tsr_memory::Value;
 use tsr_realm::{interpreter, Realm, RtError};
 use tsr_memory::{self};
 
@@ -41,12 +41,12 @@ pub fn run_graph(realm: &mut Realm, program: &Program) -> Result<Value, RtError>
             preexisting[i] = true;
             continue;
         }
-        let mut obj = Obj::default();
+        let obj = realm.heap.alloc_obj_host();
         // three hidden pads push every export into overflow slots: the
         // JIT's inline GetField serves slots < OBJ_INLINE only, so ns
         // reads always take the helper — which derefs export cells
         for pad in ["\0p0", "\0p1", "\0p2"] {
-            obj.set(Arc::from(pad), Value::UNDEFINED);
+            realm.heap.obj_set(obj, Arc::from(pad), Value::UNDEFINED);
         }
         // export fields start as the TDZ sentinel; each module publishes
         // values (or its live cells) as it evaluates — a cyclic read
@@ -57,12 +57,12 @@ pub fn run_graph(realm: &mut Realm, program: &Program) -> Result<Value, RtError>
             if e.from.is_some() {
                 continue; // re-exports materialize just before evaluation
             }
-            obj.set(e.name.clone(), tdz);
+            realm.heap.obj_set(obj, e.name.clone(), tdz);
         }
         if !m.exports.iter().any(|e| e.name.as_ref() == "default") {
-            obj.set(Arc::from("default"), tdz);
+            realm.heap.obj_set(obj, Arc::from("default"), tdz);
         }
-        let r = realm.heap.alloc_obj(obj); // old space: ns never moves
+        let r = obj; // old space: ns never moves
         realm.globals.insert(module_key(&m.id), Value::object(r));
     }
 
@@ -150,7 +150,7 @@ fn materialize_reexports(realm: &mut Realm, program: &Program, i: usize) {
         match re {
             ReExport::Namespace => {
                 realm.heap.barrier_obj(ns);
-                realm.heap.obj_mut(ns).set(e.name.clone(), dep_v);
+                realm.heap.obj_set(ns, e.name.clone(), dep_v);
             }
             ReExport::Named(orig) => {
                 let cur = realm.heap.obj(ns).get(&e.name);
@@ -163,7 +163,7 @@ fn materialize_reexports(realm: &mut Realm, program: &Program, i: usize) {
                     .get(orig)
                     .unwrap_or(Value::UNDEFINED);
                 realm.heap.barrier_obj(ns);
-                realm.heap.obj_mut(ns).set(e.name.clone(), v);
+                realm.heap.obj_set(ns, e.name.clone(), v);
             }
             ReExport::Star => {
                 let fields: Vec<(Arc<str>, Value)> = realm
@@ -177,7 +177,7 @@ fn materialize_reexports(realm: &mut Realm, program: &Program, i: usize) {
                 for (k, v) in fields {
                     let cur = realm.heap.obj(ns).get(&k);
                     if cur.is_none_or(|c| c.bits() == tdz.bits()) {
-                        realm.heap.obj_mut(ns).set(k, v);
+                        realm.heap.obj_set(ns, k, v);
                     }
                 }
             }

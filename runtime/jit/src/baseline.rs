@@ -84,83 +84,50 @@ pub struct Helpers {
     pub call_resume: usize,
 }
 
-/// Probed heap layout offsets (tsr-realm::layout). None disables the
-/// inline read paths — helpers still handle everything.
+/// Heap layout the templates bake in (tsr-realm::layout). Offsets are
+/// bytes from the Realm pointer; cell field offsets are bytes from a
+/// cell address. None disables the inline paths — helpers still handle
+/// everything.
 #[derive(Clone, Copy)]
 pub struct HeapOffsets {
-    /// Offset of realm.stack's data pointer inside Realm.
+    /// Offset of realm.stack's data pointer / length inside Realm.
     pub realm_stack_ptr: u32,
-    pub realm_objs_ptr: u32,
-    pub realm_arrs_ptr: u32,
-    /// Nursery (young) arena data pointers — templates select the base on
-    /// payload bit 31 and mask the index.
-    pub nursery_objs_ptr: u32,
-    pub nursery_arrs_ptr: u32,
-    /// [old, young] base-pair tables in Realm: one shifted load selects.
-    pub obj_bases_off: u32,
-    pub arr_bases_off: u32,
-    /// Inline bump-allocation: nursery.objs len/cap + nursery.bytes word
-    /// offsets in Realm, the raw words of an empty Vec<Value>, and Obj
-    /// field offsets.
-    pub nursery_objs_len: u32,
-    pub nursery_objs_cap: u32,
-    pub nursery_bytes_off: u32,
-    /// nursery.arrs len/cap and the array-buffer pool Vec words (inline
-    /// array literals pop a pooled buffer and bump a nursery slot).
-    pub nursery_arrs_len: u32,
-    pub nursery_arrs_cap: u32,
-    pub pool_arr_ptr: u32,
-    pub pool_arr_len: u32,
-    pub pool_arr_cap: u32,
-    pub pretenure_off: u32,
-    pub objs_len: u32,
-    pub objs_cap: u32,
-    pub arrs_len: u32,
-    pub arrs_cap: u32,
-    pub free_objs_len: u32,
-    pub free_arrs_len: u32,
-    pub objs_young_ptr: u32,
-    pub objs_young_len: u32,
-    pub objs_young_cap: u32,
-    pub arrs_young_ptr: u32,
-    pub arrs_young_len: u32,
-    pub arrs_young_cap: u32,
-    pub allocs_since_gc_off: u32,
-    pub arrs_old_ptr: u32,
-    pub arrs_old_len: u32,
-    pub arrs_dirty_ptr: u32,
-    pub arrs_dirty_len: u32,
-    pub objs_old_ptr: u32,
-    pub objs_old_len: u32,
-    pub objs_dirty_ptr: u32,
-    pub objs_dirty_len: u32,
+    pub realm_stack_len: u32,
     pub const_cache_ptr: u32,
-    pub free_closures_len: u32,
-    pub closures_young_ptr: u32,
-    pub closures_young_len: u32,
-    pub closures_young_cap: u32,
-    pub empty_vec_words: [u64; 3],
-    pub obj_vlen: u32,
-    pub obj_overflow: u32,
+    /// Nursery: base of the aligned reservation, bump pointer, soft limit.
+    pub young_base: u32,
+    pub young_top: u32,
+    pub young_limit: u32,
+    /// Old-space bump region (pretenure template).
+    pub old_top: u32,
+    pub old_limit: u32,
+    /// Old-space size-class free-list heads: `old_small + words * 8`.
+    pub old_small: u32,
+    /// Fixed born buffer (ptr, len, cap words) for free-list pops.
+    pub born_ptr: u32,
+    pub born_len: u32,
+    pub born_cap: u32,
+    pub pretenure_off: u32,
+    /// `young(a) = (a >> young_shift) == (base >> young_shift)`.
+    pub young_shift: u32,
     /// Inline bump path enabled (nursery on for this process).
     pub bump_alloc: bool,
-    pub obj_size: u32,
-    pub obj_shape_arc: u32,
-    pub shape_id_delta: u32,
-    /// Offset of the inline value slots inside Obj.
+    /// Object cell: shape pointer, inline slots, spill pointer.
+    pub obj_shape: u32,
     pub obj_inline: u32,
-    /// Number of inline slots (IC slots >= this take the helper).
     pub obj_inline_n: u32,
-    pub realm_closures_ptr: u32,
-    pub realm_cells_ptr: u32,
-    pub closure_size: u32,
-    pub closure_upvals_ptr: u32,
-    pub closure_proto_off: u32,
-    pub realm_stack_len: u32,
-    pub arr_size: u32,
-    pub vec_ptr: u32,
-    pub vec_len: u32,
-    pub vec_cap: u32,
+    pub obj_spill: u32,
+    pub obj_words: u32,
+    /// Array cell: element-chunk pointer; values start `elems_vals` into
+    /// the chunk; lengths sit in the meta word's high 32 bits.
+    pub arr_elems: u32,
+    pub elems_vals: u32,
+    /// Closure cell: proto pointer, first upval. Cell: its value.
+    pub closure_proto: u32,
+    pub closure_upvals: u32,
+    pub cell_val: u32,
+    /// Byte offset of the u32 id inside ShapeData.
+    pub shape_id: u32,
 }
 
 #[repr(C)]
@@ -233,21 +200,6 @@ impl C {
     }
 
 
-    /// x{base} = arena data pointer selected by payload bit 31 of
-    /// w{refr} (old vs nursery); leaves the masked index in w{refr}.
-    /// One shifted load from the realm's [old, young] base-pair table
-    /// (refreshed by Heap::refresh_bases on every pointer move).
-    fn arena_base(&mut self, base: u32, refr: u32, table_off: u32) {
-        self.a.lsr_imm(13, refr, 31);
-        if table_off < 4096 {
-            self.a.add_imm(11, R_REALM, table_off);
-        } else {
-            self.a.mov_imm64(11, table_off as u64);
-            self.a.add_reg(11, R_REALM, 11);
-        }
-        self.a.ldr_reg_lsl3(base, 11, 13);
-        self.a.ubfx32(refr, refr, 0, 31);
-    }
     /// x{dst} = x{base} + w{idx} * size (size folded as shift when pow2).
     fn index_addr(&mut self, dst: u32, base: u32, idx: u32, size: u32) {
         if size.is_power_of_two() {
@@ -683,11 +635,9 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
                 c.a.movz(11, 0xFFFB, 0); // TAG_OBJ
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
-                c.a.orr_reg32(9, 31, 8); // w9 = payload ref
-                c.arena_base(10, 9, o.obj_bases_off);
-                c.index_addr(10, 10, 9, o.obj_size);
-                c.a.ldr_imm(11, 10, o.obj_shape_arc);
-                c.a.ldr_w_imm(12, 11, o.shape_id_delta);
+                c.a.ubfx64(10, 8, 0, 48); // object address
+                c.a.ldr_imm(11, 10, o.obj_shape);
+                c.a.ldr_w_imm(12, 11, o.shape_id);
                 c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
                 c.a.ldr_imm(14, 13, 0);
                 c.a.lsr_imm(15, 14, 32);
@@ -732,19 +682,19 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
                 c.a.b_cond(Cond::Ne, slow);
                 c.load_slot(9, ins.c);
                 c.guard_number(9, slow);
-                c.a.orr_reg32(12, 31, 8); // ref
-                c.arena_base(10, 12, o.arr_bases_off);
-                c.index_addr(10, 10, 12, o.arr_size);
+                c.a.ubfx64(10, 8, 0, 48); // array address
                 // exact-integer index: fcvtzs/scvtf round trip
                 c.a.fmov_dx(0, 9);
                 c.a.fcvtzs(13, 0);
                 c.a.scvtf(1, 13);
                 c.a.fcmp(1, 0);
                 c.a.b_cond(Cond::Ne, slow); // fractional / NaN / huge
-                c.a.ldr_imm(14, 10, o.vec_len);
+                c.a.ldr_imm(14, 10, 0); // meta: len in the high word
+                c.a.lsr_imm(14, 14, 32);
                 c.a.cmp_reg(13, 14);
                 c.a.b_cond(Cond::Hs, slow); // OOB or negative (unsigned)
-                c.a.ldr_imm(15, 10, o.vec_ptr);
+                c.a.ldr_imm(15, 10, o.arr_elems);
+                c.a.add_imm(15, 15, o.elems_vals);
                 c.a.ldr_reg_lsl3(8, 15, 13);
                 c.store_slot(8, ins.a);
                 c.a.b(done);
@@ -772,16 +722,15 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
         Op::Len => {
             let slow = c.a.new_label();
             let done = c.a.new_label();
-            if let Some(o) = c.offsets {
+            if c.offsets.is_some() {
                 c.load_slot(8, ins.b);
                 c.a.lsr_imm(10, 8, 48);
                 c.a.movz(11, 0xFFFC, 0);
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow); // strings etc -> helper
-                c.a.orr_reg32(12, 31, 8);
-                c.arena_base(10, 12, o.arr_bases_off);
-                c.index_addr(10, 10, 12, o.arr_size);
-                c.a.ldr_imm(14, 10, o.vec_len);
+                c.a.ubfx64(10, 8, 0, 48);
+                c.a.ldr_imm(14, 10, 0);
+                c.a.lsr_imm(14, 14, 32);
                 c.a.scvtf(0, 14);
                 c.a.fmov_xd(8, 0);
                 c.store_slot(8, ins.a);

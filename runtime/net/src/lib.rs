@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{mpsc, Arc, Mutex};
-use tsr_memory::{Foreign, Obj, PromiseError, Value};
+use tsr_memory::{Foreign, PromiseError, Value};
 use tsr_realm::{Completer, NativeArgs, Realm, RtError};
 use tsr_task::PortableValue;
 
@@ -25,9 +25,9 @@ const CONN_KIND: &str = "netConn";
 
 fn make_handle(realm: &mut Realm, kind: &'static str, core: Arc<dyn std::any::Any + Send + Sync>) -> Value {
     let f = realm.heap.alloc_foreign(Foreign::Handle(kind, core));
-    let mut obj = Obj::default();
-    obj.set(Arc::from(format!("__{kind}")), Value::foreign(f));
-    let r = realm.heap.alloc_obj(obj);
+    let obj = realm.heap.alloc_obj_host();
+    realm.heap.obj_set(obj, Arc::from(format!("__{kind}")), Value::foreign(f));
+    let r = obj;
     Value::object(r)
 }
 
@@ -441,7 +441,7 @@ pub fn install(realm: &mut Realm) {
         Err(RtError::new("net.close: expected a net handle"))
     });
 
-    let mut net = Obj::default();
+    let net = realm.heap.alloc_obj_host();
     for (k, v) in [
         ("listen", listen),
         ("accept", accept),
@@ -450,20 +450,20 @@ pub fn install(realm: &mut Realm) {
         ("connect", connect),
         ("close", close),
     ] {
-        net.set(Arc::from(k), v);
+        realm.heap.obj_set(net, Arc::from(k), v);
     }
-    let net_ref = realm.heap.alloc_obj(net);
+    let net_ref = net;
 
     // ---- runtime.http ----
     let serve = realm.add_native(|realm, args| http_serve(realm, args));
-    let mut http = Obj::default();
-    http.set(Arc::from("serve"), serve);
-    let http_ref = realm.heap.alloc_obj(http);
+    let http = realm.heap.alloc_obj_host();
+    realm.heap.obj_set(http, Arc::from("serve"), serve);
+    let http_ref = http;
 
     if let Some(rt) = realm.globals.get("runtime").copied().and_then(|v| v.as_object()) {
         realm.heap.barrier_obj(rt);
-        realm.heap.obj_mut(rt).set(Arc::from("net"), Value::object(net_ref));
-        realm.heap.obj_mut(rt).set(Arc::from("http"), Value::object(http_ref));
+        realm.heap.obj_set(rt, Arc::from("net"), Value::object(net_ref));
+        realm.heap.obj_set(rt, Arc::from("http"), Value::object(http_ref));
     } else {
         realm.set_global_obj(
             "runtime",
@@ -792,7 +792,7 @@ fn handle_request(
         }
         s
     });
-    let mut headers = Obj::default();
+    let headers = realm.heap.alloc_obj_host();
     let mut lower = [0u8; 64];
     for (k, v) in &req.headers {
         // header names are exposed lowercased (what handlers expect);
@@ -807,9 +807,9 @@ fn handle_request(
             slice_str(buf, *k)
         };
         let val = names.intern_value(realm, slice_str(buf, *v));
-        headers.set(names.intern(name), val);
+        realm.heap.obj_set(headers, names.intern(name), val);
     }
-    let headers_v = Value::object(realm.heap.alloc_obj(headers));
+    let headers_v = Value::object(headers);
     let vals = [
         realm.alloc_string(slice_str(buf, req.method)),
         realm.alloc_string(slice_str(buf, req.path)),

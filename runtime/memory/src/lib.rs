@@ -18,6 +18,12 @@ pub const BUF_POOL_CAP: usize = 262144;
 use std::sync::Arc;
 use tsc_ir::FunctionProto;
 
+pub mod cells;
+pub mod space;
+pub use cells::{Closure, Obj, OBJ_INLINE};
+use cells::*;
+use space::{BornBuf, Old, Young};
+
 /// Heap reference payload: today an index into one of the realm heap's
 /// arenas, carried in the low 48 bits of a `Value` so an address fits
 /// the same slot later.
@@ -213,10 +219,10 @@ impl Value {
                 1 => Kind::Undefined,
                 2 => Kind::Bool(false),
                 3 => Kind::Bool(true),
-                _ => {
-                    debug_assert!(p >= FOREIGN_BASE);
-                    Kind::Foreign(p - FOREIGN_BASE)
-                }
+                // the JIT/TDZ sentinels (4..8) are opaque: no edges, and
+                // display/typeof treat them as undefined
+                p if p < FOREIGN_BASE => Kind::Undefined,
+                _ => Kind::Foreign(p - FOREIGN_BASE),
             },
             TAG_STR => Kind::Str(p),
             TAG_OBJ => Kind::Object(p),
@@ -280,14 +286,6 @@ pub enum Foreign {
     Handle(&'static str, Arc<dyn std::any::Any + Send + Sync>),
     /// Cleared by the sweep; slot on the free list.
     Free,
-}
-
-#[derive(Debug)]
-pub struct Closure {
-    pub proto: Arc<FunctionProto>,
-    /// Captured environment per proto.upvals: `Value::cell(r)` for
-    /// mutable captures, the captured value itself for immutable ones.
-    pub upvals: Vec<Value>,
 }
 
 /// Hidden class: objects with the same field history share one shape.
@@ -472,114 +470,6 @@ impl ShapeData {
     }
 }
 
-/// Inline value slots per object; fields beyond this spill to `overflow`.
-/// 3 keeps Obj at exactly 64 bytes (pow2 arena stride: the JIT indexes
-/// with one shifted add instead of a mul). Bump only with re-measurement.
-pub const OBJ_INLINE: usize = 3;
-
-/// Object = shared shape + value slots. The first OBJ_INLINE values live
-/// inline in the arena slot (no second allocation, no pointer chase on
-/// reads); rare bigger objects spill to `overflow`. repr(C) so the JIT
-/// reads fields at compile-time offsets.
-#[repr(C)]
-#[derive(Debug)]
-pub struct Obj {
-    pub shape: &'static ShapeData,
-    /// Number of populated value slots (== shape.fields.len()).
-    pub vlen: u32,
-    pub inline: [Value; OBJ_INLINE],
-    pub overflow: Vec<Value>,
-}
-
-impl Default for Obj {
-    fn default() -> Self {
-        Obj {
-            shape: empty_shape(),
-            vlen: 0,
-            inline: [Value::UNDEFINED; OBJ_INLINE],
-            overflow: Vec::new(),
-        }
-    }
-}
-
-impl Obj {
-    #[inline(always)]
-    pub fn vlen(&self) -> usize {
-        self.vlen as usize
-    }
-    #[inline(always)]
-    pub fn val(&self, i: usize) -> Value {
-        if i < OBJ_INLINE {
-            self.inline[i]
-        } else {
-            self.overflow[i - OBJ_INLINE]
-        }
-    }
-    #[inline(always)]
-    pub fn set_val(&mut self, i: usize, v: Value) {
-        if i < OBJ_INLINE {
-            self.inline[i] = v;
-        } else {
-            self.overflow[i - OBJ_INLINE] = v;
-        }
-    }
-    /// Field store that keeps the shape's representation honest. Every
-    /// mutator-side write goes through here; `set_val` is for the GC,
-    /// which only moves values.
-    #[inline(always)]
-    pub fn store(&mut self, i: usize, v: Value) {
-        self.shape.widen(i, Repr::of(v));
-        self.set_val(i, v);
-    }
-    #[inline(always)]
-    pub fn push_val(&mut self, v: Value) {
-        let i = self.vlen as usize;
-        self.shape.widen(i, Repr::of(v));
-        if i < OBJ_INLINE {
-            self.inline[i] = v;
-        } else {
-            self.overflow.push(v);
-        }
-        self.vlen += 1;
-    }
-    #[inline(always)]
-    pub fn extend_vals(&mut self, vals: &[Value]) {
-        for (k, &v) in vals.iter().enumerate() {
-            self.shape.widen(self.vlen as usize + k, Repr::of(v));
-        }
-        let n_inline = vals.len().min(OBJ_INLINE);
-        self.inline[..n_inline].copy_from_slice(&vals[..n_inline]);
-        if vals.len() > OBJ_INLINE {
-            self.overflow.extend_from_slice(&vals[OBJ_INLINE..]);
-        }
-        self.vlen += vals.len() as u32;
-    }
-    /// Reset value storage (keeps overflow capacity for reuse).
-    #[inline(always)]
-    pub fn clear_vals(&mut self) {
-        self.vlen = 0;
-        self.overflow.clear();
-    }
-    pub fn get(&self, name: &str) -> Option<Value> {
-        self.shape.slot_of(name).map(|i| self.val(i))
-    }
-    pub fn set(&mut self, name: Arc<str>, v: Value) {
-        match self.shape.slot_of(&name) {
-            Some(i) => self.store(i, v),
-            None => {
-                let prev = self.shape;
-                self.shape = self.shape.with_field(name);
-                self.shape.absorb(prev);
-                self.push_val(v);
-            }
-        }
-    }
-    /// (name, value) pairs in slot order.
-    pub fn entries(&self) -> impl Iterator<Item = (&Arc<str>, Value)> {
-        self.shape.fields.iter().zip((0..self.vlen()).map(|i| self.val(i)))
-    }
-}
-
 /// Growable bitmap (1 bit per arena slot).
 #[derive(Default)]
 pub struct Bitmap(Vec<u64>);
@@ -618,32 +508,25 @@ impl Bitmap {
     }
 }
 
-/// Reusable GC scratch: mark vectors, minor-mark bitmaps, and the trace
-/// worklist. Lives on the heap so a collection never allocates
-/// proportionally to arena size (a major used to malloc six full-length
-/// Vec<bool>s per run).
+/// Reusable GC scratch: mark vectors for the arena kinds (strings,
+/// foreigns), the trace worklist, and the minor's scan queue. Lives on
+/// the heap so a collection never allocates proportionally to heap size.
 #[derive(Default)]
 pub struct GcScratch {
     pub strs: Vec<bool>,
-    pub objs: Vec<bool>,
-    pub arrs: Vec<bool>,
-    pub closures: Vec<bool>,
-    pub cells: Vec<bool>,
     pub foreigns: Vec<bool>,
     pub ystrs: Bitmap,
-    pub yobjs: Bitmap,
-    pub yarrs: Bitmap,
-    pub yclosures: Bitmap,
-    pub ycells: Bitmap,
     pub yforeigns: Bitmap,
     pub work: Vec<Value>,
-    // evacuation state (copying nursery): forwarding tables per moving
-    // kind (u32::MAX = unforwarded) and the Cheney scan queue, packed as
-    // (kind << 32) | old_ref
-    pub fwd_objs: Vec<u32>,
-    pub fwd_arrs: Vec<u32>,
+    /// Forwarding table for nursery strings (u32::MAX = unforwarded).
     pub fwd_strs: Vec<u32>,
-    pub scan: Vec<u64>,
+    /// Cells whose edges still need forwarding (addresses; foreigns as
+    /// `Value::foreign` bits in `scan_foreign`).
+    pub scan: Vec<Ref>,
+    pub scan_foreign: Vec<Ref>,
+    /// `promoted_bytes_since_major` at the end of the last minor, so the
+    /// pretenure policy can see what this minor alone copied.
+    pub evac_base: usize,
 }
 
 /// Per-arena generational state: age bits, barrier dirty bits, and the log
@@ -783,10 +666,9 @@ impl HStr {
 
 }
 
-/// Young-generation tag: bit 31 of an obj/arr/str Value payload. Young
-/// refs index the nursery arenas; minor GC evacuates survivors into the
-/// old arenas and rewrites every reachable edge. Closures/cells/foreigns
-/// never carry it (non-moving kinds).
+/// Young-generation tag for string refs: bit 31 of the payload indexes
+/// `nursery.strs`; minor GC evacuates survivors into `strs`. Objects and
+/// arrays are young by address (`Heap::young`).
 pub const YOUNG_BIT: u64 = 1 << 31;
 
 #[inline(always)]
@@ -794,16 +676,12 @@ pub fn is_young(r: Ref) -> bool {
     r & YOUNG_BIT != 0
 }
 
-/// Bump-allocated nursery for obj/arr/str. Allocation is a push; minor GC
-/// evacuates the live survivors and truncates. Backing buffers of dead
-/// slots are harvested into the reuse pools before truncation.
+/// Young strings: a push-allocated arena; minor GC evacuates survivors
+/// into `strs` and truncates. (Objects and arrays live in `Heap::young`.)
 #[derive(Default)]
 pub struct Nursery {
-    pub objs: Vec<Obj>,
-    pub arrs: Vec<Vec<Value>>,
     pub strs: Vec<HStr>,
-    /// Approximate bytes allocated in the nursery this window (arrays and
-    /// strings count their contents — slot counts under-estimate growth).
+    /// Approximate string bytes allocated this window.
     pub bytes: usize,
 }
 
@@ -822,28 +700,30 @@ pub struct Heap {
     /// so running it at every GC would re-copy a growing accumulator each
     /// cycle — O(n²) again. Doubling makes it amortized O(1) per node.
     rope_live: usize,
-    pub objs: Vec<Obj>,
-    pub arrs: Vec<Vec<Value>>,
-    pub closures: Vec<Closure>,
-    pub cells: Vec<Value>,
     pub foreigns: Vec<Foreign>,
     // free lists rebuilt by the sweep (tsr-gc); alloc reuses them.
-    // ponytail: non-moving collector — no compaction, refs stay stable
     pub free_strs: Vec<u32>,
-    pub free_objs: Vec<u32>,
-    pub free_arrs: Vec<u32>,
-    pub free_closures: Vec<u32>,
-    pub free_cells: Vec<u32>,
     pub free_foreigns: Vec<u32>,
     pub allocs_since_gc: usize,
     pub gc_threshold: usize,
-    // generational state (sticky in-place mark-sweep)
+    // generational state of the arena kinds (sticky in-place mark-sweep)
     pub gen_strs: GenState,
-    pub gen_objs: GenState,
-    pub gen_arrs: GenState,
-    pub gen_closures: GenState,
-    pub gen_cells: GenState,
     pub gen_foreigns: GenState,
+    /// Bump nursery for objects, arrays and element chunks.
+    pub young: Young,
+    /// Old space: promoted cells, closures, cells, pretenured allocations.
+    pub old: Old,
+    /// Old-space cells allocated since the last minor (the young log of
+    /// the old space): scanned as roots by the next minor, which ages the
+    /// reachable ones and frees the rest.
+    pub born_old: Vec<Value>,
+    /// Old-space element chunks allocated since the last minor (reached
+    /// through their owner; listed so a dead owner's chunk is freed too).
+    pub born_elems: Vec<Ref>,
+    /// Boxed cells the JIT took off a free list since the last minor.
+    pub born_buf: BornBuf,
+    /// Last proto passed to `hold_proto` (see the free function).
+    held_last: usize,
     /// Old containers mutated since the last collection (write barrier log).
     pub remembered: Vec<Value>,
     pub promoted_since_major: usize,
@@ -869,64 +749,50 @@ pub struct Heap {
     /// while allocation goes old. TSC_PRETENURE=1 pins it on.
     pub pretenure: usize,
     pub pretenure_fixed: bool,
-    /// Minors left that may bulk-promote the young logs without tracing.
-    /// Set to 1 by a traced minor that measured >= 90% survival in
-    /// pretenure mode: the next minor keeps everything, the one after
-    /// traces again. Bounds the garbage kept to one young log's worth.
+    /// Minors left that may age the born log without tracing. Set to 1
+    /// by a traced minor that measured >= 90% survival in pretenure mode.
     pub pretenure_skip: u8,
-    /// [old data ptr, nursery data ptr] — contiguous so the JIT selects
-    /// an arena base with one shifted load on the young bit. Refreshed by
-    /// `refresh_bases()` at every point a data pointer can move.
-    pub obj_bases: [usize; 2],
-    pub arr_bases: [usize; 2],
-    /// Detached backing buffers harvested from dead nursery slots.
-    pub pool_arr_bufs: Vec<Vec<Value>>,
+    /// Detached string buffers harvested from dead nursery slots.
     pub pool_str_bufs: Vec<String>,
 }
 
 impl Default for Heap {
     fn default() -> Self {
+        let nursery_limit = std::env::var("TSC_NURSERY_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16 << 20); // 16MB: churn live-sets die in-nursery (measured)
         Heap {
             strs: Vec::new(),
             ropes: Vec::new(),
             rope_slots: Vec::new(),
             rope_live: 0,
-            objs: Vec::new(),
-            arrs: Vec::new(),
-            closures: Vec::new(),
-            cells: Vec::new(),
             foreigns: Vec::new(),
             free_strs: Vec::new(),
-            free_objs: Vec::new(),
-            free_arrs: Vec::new(),
-            free_closures: Vec::new(),
-            free_cells: Vec::new(),
             free_foreigns: Vec::new(),
             allocs_since_gc: 0,
             gc_threshold: 1 << 18, // 256k allocations between collections
             gen_strs: GenState::default(),
-            gen_objs: GenState::default(),
-            gen_arrs: GenState::default(),
-            gen_closures: GenState::default(),
-            gen_cells: GenState::default(),
             gen_foreigns: GenState::default(),
+            young: Young::new(nursery_limit),
+            old: Old::new(),
+            born_old: Vec::new(),
+            born_elems: Vec::new(),
+            // 64K entries: a full buffer triggers a minor, so this bounds how
+            // long the JIT recycles free cells before the log is swept
+            born_buf: BornBuf::new(64 << 10),
+            held_last: 0,
             remembered: Vec::new(),
             promoted_since_major: 0,
             promoted_bytes_since_major: 0,
             remembered_peak: 0,
             gc_scratch: GcScratch::default(),
             nursery: Nursery::default(),
-            nursery_limit: std::env::var("TSC_NURSERY_BYTES")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16 << 20), // 16MB: churn live-sets die in-nursery (measured)
+            nursery_limit,
             nursery_on: std::env::var_os("TSC_NO_NURSERY").is_none(),
             pretenure: std::env::var_os("TSC_PRETENURE").is_some() as usize,
             pretenure_fixed: std::env::var_os("TSC_PRETENURE").is_some(),
             pretenure_skip: 0,
-            obj_bases: [0; 2],
-            arr_bases: [0; 2],
-            pool_arr_bufs: Vec::new(),
             pool_str_bufs: Vec::new(),
         }
     }
@@ -942,7 +808,6 @@ macro_rules! alloc {
                 return r;
             }
             self.$field.push(v);
-            self.refresh_bases();
             let r = (self.$field.len() - 1) as Ref;
             self.$gen.on_alloc(r);
             r
@@ -971,7 +836,6 @@ macro_rules! alloc_moving {
                 return r;
             }
             self.$field.push(v);
-            self.refresh_bases();
             let r = (self.$field.len() - 1) as Ref;
             self.$gen.on_alloc(r);
             r
@@ -1004,34 +868,6 @@ impl Heap {
     /// Shared-constant string (refcount bump only).
     pub fn alloc_str(&mut self, s: Arc<str>) -> Ref {
         self.alloc_str_slot(HStr::Shared(s))
-    }
-
-    /// Closure allocation reusing a freed slot's upvals buffer.
-    /// Allocate a closure, reusing a freed slot. `proto` is borrowed: a
-    /// recycled slot usually already holds the same proto (closures of
-    /// one function churning), and skipping the swap avoids an Arc
-    /// increment + decrement per creation — measurable when a hot loop
-    /// builds thousands of closures.
-    pub fn alloc_closure_reuse(
-        &mut self,
-        proto: &Arc<FunctionProto>,
-        upvals: &[Value],
-    ) -> Ref {
-        self.allocs_since_gc += 1;
-        if let Some(r) = self.free_closures.pop().map(|r| r as Ref) {
-            let c = &mut self.closures[r as usize];
-            if !Arc::ptr_eq(&c.proto, proto) {
-                c.proto = proto.clone();
-            }
-            debug_assert!(c.upvals.is_empty()); // sweep pre-clears
-            c.upvals.extend_from_slice(upvals);
-            self.gen_closures.on_alloc(r);
-            return r;
-        }
-        self.closures.push(Closure { proto: proto.clone(), upvals: upvals.to_vec() });
-        let r = (self.closures.len() - 1) as Ref;
-        self.gen_closures.on_alloc(r);
-        r
     }
 
     /// A scratch buffer from the reuse pool with room for `n` bytes.
@@ -1358,10 +1194,6 @@ impl Heap {
         self.gen_strs.on_alloc(r);
         r
     }
-    alloc_moving!(alloc_obj, obj, obj_mut, objs, free_objs, gen_objs, Obj);
-    alloc_moving!(alloc_arr, arr, arr_mut, arrs, free_arrs, gen_arrs, Vec<Value>);
-    alloc!(alloc_closure, closure, closure_mut, closures, free_closures, gen_closures, Closure);
-    alloc!(alloc_cell, cell, cell_mut, cells, free_cells, gen_cells, Value);
     alloc!(alloc_foreign, foreign, foreign_mut, foreigns, free_foreigns, gen_foreigns, Foreign);
 
     /// The only sanctioned way to free a foreign slot outside the sweep:
@@ -1371,45 +1203,6 @@ impl Heap {
         self.gen_foreigns.old.clear(r);
         self.gen_foreigns.dirty.clear(r);
         self.free_foreigns.push(r as u32);
-    }
-
-    // ---- write barriers: record old containers that gain new edges ----
-    // Container-only, dedup via dirty bit. Zero cost when the container is
-    // young (the common case in churn) — one bitmap test.
-
-    #[inline(always)]
-    pub fn barrier_obj(&mut self, r: Ref) {
-        if r & YOUNG_BIT != 0 {
-            return; // young containers are traced wholesale
-        }
-        if self.gen_objs.old.get(r) && !self.gen_objs.dirty.get(r) {
-            self.gen_objs.dirty.set(r);
-            self.remembered.push(Value::object(r));
-        }
-    }
-    #[inline(always)]
-    pub fn barrier_arr(&mut self, r: Ref) {
-        if r & YOUNG_BIT != 0 {
-            return; // young containers are traced wholesale
-        }
-        if self.gen_arrs.old.get(r) && !self.gen_arrs.dirty.get(r) {
-            self.gen_arrs.dirty.set(r);
-            self.remembered.push(Value::array(r));
-        }
-    }
-    #[inline(always)]
-    pub fn barrier_cell(&mut self, r: Ref) {
-        if self.gen_cells.old.get(r) && !self.gen_cells.dirty.get(r) {
-            self.gen_cells.dirty.set(r);
-            self.remembered.push(Value::cell(r));
-        }
-    }
-    #[inline(always)]
-    pub fn barrier_foreign(&mut self, r: Ref) {
-        if self.gen_foreigns.old.get(r) && !self.gen_foreigns.dirty.get(r) {
-            self.gen_foreigns.dirty.set(r);
-            self.remembered.push(Value::foreign(r));
-        }
     }
 
     pub fn alloc_promise(&mut self) -> Ref {
@@ -1433,9 +1226,6 @@ impl Heap {
         }
     }
 
-    /// Re-derive the JIT's arena base-pair tables. MUST be called after
-    /// any operation that can move an objs/arrs data pointer (Vec growth,
-    /// nursery take/restore) — compiled code reads these words directly.
     /// Allocate into the nursery? Off entirely (TSC_NO_NURSERY) or
     /// temporarily while pretenuring.
     #[inline(always)]
@@ -1443,217 +1233,15 @@ impl Heap {
         self.nursery_on && self.pretenure == 0
     }
 
-    #[inline(always)]
-    pub fn refresh_bases(&mut self) {
-        self.obj_bases = [
-            self.objs.as_ptr() as usize,
-            self.nursery.objs.as_ptr() as usize,
-        ];
-        self.arr_bases = [
-            self.arrs.as_ptr() as usize,
-            self.nursery.arrs.as_ptr() as usize,
-        ];
-    }
-
     pub fn needs_gc(&self) -> bool {
-        self.allocs_since_gc >= self.gc_threshold
-            || self.nursery.bytes + self.nursery.objs.len() * 72 >= self.nursery_limit
-    }
-
-    /// Allocate an empty array, reusing a freed slot's buffer when
-    /// possible (churn workloads would otherwise malloc per array).
-    pub fn alloc_arr_empty(&mut self, cap: usize) -> Ref {
-        if self.young_on() {
-            let b = self.young_arr_buf(cap);
-            return self.young_arr(b);
-        }
-        self.allocs_since_gc += 1;
-        if let Some(r) = self.free_arrs.pop().map(|r| r as Ref) {
-            // freed slots arrive pre-cleared (sweep clears + caps capacity)
-            debug_assert!(self.arrs[r as usize].is_empty());
-            self.gen_arrs.on_alloc(r);
-            return r;
-        }
-        // pooled buffer here too: pretenuring sends every array this way
-        let b = self.young_arr_buf(cap);
-        self.arrs.push(b);
-        self.refresh_bases();
-        let r = (self.arrs.len() - 1) as Ref;
-        self.gen_arrs.on_alloc(r);
-        r
-    }
-
-    /// Fused object literal: final shape + all values in one allocation.
-    pub fn alloc_obj_lit(&mut self, shape: &'static ShapeData, values: &[Value]) -> Ref {
-        if self.young_on() {
-            let mut o = Obj { shape, ..Obj::default() };
-            o.extend_vals(values);
-            return self.young_obj(o);
-        }
-        self.allocs_since_gc += 1;
-        if let Some(r) = self.free_objs.pop().map(|r| r as Ref) {
-            let o = &mut self.objs[r as usize];
-            debug_assert!(o.vlen == 0);
-            o.shape = shape;
-            o.extend_vals(values);
-            self.gen_objs.on_alloc(r);
-            return r;
-        }
-        let mut o = Obj { shape, ..Obj::default() };
-        o.extend_vals(values);
-        self.objs.push(o);
-        self.refresh_bases();
-        let r = (self.objs.len() - 1) as Ref;
-        self.gen_objs.on_alloc(r);
-        r
-    }
-
-    /// Fused array literal: contents in one allocation.
-    pub fn alloc_arr_lit(&mut self, values: &[Value]) -> Ref {
-        if self.young_on() {
-            let mut b = self.young_arr_buf(values.len());
-            b.extend_from_slice(values);
-            return self.young_arr(b);
-        }
-        self.allocs_since_gc += 1;
-        if let Some(r) = self.free_arrs.pop().map(|r| r as Ref) {
-            let v = &mut self.arrs[r as usize];
-            debug_assert!(v.is_empty());
-            v.extend_from_slice(values);
-            self.gen_arrs.on_alloc(r);
-            return r;
-        }
-        let mut b = self.young_arr_buf(values.len());
-        b.extend_from_slice(values);
-        self.arrs.push(b);
-        self.refresh_bases();
-        let r = (self.arrs.len() - 1) as Ref;
-        self.gen_arrs.on_alloc(r);
-        r
-    }
-
-    /// Allocate an empty object, reusing a freed slot's values buffer.
-    pub fn alloc_obj_empty(&mut self) -> Ref {
-        if self.young_on() {
-            return self.young_obj(Obj::default());
-        }
-        self.allocs_since_gc += 1;
-        if let Some(r) = self.free_objs.pop().map(|r| r as Ref) {
-            // freed slots arrive pre-cleared: sweep resets shape + values
-            debug_assert!(self.objs[r as usize].vlen == 0);
-            self.gen_objs.on_alloc(r);
-            return r;
-        }
-        self.objs.push(Obj::default());
-        self.refresh_bases();
-        let r = (self.objs.len() - 1) as Ref;
-        self.gen_objs.on_alloc(r);
-        r
-    }
-
-    // ---- nursery (young) allocation: bump push, no free-list, no young
-    // log; a minor GC evacuates survivors and truncates ----
-
-    #[inline]
-    fn young_obj(&mut self, o: Obj) -> Ref {
-        let i = self.nursery.objs.len();
-        assert!(i < YOUNG_BIT as usize, "nursery overflow");
-        // the 72 bytes of the slot itself are counted from objs.len() at
-        // the trigger, so the JIT template need not touch `bytes`
-        self.nursery.bytes += o.overflow.capacity() * 8;
-        self.nursery.objs.push(o);
-        self.refresh_bases();
-        i as Ref | YOUNG_BIT
-    }
-
-    #[inline]
-    fn young_arr(&mut self, v: Vec<Value>) -> Ref {
-        let i = self.nursery.arrs.len();
-        assert!(i < YOUNG_BIT as usize, "nursery overflow");
-        // ponytail: alloc-time capacity only; later growth undercounts,
-        // allocs_since_gc backstops the trigger
-        self.nursery.bytes += 32 + v.capacity() * 8;
-        self.nursery.arrs.push(v);
-        self.refresh_bases();
-        i as Ref | YOUNG_BIT
-    }
-
-    #[inline]
-    fn young_str(&mut self, s: HStr) -> Ref {
-        let i = self.nursery.strs.len();
-        assert!(i < YOUNG_BIT as usize, "nursery overflow");
-        self.nursery.bytes += 24 + s.byte_len();
-        self.nursery.strs.push(s);
-        i as Ref | YOUNG_BIT
-    }
-
-    /// Recycled Vec for a young array (pool from evacuation harvest).
-    /// A recycled backing buffer with room for `cap` values.
-    ///
-    /// Pops until one is actually big enough. Putting a too-small buffer
-    /// back and allocating instead — which is what this did — leaves that
-    /// buffer at the top of the pool, so it is drawn and rejected again on
-    /// every call and the pool never makes progress: one undersized entry
-    /// sends every array literal to the allocator. Same shape as the
-    /// string pool, which had the same defect.
-    fn young_arr_buf(&mut self, cap: usize) -> Vec<Value> {
-        while let Some(b) = self.pool_arr_bufs.pop() {
-            if b.capacity() >= cap {
-                return b;
-            }
-        }
-        Vec::with_capacity(cap.max(4))
-    }
-
-    // ---- promotion: evacuation target in the old arenas. Sets the old
-    // bit and skips the young log — the existing alloc path would clear
-    // the old bit and barriers would stop firing (dangling refs) ----
-
-    pub fn promote_obj(&mut self, o: Obj) -> Ref {
-        self.promoted_bytes_since_major += 72 + o.overflow.len() * 8;
-        let r = match self.free_objs.pop().map(|r| r as Ref) {
-            Some(r) => {
-                let old = std::mem::replace(&mut self.objs[r as usize], o);
-                // the freed slot kept its overflow buffer — recycle it
-                if old.overflow.capacity() > 0 && self.pool_arr_bufs.len() < BUF_POOL_CAP {
-                    let mut b = old.overflow;
-                    b.clear();
-                    self.pool_arr_bufs.push(b);
-                }
-                r
-            }
-            None => {
-                // no refresh_bases: promotion only runs inside a collection,
-                // which refreshes once after the nursery is reattached
-                self.objs.push(o);
-                (self.objs.len() - 1) as Ref
-            }
-        };
-        self.gen_objs.old.set(r);
-        self.promoted_since_major += 1;
-        r
-    }
-
-    pub fn promote_arr(&mut self, v: Vec<Value>) -> Ref {
-        self.promoted_bytes_since_major += 32 + v.len() * 8;
-        let r = match self.free_arrs.pop().map(|r| r as Ref) {
-            Some(r) => {
-                let old = std::mem::replace(&mut self.arrs[r as usize], v);
-                if old.capacity() > 0 && self.pool_arr_bufs.len() < BUF_POOL_CAP {
-                    let mut b = old;
-                    b.clear();
-                    self.pool_arr_bufs.push(b);
-                }
-                r
-            }
-            None => {
-                self.arrs.push(v);
-                (self.arrs.len() - 1) as Ref
-            }
-        };
-        self.gen_arrs.old.set(r);
-        self.promoted_since_major += 1;
-        r
+        self.young.top >= self.young.limit
+            || self.allocs_since_gc >= self.gc_threshold
+            || self.nursery.bytes >= self.nursery_limit
+            // old-space allocation (pretenure, closures, cells) collects on a
+            // quarter of the nursery budget: those cells are swept in place,
+            // so a shorter cycle costs little and bounds the garbage held
+            || self.old.bytes_since_minor() >= self.nursery_limit / 4
+            || self.born_buf.is_full()
     }
 
     pub fn promote_str(&mut self, s: HStr) -> Ref {
@@ -1681,6 +1269,362 @@ impl Heap {
             self.rope_slots.push(r);
         }
         r
+    }
+}
+
+
+// ---- bump-heap cells: objects, arrays, element chunks, closures, cells ----
+impl Heap {
+    #[inline]
+    fn young_str(&mut self, s: HStr) -> Ref {
+        let i = self.nursery.strs.len();
+        assert!(i < YOUNG_BIT as usize, "nursery overflow");
+        self.nursery.bytes += 24 + s.byte_len();
+        self.nursery.strs.push(s);
+        i as Ref | YOUNG_BIT
+    }
+
+    /// Is this obj/arr/elems address in the nursery?
+    #[inline(always)]
+    pub fn young(&self, a: Ref) -> bool {
+        self.young.contains(a)
+    }
+
+    /// Old-space allocation for the kinds that never move (closures,
+    /// cells) and for pretenured / large cells. A bump-allocated cell is
+    /// in the born range the minor walks; a free-list cell is logged in
+    /// `born_old` / `born_elems` (`log` builds the entry).
+    #[inline(always)]
+    fn alloc_old_cell(&mut self, kind: u64, words: usize, len: usize) -> Ref {
+        self.allocs_since_gc += 1;
+        let a = self.old.alloc(words);
+        set_meta(a, meta(kind, words, len));
+        if !self.old.in_born_range(a) {
+            if kind == K_ELEMS {
+                self.born_elems.push(a);
+            } else {
+                self.born_old.push(Value::tagged(cell_tag(kind), a));
+            }
+        }
+        a
+    }
+
+    /// Element chunk with room for `cap` values, in the generation of
+    /// its owner (`young_owner`). Big chunks go old outright: copying
+    /// them out of the nursery would dominate a minor.
+    fn alloc_elems(&mut self, cap: usize, young_owner: bool) -> Ref {
+        let cap = cap.max(1);
+        let words = 1 + cap;
+        let e = if young_owner && cap <= ELEMS_YOUNG_MAX {
+            let a = self.young.alloc(words);
+            set_meta(a, meta(K_ELEMS, words, cap));
+            a
+        } else {
+            let a = self.alloc_old_cell(K_ELEMS, words, cap);
+            a
+        };
+        // slack past the live length is never read, but zero it anyway so
+        // a debug walk never trips on stale bits
+        elems_slice_mut(e, cap).fill(Value::UNDEFINED);
+        e
+    }
+
+    // ---- objects ----
+
+    #[inline(always)]
+    pub fn obj(&self, r: Ref) -> &Obj {
+        debug_assert_eq!(kind_of(meta_at(r)), K_OBJ);
+        unsafe { &*(r as *const Obj) }
+    }
+    #[inline(always)]
+    pub fn obj_mut(&mut self, r: Ref) -> &mut Obj {
+        debug_assert_eq!(kind_of(meta_at(r)), K_OBJ);
+        unsafe { &mut *(r as *mut Obj) }
+    }
+
+    /// Allocate an empty object.
+    pub fn alloc_obj_empty(&mut self) -> Ref {
+        let a = if self.young_on() {
+            let a = self.young.alloc(OBJ_WORDS);
+            set_meta(a, meta(K_OBJ, OBJ_WORDS, 0));
+            a
+        } else {
+            let a = self.alloc_old_cell(K_OBJ, OBJ_WORDS, 0);
+            a
+        };
+        let o = unsafe { &mut *(a as *mut Obj) };
+        o.shape = empty_shape();
+        o.inline = [Value::UNDEFINED; OBJ_INLINE];
+        o.spill = 0;
+        a
+    }
+
+    /// Host-built object: old space, so Rust code may hold the ref across
+    /// safepoints (module namespaces, native handles, rehydrated values).
+    /// The v1 arena put every Rust-built object there too.
+    pub fn alloc_obj_host(&mut self) -> Ref {
+        let a = self.alloc_old_cell(K_OBJ, OBJ_WORDS, 0);
+        let o = unsafe { &mut *(a as *mut Obj) };
+        o.shape = empty_shape();
+        o.inline = [Value::UNDEFINED; OBJ_INLINE];
+        o.spill = 0;
+        a
+    }
+    /// Host-built array (see `alloc_obj_host`).
+    pub fn alloc_arr_host(&mut self, values: &[Value]) -> Ref {
+        let a = self.alloc_old_cell(K_ARR, ARR_WORDS, 0);
+        let e = self.alloc_elems(values.len().max(4), false);
+        set_word(a, 1, e);
+        elems_slice_mut(e, values.len()).copy_from_slice(values);
+        set_meta(a, with_len(meta_at(a), values.len()));
+        a
+    }
+
+    /// Fused object literal: final shape + all values in one allocation.
+    pub fn alloc_obj_lit(&mut self, shape: &'static ShapeData, values: &[Value]) -> Ref {
+        debug_assert_eq!(shape.fields.len(), values.len());
+        let a = self.alloc_obj_empty();
+        for (i, &v) in values.iter().enumerate() {
+            shape.widen(i, Repr::of(v));
+        }
+        let n_inline = values.len().min(OBJ_INLINE);
+        let spill = if values.len() > OBJ_INLINE {
+            let young = self.young(a);
+            let e = self.alloc_elems(values.len() - OBJ_INLINE, young);
+            elems_slice_mut(e, values.len() - OBJ_INLINE).copy_from_slice(&values[OBJ_INLINE..]);
+            e
+        } else {
+            0
+        };
+        let o = unsafe { &mut *(a as *mut Obj) };
+        o.shape = shape;
+        o.inline[..n_inline].copy_from_slice(&values[..n_inline]);
+        o.spill = spill;
+        o.meta = with_len(o.meta, values.len());
+        a
+    }
+
+    /// Append a value slot (the shape already has the field).
+    pub fn obj_push_val(&mut self, r: Ref, v: Value) {
+        let i = self.obj(r).vlen();
+        self.obj(r).shape.widen(i, Repr::of(v));
+        if i < OBJ_INLINE {
+            let o = self.obj_mut(r);
+            o.inline[i] = v;
+            o.meta = with_len(o.meta, i + 1);
+            return;
+        }
+        let k = i - OBJ_INLINE;
+        if k >= self.obj(r).spill_cap() {
+            let young = self.young(r);
+            let e = self.alloc_elems((k + 1).max(4).next_power_of_two(), young);
+            let old = self.obj(r).spill;
+            if old != 0 {
+                elems_slice_mut(e, k).copy_from_slice(elems_slice(old, k));
+            }
+            self.obj_mut(r).spill = e;
+        }
+        let o = self.obj_mut(r);
+        elems_slice_mut(o.spill, k + 1)[k] = v;
+        o.meta = with_len(o.meta, i + 1);
+    }
+
+    /// Named store: existing slot, or a shape transition + new slot.
+    pub fn obj_set(&mut self, r: Ref, name: Arc<str>, v: Value) {
+        match self.obj(r).shape.slot_of(&name) {
+            Some(i) => self.obj_mut(r).store(i, v),
+            None => {
+                let prev = self.obj(r).shape;
+                let next = prev.with_field(name);
+                next.absorb(prev);
+                self.obj_mut(r).shape = next;
+                self.obj_push_val(r, v);
+            }
+        }
+    }
+
+    // ---- arrays ----
+
+    #[inline(always)]
+    pub fn arr(&self, r: Ref) -> &[Value] {
+        debug_assert_eq!(kind_of(meta_at(r)), K_ARR);
+        elems_slice(word(r, 1), len_of(meta_at(r)))
+    }
+    #[inline(always)]
+    pub fn arr_mut(&mut self, r: Ref) -> &mut [Value] {
+        debug_assert_eq!(kind_of(meta_at(r)), K_ARR);
+        elems_slice_mut(word(r, 1), len_of(meta_at(r)))
+    }
+    #[inline(always)]
+    pub fn arr_len(&self, r: Ref) -> usize {
+        len_of(meta_at(r))
+    }
+
+    /// Empty array with room for `cap`.
+    pub fn alloc_arr_empty(&mut self, cap: usize) -> Ref {
+        let young = self.young_on();
+        let a = if young {
+            let a = self.young.alloc(ARR_WORDS);
+            set_meta(a, meta(K_ARR, ARR_WORDS, 0));
+            a
+        } else {
+            let a = self.alloc_old_cell(K_ARR, ARR_WORDS, 0);
+            a
+        };
+        let e = self.alloc_elems(cap.max(4), young);
+        set_word(a, 1, e);
+        a
+    }
+
+    /// Fused array literal: contents in one allocation.
+    pub fn alloc_arr_lit(&mut self, values: &[Value]) -> Ref {
+        let a = self.alloc_arr_empty(values.len());
+        elems_slice_mut(word(a, 1), values.len()).copy_from_slice(values);
+        set_meta(a, with_len(meta_at(a), values.len()));
+        a
+    }
+
+    pub fn arr_push(&mut self, r: Ref, v: Value) {
+        let n = len_of(meta_at(r));
+        let e = word(r, 1);
+        let e = if n >= elems_cap(e) {
+            let young = self.young(r);
+            let ne = self.alloc_elems(n * 2, young);
+            elems_slice_mut(ne, n).copy_from_slice(elems_slice(e, n));
+            set_word(r, 1, ne);
+            ne
+        } else {
+            e
+        };
+        elems_slice_mut(e, n + 1)[n] = v;
+        set_meta(r, with_len(meta_at(r), n + 1));
+    }
+
+    /// Truncate or extend (with undefined) to `len`.
+    pub fn arr_set_len(&mut self, r: Ref, len: usize) {
+        while len_of(meta_at(r)) < len {
+            self.arr_push(r, Value::UNDEFINED);
+        }
+        set_meta(r, with_len(meta_at(r), len));
+    }
+
+    // ---- closures and cells: old space, never move ----
+
+    #[inline(always)]
+    pub fn closure(&self, r: Ref) -> &Closure {
+        debug_assert_eq!(kind_of(meta_at(r)), K_CLOSURE);
+        unsafe { &*(r as *const Closure) }
+    }
+    #[inline(always)]
+    pub fn closure_mut(&mut self, r: Ref) -> &mut Closure {
+        unsafe { &mut *(r as *mut Closure) }
+    }
+
+    pub fn alloc_closure(&mut self, proto: &Arc<FunctionProto>, upvals: &[Value]) -> Ref {
+        self.hold_proto(proto);
+        let a = self.alloc_old_cell(K_CLOSURE, 2 + upvals.len(), upvals.len());
+        set_word(a, 1, Arc::as_ptr(proto) as u64);
+        self.closure_mut(a).upvals_mut().copy_from_slice(upvals);
+        a
+    }
+
+    /// `hold_proto` with a one-entry cache: closures made in a loop
+    /// share one proto.
+    #[inline]
+    pub fn hold_proto(&mut self, proto: &Arc<FunctionProto>) {
+        let p = Arc::as_ptr(proto) as usize;
+        if p == self.held_last {
+            return;
+        }
+        self.held_last = p;
+        hold_proto(proto);
+    }
+
+    #[inline(always)]
+    pub fn cell(&self, r: Ref) -> &Value {
+        debug_assert_eq!(kind_of(meta_at(r)), K_CELL);
+        unsafe { &*((r as *const Value).add(1)) }
+    }
+    #[inline(always)]
+    pub fn cell_mut(&mut self, r: Ref) -> &mut Value {
+        debug_assert_eq!(kind_of(meta_at(r)), K_CELL);
+        unsafe { &mut *((r as *mut Value).add(1)) }
+    }
+    pub fn alloc_cell(&mut self, v: Value) -> Ref {
+        let a = self.alloc_old_cell(K_CELL, CELL_WORDS, 0);
+        set_word(a, 1, v.0);
+        a
+    }
+
+    // ---- write barriers: record aged containers that gain new edges ----
+    // Container-only, dedup via the dirty bit. Young containers are traced
+    // wholesale; born-old ones are on the born log already.
+
+    #[inline(always)]
+    fn barrier(&mut self, a: Ref, log: Value) {
+        let m = meta_at(a);
+        if m & (M_AGED | M_DIRTY) == M_AGED {
+            set_meta(a, m | M_DIRTY);
+            self.remembered.push(log);
+        }
+    }
+    #[inline(always)]
+    pub fn barrier_obj(&mut self, r: Ref) {
+        if !self.young(r) {
+            self.barrier(r, Value::object(r));
+        }
+    }
+    #[inline(always)]
+    pub fn barrier_arr(&mut self, r: Ref) {
+        if !self.young(r) {
+            self.barrier(r, Value::array(r));
+        }
+    }
+    #[inline(always)]
+    pub fn barrier_cell(&mut self, r: Ref) {
+        self.barrier(r, Value::cell(r));
+    }
+    #[inline(always)]
+    pub fn barrier_foreign(&mut self, r: Ref) {
+        if self.gen_foreigns.old.get(r) && !self.gen_foreigns.dirty.get(r) {
+            self.gen_foreigns.dirty.set(r);
+            self.remembered.push(Value::foreign(r));
+        }
+    }
+
+    /// Cells in use: old-space bytes plus the nursery, for stats.
+    pub fn cell_bytes(&self) -> usize {
+        self.old.allocated_bytes() + self.young.used()
+    }
+}
+
+/// Element chunks up to this many values are nursery-allocated with
+/// their owner; larger ones go straight to old space.
+pub const ELEMS_YOUNG_MAX: usize = 512;
+
+/// Value tag for a cell kind.
+#[inline(always)]
+fn cell_tag(kind: u64) -> u64 {
+    match kind {
+        K_OBJ => TAG_OBJ,
+        K_ARR => TAG_ARR,
+        K_CLOSURE => TAG_CLOSURE,
+        K_CELL => TAG_CELL,
+        _ => unreachable!("no Value tag for cell kind {kind}"),
+    }
+}
+
+/// Keep a proto alive for the rest of the process. Closures store a raw
+/// proto pointer; the module tree normally owns the target, but a
+/// dynamically imported program drops its tree, and compiled code is
+/// shared by every realm. Process-global so every heap is covered.
+pub fn hold_proto(proto: &Arc<FunctionProto>) {
+    type Held = std::sync::Mutex<(std::collections::HashSet<usize>, Vec<Arc<FunctionProto>>)>;
+    static HELD: std::sync::OnceLock<Held> = std::sync::OnceLock::new();
+    let p = Arc::as_ptr(proto) as usize;
+    let mut h = HELD.get_or_init(Default::default).lock().unwrap();
+    if h.0.insert(p) {
+        h.1.push(proto.clone());
     }
 }
 
