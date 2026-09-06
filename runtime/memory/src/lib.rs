@@ -1451,7 +1451,7 @@ impl Heap {
 
     pub fn needs_gc(&self) -> bool {
         self.allocs_since_gc >= self.gc_threshold
-            || self.nursery.bytes >= self.nursery_limit
+            || self.nursery.bytes + self.nursery.objs.len() * 72 >= self.nursery_limit
     }
 
     /// Allocate an empty array, reusing a freed slot's buffer when
@@ -1552,7 +1552,9 @@ impl Heap {
     fn young_obj(&mut self, o: Obj) -> Ref {
         let i = self.nursery.objs.len();
         assert!(i < YOUNG_BIT as usize, "nursery overflow");
-        self.nursery.bytes += 72 + o.overflow.capacity() * 8;
+        // the 72 bytes of the slot itself are counted from objs.len() at
+        // the trigger, so the JIT template need not touch `bytes`
+        self.nursery.bytes += o.overflow.capacity() * 8;
         self.nursery.objs.push(o);
         self.refresh_bases();
         i as Ref | YOUNG_BIT

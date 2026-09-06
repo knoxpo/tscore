@@ -454,15 +454,17 @@ impl C {
             }
             self.a.str_imm(9, at, o.obj_inline + i as u32 * 8);
         }
-        if (sn as usize) < 3 {
-            self.a.mov_imm64(9, Value::UNDEFINED.bits());
-            for i in sn..3 {
-                self.a.str_imm(9, at, o.obj_inline + i as u32 * 8);
-            }
-        }
+        // slots past vlen are never read (every reader bounds on vlen and
+        // a later add writes before it bumps), so no pads. The empty
+        // overflow Vec is two zero words and a dangling pointer: the zero
+        // register stores the zeros.
         for (i, &w) in o.empty_vec_words.iter().enumerate() {
-            self.a.mov_imm64(9, w);
-            self.a.str_imm(9, at, o.obj_overflow + i as u32 * 8);
+            if w == 0 {
+                self.a.str_imm(31, at, o.obj_overflow + i as u32 * 8); // xzr
+            } else {
+                self.a.mov_imm64(9, w);
+                self.a.str_imm(9, at, o.obj_overflow + i as u32 * 8);
+            }
         }
     }
 
@@ -611,9 +613,7 @@ impl C {
             c.store_obj_lit(13, shape_ptr, sn, first, checks, slow, o);
             c.a.add_imm(14, 10, 1);
             c.a.str_imm(14, R_REALM, o.nursery_objs_len);
-            c.a.ldr_imm(14, R_REALM, o.nursery_bytes_off);
-            c.a.add_imm(14, 14, 72);
-            c.a.str_imm(14, R_REALM, o.nursery_bytes_off);
+            // no nursery.bytes update: the trigger counts objs.len() * 72
             // result: TAG_OBJ | YOUNG_BIT | index
             c.a.mov_imm64(9, (0xFFFBu64 << 48) | 0x8000_0000);
             c.a.orr_reg(9, 9, 10);
@@ -655,7 +655,7 @@ impl C {
             c.a.mov_imm64(2, first as u64);
             c.a.mov_imm64(3, sn as u64);
             c.a.mov_imm64(4, shape_ptr);
-            c.thin(c.helpers.new_object_lit2);
+            c.thin_keep_arrays(c.helpers.new_object_lit2);
             c.put_x(dst, 0);
             c.a.bind(done);
         } else {
@@ -670,7 +670,7 @@ impl C {
             c.a.mov_imm64(2, first as u64);
             c.a.mov_imm64(3, sn as u64);
             c.a.mov_imm64(4, shape_ptr);
-            c.thin(c.helpers.new_object_lit2);
+            c.thin_keep_arrays(c.helpers.new_object_lit2);
             c.put_x(dst, 0);
         }
     }
@@ -695,6 +695,20 @@ impl C {
         self.a.b_cond(Cond::Eq, self.bail);
         self.a.add_reg(R_SLOTS, 1, R_BASE);
         self.zero_cache();
+    }
+
+    /// `thin` for a helper that cannot touch the array arena (strings,
+    /// objects, cells, closures, globals — anything but arrs growth).
+    /// x22 is callee-saved and holds an array slot address that only an
+    /// arrs realloc can invalidate, so it survives; x15 is caller-saved
+    /// and must go.
+    fn thin_keep_arrays(&mut self, addr: usize) {
+        self.a.mov_imm64(8, addr as u64);
+        self.a.blr(8);
+        self.a.cmp_reg(0, R_SENTINEL);
+        self.a.b_cond(Cond::Eq, self.bail);
+        self.a.add_reg(R_SLOTS, 1, R_BASE);
+        self.a.movz(15, 0, 0);
     }
 
     /// Full interpreter semantics for instruction `pc` via h_step, with
@@ -1029,8 +1043,8 @@ pub fn compile(
             let prim = inherited.or_else(|| {
                 pbody.code[h..=e]
                     .iter()
-                    .find(|i| matches!(i.op, Op::Len | Op::GetIndex))
-                    .map(|i| i.b)
+                    .find(|i| matches!(i.op, Op::Len | Op::GetIndex | Op::ArrayPush | Op::SetIndex))
+                    .map(|i| if matches!(i.op, Op::ArrayPush | Op::SetIndex) { i.a } else { i.b })
                     .filter(|&a| !pbody.code[h..=e].iter().any(|i| writes_a_op(i.op) && i.a == a))
             });
             for p in h..=e {
@@ -1156,9 +1170,16 @@ pub fn compile(
         }
         // the array cache follows the same conservative set plus its own
         // arms; a back edge runs a safepoint, which can move the arena
+        // Compile-time: the cache survives any op whose fast path keeps
+        // x22 and whose slow path zeroes it at run time (the next reuse
+        // finds 0 and derives), and any helper that cannot grow the array
+        // arena (thin_keep_arrays). Only arrs growth moves a slot.
         let apreserves = match ins.op {
-            Op::Len | Op::GetIndex => true, // arms manage it
+            Op::Len | Op::GetIndex | Op::ArrayPush | Op::SetIndex | Op::NewArrayLit => true, // arms manage it
             Op::Jump => ins.sbx() >= 0,
+            Op::Concat | Op::LoadConst | Op::NewObjectLit | Op::NewObject | Op::Closure
+            | Op::NewCell | Op::LoadCell | Op::StoreCell | Op::GetUpval | Op::SetUpval
+            | Op::GetGlobal | Op::TypeOf | Op::Not => true,
             _ => preserves,
         };
         if !apreserves {
@@ -1925,7 +1946,7 @@ fn emit_op(
                 c.a.mov(0, R_REALM);
                 c.a.mov(1, R_PROTO);
                 c.a.mov_imm64(2, ins.bx() as u64);
-                c.thin(c.helpers.load_const);
+                c.thin_keep_arrays(c.helpers.load_const);
                 c.a.bind(done);
                 c.put_x(ins.a, 0);
             }
@@ -1934,7 +1955,7 @@ fn emit_op(
                 c.a.mov(0, R_REALM);
                 c.a.mov(1, R_PROTO);
                 c.a.mov_imm64(2, ins.bx() as u64);
-                c.thin(c.helpers.load_const);
+                c.thin_keep_arrays(c.helpers.load_const);
                 c.put_x(ins.a, 0);
             }
         },
@@ -2028,7 +2049,7 @@ fn emit_op(
                     c.a.mov_imm64(2, pc as u64);
                     c.fetch_x(ins.b, 3);
                     c.fetch_x(ins.c, 4);
-                    c.thin(c.helpers.add_slow);
+                    c.thin_keep_arrays(c.helpers.add_slow);
                     c.put_x(ins.a, 0);
                 } else {
                     c.step_full(pc);
@@ -2590,7 +2611,7 @@ fn emit_op(
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.b, 3);
             c.a.mov_imm64(4, ins.c as u64);
-            c.thin(c.helpers.get_field);
+            c.thin_keep_arrays(c.helpers.get_field);
             c.put_x(ins.a, 0);
             c.a.bind(done);
             if c.offsets.is_some() && ins.a != ins.b {
@@ -2729,7 +2750,7 @@ fn emit_op(
             c.fetch_x(ins.a, 3);
             c.a.mov_imm64(4, ins.b as u64);
             c.fetch_x(ins.c, 5);
-            c.thin(c.helpers.set_field);
+            c.thin_keep_arrays(c.helpers.set_field);
             c.a.bind(done);
             if c.offsets.is_some() {
                 *fcache = Some(ins.a);
@@ -2792,7 +2813,7 @@ fn emit_op(
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.b, 3);
             c.fetch_x(ins.c, 4);
-            c.thin(c.helpers.get_index);
+            c.thin_keep_arrays(c.helpers.get_index);
             c.put_x(ins.a, 0);
             c.a.bind(done);
         }
@@ -2907,7 +2928,7 @@ fn emit_op(
             c.a.mov(1, R_PROTO);
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.b, 3);
-            c.thin(c.helpers.len);
+            c.thin_keep_arrays(c.helpers.len);
             c.put_x(ins.a, 0);
             c.a.bind(done);
         }
@@ -2928,16 +2949,18 @@ fn emit_op(
                 // trigger, and a push that reuses existing capacity has not
                 // allocated. Growth still goes through the helper and still
                 // counts.
+                // young check needs the value; the slot address comes from
+                // the cache when this is the loop's primary array (the
+                // helper slow path zeroes x22, and growth keeps the slot)
                 c.fetch_x(ins.a, 8);
-                c.a.lsr_imm(10, 8, 48);
-                c.a.movz(11, 0xFFFC, 0); // TAG_ARR
-                c.a.cmp_reg(10, 11);
-                c.a.b_cond(Cond::Ne, slow);
                 c.a.ubfx32(13, 8, 31, 1); // YOUNG_BIT
                 c.a.cbz(13, slow); // old array -> helper (barrier)
-                c.a.orr_reg32(12, 31, 8);
-                c.arena_base(10, 12, o.arr_bases_off);
-                c.index_addr(10, 10, 12, o.arr_size);
+                let reuse = *acache == Some(ins.a) && c.int_lane;
+                let cache = c.acache_on && primary.is_none_or(|p| p == ins.a);
+                c.array_base(10, ins.a, o.arr_bases_off, o.arr_size, slow, reuse, cache);
+                if cache {
+                    *acache = Some(ins.a);
+                }
                 c.a.ldr_imm(13, 10, o.vec_len);
                 c.a.ldr_imm(14, 10, o.vec_cap);
                 c.a.cmp_reg(13, 14);
@@ -2963,7 +2986,7 @@ fn emit_op(
             c.a.mov(1, R_PROTO);
             c.a.mov_imm64(2, pc as u64);
             c.a.mov_imm64(3, ins.bx() as u64);
-            c.thin(c.helpers.get_global);
+            c.thin_keep_arrays(c.helpers.get_global);
             c.put_x(ins.a, 0);
         }
 
@@ -2995,7 +3018,7 @@ fn emit_op(
                     let cl = c.closure(1);
                     c.a.mov(1, cl);
                     c.a.mov_imm64(2, ins.b as u64);
-                    c.thin(c.helpers.get_upval);
+                    c.thin_keep_arrays(c.helpers.get_upval);
                     c.put_x(ins.a, 0);
                 }
             }
@@ -3006,14 +3029,14 @@ fn emit_op(
             c.a.mov(1, cl);
             c.a.mov_imm64(2, ins.a as u64);
             c.fetch_x(ins.b, 3);
-            c.thin(c.helpers.set_upval);
+            c.thin_keep_arrays(c.helpers.set_upval);
         }
         Op::LoadCell => {
             c.a.mov(0, R_REALM);
             c.a.mov(1, R_PROTO);
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.b, 3);
-            c.thin(c.helpers.load_cell);
+            c.thin_keep_arrays(c.helpers.load_cell);
             c.put_x(ins.a, 0);
         }
         Op::StoreCell => {
@@ -3022,11 +3045,11 @@ fn emit_op(
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.a, 3);
             c.fetch_x(ins.b, 4);
-            c.thin(c.helpers.store_cell);
+            c.thin_keep_arrays(c.helpers.store_cell);
         }
         Op::NewObject => {
             c.a.mov(0, R_REALM);
-            c.thin(c.helpers.new_object);
+            c.thin_keep_arrays(c.helpers.new_object);
             c.put_x(ins.a, 0);
         }
         Op::NewArray => {
@@ -3038,7 +3061,7 @@ fn emit_op(
         Op::NewCell => {
             c.a.mov(0, R_REALM);
             c.fetch_x(ins.a, 1);
-            c.thin(c.helpers.new_cell);
+            c.thin_keep_arrays(c.helpers.new_cell);
             c.put_x(ins.a, 0);
         }
         Op::NewObjectLit | Op::NewArrayLit => {
@@ -3061,7 +3084,23 @@ fn emit_op(
                     let classes = facts.lit_vals.get(pc).map(|v| v.as_slice()).unwrap_or(&[]);
                     (0..sn as usize)
                         .map(|j| {
+                            let v = ins.b + j as u8;
+                            // the loop's own int guard already proved it —
+                            // possibly for the vreg this one was just copied
+                            // from (the literal's operands are contiguous
+                            // copies of the values)
+                            let src = pbody.code[pc.saturating_sub(16)..pc]
+                                .iter()
+                                .rev()
+                                .find(|i| writes_a_op(i.op) && i.a == v)
+                                .and_then(|i| (i.op == Op::Move).then_some(i.b))
+                                .unwrap_or(v);
+                            let int_here = in_lane
+                                && [v, src].iter().any(|&r| {
+                                    c.lane == Some(r) || c.itmp == Some(r) || c.int_ok.contains(&r)
+                                });
                             (classes.get(j).copied().unwrap_or(2) == 1
+                                && !int_here
                                 && shape.repr(j) == tsr_memory::Repr::Int32) as u8
                         })
                         .collect()
@@ -3079,7 +3118,7 @@ fn emit_op(
                 c.a.mov(3, R_BASE);
                 c.a.mov_imm64(4, ins.b as u64);
                 c.a.mov_imm64(5, ins.c as u64);
-                c.thin(c.helpers.new_object_lit);
+                c.thin_keep_arrays(c.helpers.new_object_lit);
                 c.put_x(ins.a, 0);
             }
         }
@@ -3105,14 +3144,14 @@ fn emit_op(
             let cl = c.closure(4);
             c.a.mov(4, cl);
             c.a.mov_imm64(5, child as *const std::sync::Arc<FunctionProto> as u64);
-            c.thin(c.helpers.new_closure);
+            c.thin_keep_arrays(c.helpers.new_closure);
             c.put_x(ins.a, 0);
         }
         Op::Concat => {
             c.a.mov(0, R_REALM);
             c.fetch_x(ins.b, 1);
             c.fetch_x(ins.c, 2);
-            c.thin(c.helpers.concat);
+            c.thin_keep_arrays(c.helpers.concat);
             c.put_x(ins.a, 0);
         }
 
