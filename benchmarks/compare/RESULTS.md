@@ -92,6 +92,26 @@ processes serves every connection and the rest idle. Its row is a
 second bun x1 measurement, not a multi-core one. node's cluster
 distributes in userspace via the primary, and tscore's workers
 share one listener with a kqueue per thread; both scale here.
+
+The table is one sweep. Five further sweeps taken in a busier window
+(a VM and dev servers live) put the run-to-run spread at:
+
+| engine | min | max |
+|---|---|---|
+| tscore workers:1 | 133,058 | 137,499 |
+| tscore workers:8 | 149,100 | 158,257 |
+| bun x8 reusePort | 116,932 | 123,704 |
+| bun x1 | 114,633 | 121,755 |
+| node x1 | 86,141 | 91,651 |
+| node cluster x8 | 117,387 | 134,463 |
+
+Those runs are all lower than the table above, which is the expected
+direction: contention only ever costs throughput, so a quieter window
+reads higher and the best sweep is the one closest to what the engine
+can do. What matters is that the ordering held in every run — no engine
+changed places under load, so the per-core column is not an artefact of
+which moment the sweep landed in.
+
 ## Runtime surface
 
 | category | status |
