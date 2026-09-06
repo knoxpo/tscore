@@ -47,7 +47,8 @@ fn golden_outputs_match_at_all_worker_counts() {
         for workers in ["1", "4"] {
             let got = run(&entry_file, workers);
             assert_eq!(
-                got, expected,
+                got,
+                expected,
                 "{} diverged at --workers {workers}",
                 entry_file.display()
             );
@@ -96,7 +97,10 @@ fn runtime_error_has_span() {
 fn run_expect_fail(source: &str) -> String {
     let dir = std::env::temp_dir().join("tscore-golden");
     std::fs::create_dir_all(&dir).unwrap();
-    let f = dir.join(format!("m3-{:x}.ts", source.len() * 31 + source.as_bytes()[0] as usize));
+    let f = dir.join(format!(
+        "m3-{:x}.ts",
+        source.len() * 31 + source.as_bytes()[0] as usize
+    ));
     std::fs::write(&f, source).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_tscore"))
         .args(["run", f.to_str().unwrap()])
@@ -115,7 +119,10 @@ fn child_error_cancels_siblings_and_propagates() {
              scope.spawn(() => missingGlobal);\n\
          });\n",
     );
-    assert!(err.contains("task scope failed: missingGlobal is not defined"), "{err}");
+    assert!(
+        err.contains("task scope failed: missingGlobal is not defined"),
+        "{err}"
+    );
     // the spinning sibling was cancelled, not run to (never) completion
     assert!(start.elapsed().as_secs() < 10, "sibling was not cancelled");
 }

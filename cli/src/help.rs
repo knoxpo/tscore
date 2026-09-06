@@ -37,6 +37,7 @@ impl Style {
     pub fn for_stderr() -> Self {
         Self::new(std::io::stderr().is_terminal())
     }
+    #[cfg(test)]
     pub(crate) fn plain() -> Self {
         Style { on: false }
     }

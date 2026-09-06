@@ -169,7 +169,10 @@ fn expression_subset_error_defers_to_first_call() {
     assert!(!ok, "bad() should fail");
     // code before the first call ran
     assert_eq!(stdout, "RESULT 1\n");
-    assert!(stderr.contains("deferred-err.ts:2:"), "no span in: {stderr}");
+    assert!(
+        stderr.contains("deferred-err.ts:2:"),
+        "no span in: {stderr}"
+    );
     assert!(stderr.contains("not supported in M1"), "{stderr}");
     // eager mode reports the same error before anything runs
     let (ok_e, stdout_e, stderr_e) = run_with(&f, &[("TSC_NO_LAZY", "1")], "1");
