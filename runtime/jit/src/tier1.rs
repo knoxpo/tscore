@@ -134,6 +134,7 @@ pub struct HeapOffsets {
     pub objs_old_len: u32,
     pub objs_dirty_ptr: u32,
     pub objs_dirty_len: u32,
+    pub const_cache_ptr: u32,
     pub empty_vec_words: [u64; 3],
     pub obj_vlen: u32,
     pub obj_overflow: u32,

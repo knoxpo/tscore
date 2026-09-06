@@ -1296,6 +1296,7 @@ fn heap_offsets() -> Option<tsr_jit::tier1::HeapOffsets> {
         objs_old_len: l.objs_old_len,
         objs_dirty_ptr: l.objs_dirty_ptr,
         objs_dirty_len: l.objs_dirty_len,
+        const_cache_ptr: l.const_cache_ptr,
         empty_vec_words: l.empty_vec_words,
         obj_vlen: l.obj_vlen,
         obj_overflow: l.obj_overflow,

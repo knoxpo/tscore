@@ -68,6 +68,9 @@ pub struct HeapLayout {
     pub objs_old_len: u32,
     pub objs_dirty_ptr: u32,
     pub objs_dirty_len: u32,
+    /// Realm.const_cache data pointer: the string-constant interning
+    /// cache, direct-mapped on the constant's address, probed inline.
+    pub const_cache_ptr: u32,
     /// The three raw words of an empty Vec<Value> (written into a freshly
     /// bumped Obj's overflow field).
     pub empty_vec_words: [u64; 3],
@@ -438,6 +441,10 @@ pub fn discover() -> Option<HeapLayout> {
         |r: &Realm| r.heap.gen_objs.dirty.words().as_ptr(),
         |r: &mut Realm| { let w = r.heap.gen_objs.dirty.words_mut(); let c = w.capacity(); w.reserve(c + 8); }
     );
+    let const_cache_ptr = probe!(
+        "const_cache_ptr",
+        find_word(as_words(&realm), realm.const_cache.as_ptr() as u64)
+    );
     let saved = realm.heap.allocs_since_gc;
     realm.heap.allocs_since_gc = 0xB0BA_0005_0001;
     let allocs_since_gc_off = probe!(
@@ -491,6 +498,7 @@ pub fn discover() -> Option<HeapLayout> {
         objs_old_len,
         objs_dirty_ptr,
         objs_dirty_len,
+        const_cache_ptr,
         empty_vec_words,
         obj_vlen,
         obj_overflow,

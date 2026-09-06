@@ -35,6 +35,8 @@ const R_CLOSURE: u32 = 22;
 /// Cached array data pointer, 0 when invalid — same discipline as the
 /// field cache in x15. Only live when `int_lane`.
 const R_ACACHE: u32 = 22;
+/// Realm.const_cache entries (mirrors tsr_realm::CONST_CACHE; 16-byte (key, Value) pairs).
+const CONST_CACHE: usize = 512;
 const CLOSURE_SLOT: u32 = 8;
 const R_POLL: u32 = 24;
 const R_PROTO: u32 = 26;
@@ -1004,10 +1006,74 @@ pub fn compile(
     let mut fcache: Option<u8> = None;
     // which vreg's array data pointer is in R_ACACHE (0 there = invalid)
     let mut acache: Option<u8> = None;
+    // Per pc: the innermost enclosing loop's primary array — the vreg of
+    // the loop's first Len/GetIndex, provided nothing in the loop rewrites
+    // it. Its base lives in x22 for the whole loop: the header seeds it
+    // and other arrays' accesses leave the register alone.
+    let primary_at: Vec<Option<u8>> = {
+        let mut v = vec![None; pbody.code.len() + 2];
+        let mut hs: Vec<(usize, usize)> = pbody
+            .code
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.op == Op::Jump && i.sbx() < 0)
+            .map(|(pc, i)| ((pc as i64 + i.sbx() as i64 + 1) as usize, pc))
+            .collect();
+        hs.sort_by_key(|&(h, e)| std::cmp::Reverse(e - h)); // outer first
+        for (h, e) in hs {
+            // An inner loop inherits the enclosing loop's primary: it must
+            // not write x22 with another array's base, or the outer loop
+            // would read it on its back edge (mod_sign's nested loops
+            // exited early on a stale length).
+            let inherited = v[h];
+            let prim = inherited.or_else(|| {
+                pbody.code[h..=e]
+                    .iter()
+                    .find(|i| matches!(i.op, Op::Len | Op::GetIndex))
+                    .map(|i| i.b)
+                    .filter(|&a| !pbody.code[h..=e].iter().any(|i| writes_a_op(i.op) && i.a == a))
+            });
+            for p in h..=e {
+                v[p] = prim;
+            }
+        }
+        v
+    };
+    // loop headers: the furthest back edge targeting each
+    let loop_end_of = |h: usize| -> Option<usize> {
+        pbody
+            .code
+            .iter()
+            .enumerate()
+            .filter(|(p2, i)| {
+                i.op == Op::Jump && i.sbx() < 0 && (*p2 as i64 + i.sbx() as i64 + 1) as usize == h
+            })
+            .map(|(p2, _)| p2)
+            .max()
+    };
     for (pc, ins) in pbody.code.iter().enumerate() {
         if jump_targets[pc] {
             fcache = None;
-            acache = None;
+            // The array cache may survive a loop header when the loop's
+            // every array op is on the cached vreg and nothing rewrites
+            // it: then the back edge arrives with the same base, and the
+            // runtime `cbnz x22` still covers helpers and safepoints
+            // (which zero it). `for (i < a.length) a[i]` re-derived the
+            // base on every iteration — 18 of objects' 138 instructions.
+            // Seeded rather than merged: the fall-in edge zeroes x22 and
+            // the loop's first array op derives the base, every later
+            // iteration reuses it. Only when the loop touches exactly one
+            // array vreg and never rewrites it.
+            let single = loop_end_of(pc).and(primary_at[pc]);
+            match single {
+                Some(v) if c.acache_on => {
+                    if acache != Some(v) {
+                        c.a.movz(R_ACACHE, 0, 0); // fall-in: derive on first use
+                    }
+                    acache = Some(v);
+                }
+                _ => acache = None,
+            }
         }
         // The lane ends with its loop. Left set, a later loop sharing the
         // vreg would read a register nothing reloaded: two consecutive
@@ -1016,6 +1082,7 @@ pub fn compile(
         if !in_lane[pc] {
             c.lane = None;
             c.itmp = None;
+            c.int_ok.clear();
         }
         // loop-header speculation: guard the fall-in path (back-edges jump
         // to the label BELOW these guards and are already proven)
@@ -1063,7 +1130,7 @@ pub fn compile(
         }
         let l = c.pc_labels[pc];
         c.a.bind(l);
-        emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache, in_lane[pc]);
+        emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache, in_lane[pc], primary_at[pc]);
         // ops with only cold-path blrs (which zero x15) preserve the cache;
         // everything else — calls, allocation, heap ops that clobber
         // x15/x16 outright — kills it at compile time
@@ -1244,6 +1311,16 @@ fn emit_lane_guard(c: &mut C, vs: &[u8], laned: Option<u8>, fail: Label) {
 /// and the inner loop is the hot one, so the outer stays boxed rather
 /// than sharing x23 and reading the inner counter after the inner loop
 /// exits (which is what happened once array loops became eligible).
+/// Does `op` write its `a` operand (as opposed to reading it)?
+fn writes_a_op(op: Op) -> bool {
+    !matches!(
+        op,
+        Op::SetField | Op::SetIndex | Op::ArrayPush | Op::StoreCell | Op::SetUpval
+            | Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue | Op::Return | Op::Halt
+            | Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip | Op::GeSkip
+    )
+}
+
 fn lane_here(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> Option<u8> {
     let pick = lane_pick(pbody, facts, h, vs)?;
     let end = pbody
@@ -1811,6 +1888,7 @@ fn emit_op(
     fcache: &mut Option<u8>,
     acache: &mut Option<u8>,
     in_lane: bool,
+    primary: Option<u8>,
 ) {
     let pbody = proto.body();
     let num_bc = facts.num[pc][1] && facts.num[pc][2];
@@ -1825,7 +1903,33 @@ fn emit_op(
         Op::LoadUndef => c.put_bits(ins.a, Value::UNDEFINED.bits()),
         Op::LoadConst => match pbody.consts.get(ins.bx() as usize) {
             Some(Const::Number(n)) => c.put_bits(ins.a, Value::number(*n).bits()),
-            // string consts allocate — thin helper (no spill/reload)
+            // A string constant is interned per realm in a direct-mapped
+            // cache keyed on the constant's address — a compile-time
+            // constant, so its slot is too. Probe inline; the helper
+            // fills it on a miss. (alloc's push loop paid a call per
+            // iteration for the literal "s".)
+            Some(Const::Str(s)) if c.offsets.is_some() => {
+                let o = c.offsets.unwrap();
+                let key = std::sync::Arc::as_ptr(s) as *const u8 as usize;
+                let slot = ((key >> 3) & (CONST_CACHE - 1)) as u32;
+                let slow = c.a.new_label();
+                let done = c.a.new_label();
+                c.a.ldr_imm(10, R_REALM, o.const_cache_ptr);
+                c.a.mov_imm64(9, key as u64);
+                c.a.ldr_imm(11, 10, slot * 16);
+                c.a.cmp_reg(11, 9);
+                c.a.b_cond(Cond::Ne, slow);
+                c.a.ldr_imm(0, 10, slot * 16 + 8);
+                c.a.b(done);
+                c.a.bind(slow);
+                c.a.mov(0, R_REALM);
+                c.a.mov(1, R_PROTO);
+                c.a.mov_imm64(2, ins.bx() as u64);
+                c.thin(c.helpers.load_const);
+                c.a.bind(done);
+                c.put_x(ins.a, 0);
+            }
+            // other consts — thin helper (no spill/reload)
             _ => {
                 c.a.mov(0, R_REALM);
                 c.a.mov(1, R_PROTO);
@@ -2644,20 +2748,29 @@ fn emit_op(
                     .and_then(|o| o[1])
                     .filter(|&k| (0..=i32::MAX as i64).contains(&k));
                 let lane_ix = in_lane && (c.lane == Some(ins.c) || c.itmp == Some(ins.c));
-                if !lane_ix && const_ix.is_none() {
+                // proven an i32 at this loop's header and kept one by every
+                // write since: the boxed home converts bare
+                let int_ix = in_lane && !lane_ix && c.int_ok.contains(&ins.c);
+                if !lane_ix && !int_ix && const_ix.is_none() {
                     // the index guard clobbers x10, so it has to run before
                     // the base pointer lands there
                     c.fetch_x(ins.c, 9);
                     c.guard_number(9, slow);
                 }
                 let reuse = *acache == Some(ins.b) && c.int_lane;
-                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, c.acache_on);
-                *acache = Some(ins.b);
+                let cache = c.acache_on && primary.is_none_or(|p| p == ins.b);
+                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, cache);
+                if cache {
+                    *acache = Some(ins.b);
+                }
                 if let Some(k) = const_ix {
                     c.a.mov_imm64(13, k as u64);
                 } else if lane_ix {
                     let r = if c.lane == Some(ins.c) { R_LANE } else { R_ITMP };
                     c.a.mov(13, r);
+                } else if int_ix {
+                    let d = c.fetch(ins.c, 0);
+                    c.a.fcvtzs(13, d);
                 } else {
                     c.a.fmov_dx(0, 9);
                     c.a.fcvtzs(13, 0);
@@ -2779,8 +2892,11 @@ fn emit_op(
             let done = c.a.new_label();
             if let Some(o) = c.offsets {
                 let reuse = *acache == Some(ins.b) && c.int_lane;
-                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, c.acache_on);
-                *acache = Some(ins.b);
+                let cache = c.acache_on && primary.is_none_or(|p| p == ins.b);
+                c.array_base(10, ins.b, o.arr_bases_off, o.arr_size, slow, reuse, cache);
+                if cache {
+                    *acache = Some(ins.b);
+                }
                 c.a.ldr_imm(14, 10, o.vec_len);
                 c.a.scvtf(0, 14);
                 c.put(ins.a, 0);
