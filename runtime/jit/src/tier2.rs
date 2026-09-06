@@ -401,6 +401,17 @@ impl C {
         self.a.bind(ok);
     }
 
+    /// Compare a shape id: an immediate while ids fit twelve bits (they
+    /// are small and sequential; widening hands out fresh ones).
+    fn cmp_sid(&mut self, reg: u32, sid: u32) {
+        if sid < 4096 {
+            self.a.cmp_imm(reg, sid);
+        } else {
+            self.a.mov_imm64(13, sid as u64);
+            self.a.cmp_reg(reg, 13);
+        }
+    }
+
     /// Deopt to the interpreter at `pc`, which re-runs the instruction
     /// from the (still intact) register homes.
     fn deopt_at(&mut self, pc: usize) {
@@ -2512,8 +2523,7 @@ fn emit_op(
                         .filter(|&(_, slot)| (slot as usize) < o.obj_inline_n as usize);
                     c.a.cbz(15, full);
                     if let Some((sid, slot)) = baked {
-                        c.a.mov_imm64(13, sid as u64);
-                        c.a.cmp_reg(16, 13);
+                        c.cmp_sid(16, sid);
                         c.a.b_cond(Cond::Ne, full);
                         c.a.ldr_imm(8, 15, o.obj_inline + slot * 8);
                     } else {
@@ -2562,8 +2572,7 @@ fn emit_op(
                     c.index_addr(10, 10, 9, o.obj_size);
                     c.a.ldr_imm(11, 10, o.obj_shape_arc);
                     c.a.ldr_w_imm(12, 11, o.shape_id_delta);
-                    c.a.mov_imm64(13, sid as u64);
-                    c.a.cmp_reg(12, 13);
+                    c.cmp_sid(12, sid);
                     c.a.b_cond(Cond::Ne, miss);
                     c.a.mov(15, 10); // CSE cache: validated address
                     c.a.mov(16, 12); //            + shape id
@@ -2636,6 +2645,10 @@ fn emit_op(
                 // known to admit anything: a baked site whose repr is Any
                 let ref_ok = facts.ic_baked.get(pc).copied().flatten().is_some()
                     && facts.field_repr.get(pc).copied().unwrap_or(2) == 2;
+                // a value the lane already holds as an integer is a number
+                let val_int = c.lane == Some(ins.c)
+                    || c.itmp == Some(ins.c)
+                    || (in_lane && c.int_ok.contains(&ins.c));
                 if *fcache == Some(ins.a) {
                     // CSE'd store: cached validated address in x15, shape
                     // id in x16 — only this pc's IC + number-value guard.
@@ -2652,16 +2665,17 @@ fn emit_op(
                         .filter(|&(_, slot)| (slot as usize) < o.obj_inline_n as usize);
                     c.a.cbz(15, full);
                     c.fetch_x(ins.c, 9);
-                    if ref_ok {
-                        c.fetch_x(ins.a, 8); // the barrier check needs the ref
+                    if !val_int {
+                        if ref_ok {
+                            c.fetch_x(ins.a, 8); // the barrier check needs the ref
+                        }
+                        c.ref_store_check(9, 8, ref_ok, o, full);
                     }
-                    c.ref_store_check(9, 8, ref_ok, o, full);
                     if int32_field {
                         c.int32_check(9, full);
                     }
                     if let Some((sid, slot)) = baked {
-                        c.a.mov_imm64(13, sid as u64);
-                        c.a.cmp_reg(16, 13);
+                        c.cmp_sid(16, sid);
                         c.a.b_cond(Cond::Ne, full);
                         c.a.str_imm(9, 15, o.obj_inline + slot * 8);
                     } else {
@@ -2693,7 +2707,9 @@ fn emit_op(
                     c.a.cmp_reg(10, 11);
                     c.a.b_cond(Cond::Ne, generic);
                     c.fetch_x(ins.c, 9);
-                    c.ref_store_check(9, 8, ref_ok, o, generic);
+                    if !val_int {
+                        c.ref_store_check(9, 8, ref_ok, o, generic);
+                    }
                     if int32_field {
                         c.int32_check(9, generic);
                     }
@@ -2702,8 +2718,7 @@ fn emit_op(
                     c.index_addr(10, 10, 12, o.obj_size);
                     c.a.ldr_imm(11, 10, o.obj_shape_arc);
                     c.a.ldr_w_imm(12, 11, o.shape_id_delta);
-                    c.a.mov_imm64(13, sid as u64);
-                    c.a.cmp_reg(12, 13);
+                    c.cmp_sid(12, sid);
                     c.a.b_cond(Cond::Ne, generic);
                     c.a.mov(15, 10);
                     c.a.mov(16, 12);
