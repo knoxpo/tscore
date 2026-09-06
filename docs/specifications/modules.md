@@ -39,10 +39,25 @@ zero JIT changes.
 
 ## Resolution
 
-- Relative: exact, then `.ts`, then `/index.ts`.
-- Bare: `tscore.json` (walked up from the entry) — `{"moduleDirs":
-  ["modules", ...]}`; tries `<root>/<dir>/<spec>.ts` then
-  `<dir>/<spec>/index.ts`.
+- Relative: the specifier's *source* form first (`./x.js` -> `x.ts`,
+  `.mjs` -> `.mts`, `.cjs` -> `.cts`, `.js` -> `.tsx`), then the literal
+  path, then `.ts`/`.tsx`/`.mts`/`.cts`, then `/index.ts(x)`. Writing the
+  emitted `.js` extension is mandatory under `moduleResolution: nodenext`,
+  so that form has to resolve.
+- Bare, in order: `tscore.json` `paths` prefixes, then its `moduleDirs`
+  (walked up from the entry, `{"moduleDirs": ["modules", ...]}`), then
+  `node_modules` walked up from the importer.
+- A `node_modules` package's entry comes from `package.json`: `exports`
+  as a string, or as an object taking `"."` then the first of
+  `"import"`/`"default"`; else `main`; else the package root's index
+  candidates. A deep import (`pkg/sub/path`) addresses the file directly.
+  No wildcards, no `imports`, no self-reference.
+
+## import.meta
+
+`import.meta.url` / `.filename` / `.dirname` are constant-folded per
+module from its canonical path. `import.meta` is not a first-class object
+— only these member reads compile; anything else is a compile error.
 
 ## Dynamic import()
 
@@ -53,7 +68,14 @@ misses compile and graft the new subgraph onto the live registry
 
 ## Known deviations (v1)
 
-- Cycles: undefined-then-live, no TDZ.
-- Namespace objects crossing realm boundaries (actors/parallel) fail on
-  mutable exports (cells don't clone across realms).
+- Cycles: a binding read before its module has evaluated throws
+  "cannot access module binding before initialization" (the TDZ
+  sentinel), rather than yielding undefined. A named re-export that
+  materializes mid-cycle copies that sentinel; the source module repairs
+  its dependents' namespaces when it finishes evaluating, so the value is
+  correct for every read after the cycle completes.
+- Namespace objects **snapshot** when they cross a realm boundary
+  (actors/parallel/channels): cells deref to plain values, uninitialized
+  exports arrive as `undefined`, and the hidden pads are dropped. Live
+  bindings are live only within the realm that owns them.
 - Errors carry per-module source attribution (`RtError.source`).

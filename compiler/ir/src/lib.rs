@@ -458,6 +458,8 @@ pub struct ExportMeta {
 pub enum ReExport {
     Named(Arc<str>),
     Star,
+    /// `export * as ns from "./x"`: one field holding the dep's namespace.
+    Namespace,
 }
 
 /// A compiled module graph (entry + everything it reaches).

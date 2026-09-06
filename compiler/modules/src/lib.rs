@@ -58,38 +58,56 @@ impl ResolveConfig {
     }
 }
 
-/// Minimal JSON field extraction: {"moduleDirs": ["a", "b"]}. Not a JSON
-/// parser — the config has exactly one recognized key.
-/// ponytail: swap for serde_json the day the config grows a second field.
-/// {"paths": {"@app/": "./src/"}} — same minimal extraction.
+/// tscore.json: {"moduleDirs": ["modules"], "paths": {"@app/": "./src/"}}
 fn parse_paths(s: &str) -> Vec<(String, String)> {
-    let Some(key) = s.find("\"paths\"") else { return Vec::new() };
-    let Some(open) = s[key..].find('{').map(|i| i + key) else { return Vec::new() };
-    let Some(close) = s[open..].find('}').map(|i| i + open) else { return Vec::new() };
-    s[open + 1..close]
-        .split(',')
-        .filter_map(|pair| {
-            let (k, v) = pair.split_once(':')?;
-            let k = k.trim().trim_matches('"');
-            let v = v.trim().trim_matches('"');
-            (!k.is_empty() && !v.is_empty()).then(|| (k.to_string(), v.to_string()))
-        })
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return Vec::new();
+    };
+    let Some(map) = v.get("paths").and_then(|p| p.as_object()) else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
         .collect()
 }
 
 fn parse_module_dirs(s: &str) -> Option<Vec<String>> {
-    let key = s.find("\"moduleDirs\"")?;
-    let open = s[key..].find('[')? + key;
-    let close = s[open..].find(']')? + open;
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
     Some(
-        s[open + 1..close]
-            .split(',')
-            .filter_map(|p| {
-                let t = p.trim().trim_matches('"');
-                (!t.is_empty()).then(|| t.to_string())
-            })
+        v.get("moduleDirs")?
+            .as_array()?
+            .iter()
+            .filter_map(|d| d.as_str().map(str::to_string))
             .collect(),
     )
+}
+
+/// The entry point a package.json declares, as a path relative to the
+/// package root. Subset of Node's algorithm: "exports" as a string, or as
+/// an object taking "." then the first of "import"/"default"; else "main".
+/// ponytail: no wildcards, no "imports", no self-reference — add a
+/// condition here the day a fixture needs one.
+fn package_entry(pkg_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(pkg_json).ok()?;
+    fn pick(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(m) => ["import", "default"]
+                .iter()
+                .find_map(|c| m.get(*c).and_then(pick)),
+            _ => None,
+        }
+    }
+    if let Some(exports) = v.get("exports") {
+        let root = match exports {
+            serde_json::Value::Object(m) if m.contains_key(".") => &m["."],
+            other => other,
+        };
+        if let Some(p) = pick(root) {
+            return Some(p);
+        }
+    }
+    v.get("main").and_then(|m| m.as_str()).map(str::to_string)
 }
 
 /// Resolve a specifier from the importer's directory to a canonical path.
@@ -99,11 +117,25 @@ pub fn resolve_specifier(
     cfg: &ResolveConfig,
 ) -> Result<PathBuf, String> {
     let try_forms = |base: PathBuf| -> Option<PathBuf> {
-        let cands = [
-            base.clone(),
-            PathBuf::from(format!("{}.ts", base.display())),
-            base.join("index.ts"),
-        ];
+        let text = base.display().to_string();
+        let mut cands = Vec::with_capacity(8);
+        // TS under nodenext writes the *emitted* extension: "./util.js"
+        // means util.ts on disk. Try the source form first, then the
+        // literal path, then the extensionless candidates.
+        for (js, ts) in [(".js", ".ts"), (".mjs", ".mts"), (".cjs", ".cts")] {
+            if let Some(stem) = text.strip_suffix(js) {
+                cands.push(PathBuf::from(format!("{stem}{ts}")));
+                if js == ".js" {
+                    cands.push(PathBuf::from(format!("{stem}.tsx")));
+                }
+            }
+        }
+        cands.push(base.clone());
+        for ext in ["ts", "tsx", "mts", "cts"] {
+            cands.push(PathBuf::from(format!("{text}.{ext}")));
+        }
+        cands.push(base.join("index.ts"));
+        cands.push(base.join("index.tsx"));
         cands
             .into_iter()
             .find(|c| c.is_file())
@@ -126,12 +158,54 @@ pub fn resolve_specifier(
                 return Ok(p);
             }
         }
+        if let Some(p) = resolve_node_modules(spec, importer_dir, &try_forms) {
+            return Ok(p);
+        }
         Err(format!(
-            "cannot resolve bare specifier '{spec}' (searched {:?} under {})",
+            "cannot resolve bare specifier '{spec}' (searched {:?} under {}, \
+             then node_modules)",
             cfg.module_dirs,
             cfg.root.display()
         ))
     }
+}
+
+/// Walk node_modules upward from the importer, as Node does. The package
+/// entry comes from package.json ("exports"/"main"); absent or unresolvable,
+/// fall back to the package root's index candidates.
+fn resolve_node_modules(
+    spec: &str,
+    importer_dir: &Path,
+    try_forms: &dyn Fn(PathBuf) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    // "@scope/pkg/sub/path" -> package "@scope/pkg", subpath "sub/path"
+    let parts: Vec<&str> = spec.splitn(if spec.starts_with('@') { 3 } else { 2 }, '/').collect();
+    let (pkg, subpath) = if spec.starts_with('@') && parts.len() >= 2 {
+        (format!("{}/{}", parts[0], parts[1]), parts.get(2).copied())
+    } else {
+        (parts[0].to_string(), parts.get(1).copied())
+    };
+    let mut dir = Some(importer_dir);
+    while let Some(d) = dir {
+        let root = d.join("node_modules").join(&pkg);
+        if root.is_dir() {
+            // a deep import addresses a file inside the package directly
+            if let Some(sub) = subpath {
+                return try_forms(root.join(sub));
+            }
+            let entry = std::fs::read_to_string(root.join("package.json"))
+                .ok()
+                .and_then(|t| package_entry(&t));
+            if let Some(e) = entry {
+                if let Some(p) = try_forms(root.join(&e)) {
+                    return Some(p);
+                }
+            }
+            return try_forms(root);
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 /// Cheap raw-text check: does this source possibly use module syntax?
@@ -230,6 +304,13 @@ pub fn compile_graph(entry: &Path) -> Result<Program, ModuleError> {
                             if tab.insert(e.name.clone(), m) != Some(m) {
                                 changed = true;
                             }
+                        }
+                    }
+                    // opaque: the ns object itself, never a cell
+                    ReExport::Namespace => {
+                        let tab = mutability.get_mut(id).unwrap();
+                        if tab.insert(e.name.clone(), false) != Some(false) {
+                            changed = true;
                         }
                     }
                     ReExport::Star => {
@@ -505,15 +586,48 @@ fn discover_one(path: &Path, cfg: &ResolveConfig) -> Result<Discovered, ModuleEr
                     continue;
                 }
                 let dep = add_dep(&e.source.value, e.span.start, &mut deps)?;
+                // `export * as ns from` is one immutable name bound to the
+                // dep's namespace, not a splat of the dep's export set
+                let (name, re) = match &e.exported {
+                    Some(alias) => {
+                        (Arc::from(alias.name().as_str()), ReExport::Namespace)
+                    }
+                    None => (Arc::from("*"), ReExport::Star),
+                };
                 exports.push(ExportMeta {
-                    name: Arc::from("*"),
+                    name,
                     mutable: false,
                     binding: None,
-                    from: Some((dep, ReExport::Star)),
+                    from: Some((dep, re)),
                 });
             }
             _ => {}
         }
     }
     Ok(Discovered { source, deps, exports, imports })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_at(root: &Path) -> ResolveConfig {
+        ResolveConfig { root: root.to_path_buf(), module_dirs: vec![], paths: vec![] }
+    }
+
+    #[test]
+    fn js_specifier_resolves_to_ts_source() {
+        let dir = std::env::temp_dir().join("tscore_resolve_js");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("util.ts"), "export const x = 1;\n").unwrap();
+        let cfg = cfg_at(&dir);
+        // "./util.js" is what tsc-checked ESM writes; util.ts is on disk
+        let got = resolve_specifier("./util.js", &dir, &cfg).unwrap();
+        assert_eq!(got, dir.join("util.ts").canonicalize().unwrap());
+        // the plain and extensionless forms still work
+        assert!(resolve_specifier("./util.ts", &dir, &cfg).is_ok());
+        assert!(resolve_specifier("./util", &dir, &cfg).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

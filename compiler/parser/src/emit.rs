@@ -1500,6 +1500,38 @@ impl Emitter {
                 return Ok(());
             }
             Expression::StaticMemberExpression(m) => {
+                // import.meta.url / .dirname: constant-folded per module.
+                // Only member reads are supported — import.meta as a value
+                // would need a real object with no use for one yet.
+                if matches!(&m.object, Expression::MetaProperty(_)) {
+                    let Some(module) = &self.module else {
+                        return self
+                            .unsupported("import.meta (module pipeline only)", m.span.start);
+                    };
+                    let path = module
+                        .key
+                        .strip_prefix("\0mod:")
+                        .unwrap_or(&module.key)
+                        .to_string();
+                    let text = match &*m.property.name {
+                        "url" => format!("file://{path}"),
+                        "dirname" => std::path::Path::new(&path)
+                            .parent()
+                            .unwrap_or(std::path::Path::new(""))
+                            .display()
+                            .to_string(),
+                        "filename" => path,
+                        other => {
+                            return self.unsupported(
+                                &format!("import.meta.{other}"),
+                                m.span.start,
+                            )
+                        }
+                    };
+                    let k = self.str_const(&text);
+                    self.emit_abx(Op::LoadConst, dst, k);
+                    return Ok(());
+                }
                 let mark = self.mark();
                 let obj = self.alloc_reg(m.span.start)?;
                 self.expr(&m.object, obj)?;

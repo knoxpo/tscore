@@ -54,6 +54,12 @@ fn clone_rec(
     v: Value,
     visiting: &mut HashSet<(u8, u32)>,
 ) -> Result<PortableValue, String> {
+    // TDZ sentinel is a TAG_SPECIAL payload below FOREIGN_BASE: kind()
+    // would underflow it into a bogus Foreign ref. An uninitialized export
+    // has no value to carry across, so it travels as undefined.
+    if v.bits() == tsr_memory::TDZ_SENTINEL {
+        return Ok(PortableValue::Undefined);
+    }
     Ok(match v.kind() {
         Kind::Number(n) => PortableValue::Number(n),
         Kind::Bool(b) => PortableValue::Bool(b),
@@ -76,6 +82,9 @@ fn clone_rec(
             // hidden-handle objects (channels, actor refs) travel as their
             // shared core, not as field-by-field clones
             for (k, v) in heap.obj(r).entries() {
+                if k.starts_with('\0') {
+                    continue; // ns pads: realm-local JIT steering, not data
+                }
                 if k.starts_with("__") {
                     if let Some(f) = v.as_foreign() {
                         if let Foreign::Handle(kind, any) = heap.foreign(f) {
@@ -90,6 +99,7 @@ fn clone_rec(
             let fields = heap
                 .obj(r)
                 .entries()
+                .filter(|(k, _)| !k.starts_with('\0'))
                 .map(|(k, x)| Ok((k.clone(), clone_rec(heap, x, visiting)?)))
                 .collect::<Result<_, String>>()?;
             visiting.remove(&(1, r));
@@ -115,7 +125,11 @@ fn clone_rec(
             visiting.remove(&(2, r));
             pv
         }
-        Kind::Cell(_) => return Err("internal: cell escaped registers".into()),
+        // Module namespaces publish mutable exports as cells so importers
+        // see live bindings. A cell cannot exist in another realm, so
+        // crossing the boundary snapshots it — same rule the closure-upvalue
+        // arm above already applies.
+        Kind::Cell(r) => clone_rec(heap, *heap.cell(r), visiting)?,
         Kind::Foreign(r) => {
             let what = match heap.foreign(r) {
                 Foreign::Promise(_) => "a promise",
@@ -209,6 +223,32 @@ mod tests {
         // mutation isolation: heap a untouched by heap b writes
         b.arr_mut(xr).push(Value::number(3.0));
         assert_eq!(a.arr(inner).len(), 2);
+    }
+
+    #[test]
+    fn namespace_snapshots_cells_and_tdz() {
+        // shaped like a module namespace: hidden pads, a cell-valued
+        // mutable export, and an export still uninitialized (TDZ)
+        let mut a = Heap::new();
+        let cell = a.alloc_cell(Value::number(7.0));
+        let mut ns = Obj::default();
+        for pad in ["\0p0", "\0p1", "\0p2"] {
+            ns.set(Arc::from(pad), Value::UNDEFINED);
+        }
+        ns.set(Arc::from("counter"), Value::cell(cell));
+        ns.set(Arc::from("later"), Value::from_bits(tsr_memory::TDZ_SENTINEL));
+        let o = a.alloc_obj(ns);
+
+        let pv = clone_out(&a, Value::object(o)).unwrap();
+        let mut b = Heap::new();
+        let v = rehydrate(&pv, &mut b);
+        let Some(r) = v.as_object() else { panic!() };
+        // cell deref'd to a plain snapshot
+        assert_eq!(b.obj(r).get("counter").unwrap().as_number(), 7.0);
+        // TDZ carried as undefined, not a bogus foreign ref
+        assert_eq!(b.obj(r).get("later").unwrap().bits(), Value::UNDEFINED.bits());
+        // pads dropped: realm-local JIT steering, meaningless over there
+        assert!(b.obj(r).get("\0p0").is_none());
     }
 
     #[test]

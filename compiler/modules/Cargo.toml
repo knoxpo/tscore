@@ -9,3 +9,4 @@ license.workspace = true
 tsc-ast.workspace = true
 tsc-ir.workspace = true
 tsc-parser.workspace = true
+serde_json.workspace = true
