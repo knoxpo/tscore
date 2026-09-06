@@ -149,10 +149,34 @@ mod waiter {
         }
 
         /// Wait until `deadline`, or forever when there is none.
+        ///
+        /// Three phases. Far from the deadline, kevent with a timeout that
+        /// returns EARLY_BY before it — interruptible by `wake`, and the
+        /// caller loops. Inside that window, `mach_wait_until`, which lands
+        /// within a few tens of microseconds where kevent's timeout lands
+        /// ~150us late; and the last SPIN_NS are spun. A registration that
+        /// arrives during the short precise phase waits it out — at most
+        /// EARLY_BY, less than the lateness this replaces. Ten serial 1ms
+        /// sleeps measured 11.46ms before: the floor is 10.
         pub fn wait(&self, deadline: Option<Instant>) {
+            const EARLY_BY: std::time::Duration = std::time::Duration::from_micros(200);
+            const SPIN_NS: u64 = 40_000;
+            if let Some(d) = deadline {
+                let left = d.saturating_duration_since(Instant::now());
+                if left <= EARLY_BY {
+                    let left_ns = left.as_nanos() as u64;
+                    if left_ns > SPIN_NS {
+                        precise_wait_ns(left_ns - SPIN_NS);
+                    }
+                    while Instant::now() < d {
+                        std::hint::spin_loop();
+                    }
+                    return;
+                }
+            }
             let mut out: libc::kevent = unsafe { std::mem::zeroed() };
             let ts = deadline.map(|d| {
-                let left = d.saturating_duration_since(Instant::now());
+                let left = d.saturating_duration_since(Instant::now()).saturating_sub(EARLY_BY);
                 libc::timespec {
                     tv_sec: left.as_secs() as libc::time_t,
                     tv_nsec: left.subsec_nanos() as libc::c_long,
@@ -182,6 +206,38 @@ mod waiter {
     impl Drop for Waiter {
         fn drop(&mut self) {
             unsafe { libc::close(self.0) };
+        }
+    }
+
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+
+    // declared here rather than through libc, whose bindings for these
+    // are deprecated in favour of a crate this does not need
+    extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_wait_until(deadline: u64) -> libc::c_int;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
+    }
+
+    /// Block for about `ns` with the kernel's high-resolution wait.
+    fn precise_wait_ns(ns: u64) {
+        static TB: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        let (numer, denom) = *TB.get_or_init(|| {
+            let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+            // SAFETY: plain out-parameter call.
+            unsafe { mach_timebase_info(&mut info) };
+            (info.numer as u64, info.denom as u64)
+        });
+        // ticks = ns * denom / numer
+        let ticks = ns.saturating_mul(denom) / numer.max(1);
+        // SAFETY: both are plain syscalls on this thread.
+        unsafe {
+            let now = mach_absolute_time();
+            mach_wait_until(now.saturating_add(ticks));
         }
     }
 }
@@ -230,11 +286,24 @@ mod waiter {
 struct TimerWheel {
     tx: crossbeam_channel::Sender<(std::time::Instant, tsr_realm::Completer)>,
     waiter: std::sync::Arc<waiter::Waiter>,
+    /// The deadline the timer thread is currently waiting for, as
+    /// nanoseconds past `EPOCH` (u64::MAX = waiting for a registration).
+    /// A registration nudges the thread only when it is due before that:
+    /// a batch of 200 sleeps used to cost 200 kevent syscalls, one per
+    /// registration, when the first was the only one that mattered.
+    next: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn since_epoch(t: std::time::Instant) -> u64 {
+    t.saturating_duration_since(*EPOCH.get_or_init(std::time::Instant::now)).as_nanos() as u64
 }
 
 impl TimerWheel {
     fn send(&self, t: (std::time::Instant, tsr_realm::Completer)) {
-        if self.tx.send(t).is_ok() {
+        let due = since_epoch(t.0);
+        if self.tx.send(t).is_ok() && due < self.next.load(std::sync::atomic::Ordering::Acquire) {
             self.waiter.wake();
         }
     }
@@ -256,6 +325,8 @@ fn timer_wheel() -> &'static TimerWheel {
         let (tx, rx) = crossbeam_channel::unbounded::<(Instant, tsr_realm::Completer)>();
         let waiter = std::sync::Arc::new(waiter::Waiter::new());
         let w = waiter.clone();
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let next_t = next.clone();
         std::thread::Builder::new()
             .name("tscore-timers".into())
             .spawn(move || {
@@ -304,11 +375,19 @@ fn timer_wheel() -> &'static TimerWheel {
                         }
                         c.settle(Ok(tsr_task::PortableValue::Undefined));
                     }
-                    w.wait(heap.peek().map(|Reverse(e)| e.0));
+                    let deadline = heap.peek().map(|Reverse(e)| e.0);
+                    // publish before waiting: a registration that reads the
+                    // old value either wakes us spuriously (harmless) or
+                    // was already drained above
+                    next_t.store(
+                        deadline.map_or(u64::MAX, since_epoch),
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    w.wait(deadline);
                 }
             })
             .expect("spawn timer thread");
-        TimerWheel { tx, waiter }
+        TimerWheel { tx, waiter, next }
     })
 }
 
