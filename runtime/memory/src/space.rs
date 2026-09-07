@@ -181,6 +181,7 @@ impl Old {
 
     /// Allocate `words` (>= 2). The cell comes back with a zeroed meta
     /// word; the caller writes the real one.
+    #[inline]
     pub fn alloc(&mut self, words: usize) -> Ref {
         debug_assert!(words >= 2);
         let bytes = words * 8;
@@ -201,23 +202,32 @@ impl Old {
                 self.sync_top();
                 return a as Ref;
             }
-            // The bump region is spent. Carve from a coalesced run rather
-            // than take another chunk: the major sweep merges neighbouring
-            // dead cells, so a run of a thousand dead closures becomes one
-            // block no size class can serve, and without this old space
-            // grew 7.4MB to 12.4MB across majors that freed 66k cells.
-            if self.carve_words >= words + 2 {
-                let a = self.carve;
-                self.carve = a + bytes as Ref;
-                self.carve_words -= words;
-                // the remainder stays a well-formed FREE cell: every walk
-                // over a chunk advances by `size_words`, so a headerless
-                // gap makes the collector read garbage
-                set_meta(self.carve, meta(K_FREE, self.carve_words, 0));
-                set_meta(a, 0);
-                self.freelist_bytes += bytes;
-                return a;
-            }
+        }
+        self.alloc_slow(words, bytes)
+    }
+
+    /// Everything that is not a size-class pop or a bump: carving a
+    /// coalesced run, scanning the large list, taking a new chunk. Out of
+    /// line so the hot path stays small — folding it inline cost the
+    /// alloc row ~1%.
+    #[inline(never)]
+    fn alloc_slow(&mut self, words: usize, bytes: usize) -> Ref {
+        // The bump region is spent. Carve from a coalesced run rather
+        // than take another chunk: the major sweep merges neighbouring
+        // dead cells, so a run of a thousand dead closures becomes one
+        // block no size class can serve, and without this old space grew
+        // 7.4MB to 12.4MB across majors that freed 66k cells each.
+        if words <= MAX_SMALL_WORDS && self.carve_words >= words + 2 {
+            let a = self.carve;
+            self.carve = a + bytes as Ref;
+            self.carve_words -= words;
+            // the remainder stays a well-formed FREE cell: every walk
+            // over a chunk advances by `size_words`, so a headerless gap
+            // makes the collector read garbage
+            set_meta(self.carve, meta(K_FREE, self.carve_words, 0));
+            set_meta(a, 0);
+            self.freelist_bytes += bytes;
+            return a;
         }
         for i in 0..self.large.len() {
             let a = self.large[i];
