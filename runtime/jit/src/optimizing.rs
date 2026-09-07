@@ -79,6 +79,13 @@ const R_ITMP: u32 = 21;
 const R_SLOTS: u32 = 25;
 const R_SENTINEL: u32 = 27;
 const R_TAGLIM: u32 = 28;
+/// Element kinds a GetIndex site can be specialized to. Mirrors
+/// `tsc_types::EK_*` (this crate does not depend on the analysis, the
+/// same way field representations arrive as plain bytes).
+const EK_I32: u8 = 0;
+#[allow(dead_code)]
+const EK_NUM: u8 = 1;
+const EK_ANY: u8 = 2;
 const R_STARTPC: u32 = 15; // stashed x5, still live at the entry guards
 // x21 was the IC table base. Every read of it sits on a generic fallback
 // path that a warmed, baked IC never takes, so materialising the address
@@ -107,15 +114,19 @@ pub struct Facts<'a> {
     /// per-arg: entry guard proves numeric
     pub arg_guard: &'a [bool],
     /// integer speculation is on: `IntV op IntV` may deopt on overflow.
-    /// Withdrawn after repeated deopts — then int operands take the
-    /// tag-dispatching arm, whose overflow makes a double instead
     pub int_static: bool,
+    /// vregs whose arithmetic already overflowed i32 at run time: their
+    /// ops convert to doubles once instead of dispatching on the tag
+    pub no_int: u64,
     /// per-arg representation the guard pins: 0 any number, 1 int
     /// (integral double converts in place), 2 double (int converts)
     pub arg_repr: &'a [u8],
     /// per header: vregs pinned double there; the fall-in edge and OSR
     /// entry convert an int-tagged value (non-number deopts)
     pub dbl_hdrs: &'a [(usize, Vec<u8>)],
+    /// per header: vregs typed double there; converted at OSR entry
+    /// only (the fall-in edge is already typed by the same analysis)
+    pub dbl_osr: &'a [(usize, Vec<u8>)],
     /// per-pc (b, c): operand is a known integer constant
     pub const_ops: &'a [[Option<i64>; 2]],
     /// per-pc: warmed GetField/SetField IC contents (shape id, slot) —
@@ -135,6 +146,9 @@ pub struct Facts<'a> {
     /// (tsc_types::REPR_*): a typed read deopts on a shape miss instead
     /// of taking the generic path, since what follows relies on it
     pub field_repr: &'a [u8],
+    /// per-pc GetIndex element kind (tsc_types::EK_*): the site guards
+    /// it and the analysis types the loaded element from it
+    pub elem_kind: &'a [u8],
     /// per-pc, per-operand: proven i32 integer
     pub int_facts: &'a [[bool; 3]],
     /// per-pc, per-operand: a double for certain (never int-tagged); the
@@ -675,6 +689,41 @@ impl C {
             self.a.bind(derived);
         }
     }
+    /// The array cell at x{arr} must have the element kind this site
+    /// was specialized to; anything else deopts. `ek` is a
+    /// `tsc_types::EK_*`. Clobbers x17.
+    fn arr_kind_guard(&mut self, arr: u32, ek: u8, bad: Label) {
+        self.a.ldr_imm(17, arr, 0);
+        self.a.ubfx64(17, 17, 4, 4);
+        if ek == EK_I32 {
+            self.a.cmp_imm(17, tsr_memory::cells::K_ARR_I32 as u32);
+            self.a.b_cond(Cond::Ne, bad);
+        } else {
+            // numbers: either of the numeric kinds, which sort above
+            // every other cell kind
+            self.a.cmp_imm(17, tsr_memory::cells::K_ARR_I32 as u32);
+            self.a.b_cond(Cond::Lo, bad);
+        }
+    }
+    /// The value in x{val} may be stored into an array whose meta word
+    /// is in x{meta} without widening its element kind; otherwise
+    /// branch to `wide` (the helper, which widens). Clobbers x11, x17.
+    fn arr_store_ok(&mut self, meta: u32, val: u32, wide: Label) {
+        // x11 and x16 only: the array arms hold the element pointer in
+        // x17 and the length in x14 across this check
+        let ok = self.a.new_label();
+        self.a.ubfx64(11, meta, 4, 4);
+        self.a.cmp_imm(11, tsr_memory::cells::K_ARR as u32);
+        self.a.b_cond(Cond::Eq, ok); // already the widest kind
+        self.a.lsr_imm(16, val, 48);
+        self.a.cmp_reg(16, R_TAGLIM);
+        self.a.b_cond(Cond::Eq, ok); // an int suits both numeric kinds
+        self.a.cmp_imm(11, tsr_memory::cells::K_ARR_NUM as u32);
+        self.a.b_cond(Cond::Ne, wide);
+        self.a.cmp_reg(16, R_TAGLIM);
+        self.a.b_cond(Cond::Hi, wide); // not a number
+        self.a.bind(ok);
+    }
     /// x{len} = length of the array cell at x{arr} (meta high word).
     fn arr_len(&mut self, len: u32, arr: u32) {
         self.a.ldr_imm(len, arr, 0);
@@ -916,16 +965,18 @@ impl C {
     /// Array literal of `n` values from vregs `first..`: one bump holding
     /// the array cell and its element chunk back to back, the helper as
     /// the slow path. Result in `dst`.
-    fn emit_arr_lit(&mut self, dst: u8, first: u8, n: usize) {
+    /// `kind` is the cell kind the literal's values give the array
+    /// (`K_ARR_I32` / `K_ARR_NUM` / `K_ARR`).
+    fn emit_arr_lit(&mut self, dst: u8, first: u8, n: usize, kind: u64) {
         let c = self;
         let slow = c.a.new_label();
         let done = c.a.new_label();
         if let Some(o) = c.offsets.filter(|o| o.bump_alloc && n <= 8) {
-            use tsr_memory::cells::{meta, K_ARR, K_ELEMS};
+            use tsr_memory::cells::{meta, K_ELEMS};
             let cap = n.max(4);
             let words = 2 + 1 + cap;
             c.bump(words as u32, &o, slow);
-            c.a.mov_imm64(14, meta(K_ARR, 2, n));
+            c.a.mov_imm64(14, meta(kind, 2, n));
             c.a.str_imm(14, 13, 0);
             c.a.add_imm(14, 13, 16);
             c.a.str_imm(14, 13, o.arr_elems);
@@ -1063,6 +1114,22 @@ impl C {
 }
 
 /// Signed-integer condition for a compare op (`js_cond` gives the FP one).
+/// The array kind a literal's value classes give it (`lit_vals`: 0 int,
+/// 1 number, 2 anything). Unknown classes make the widest kind, which
+/// admits every later store.
+fn lit_arr_kind(classes: &[u8], n: usize) -> u64 {
+    use tsr_memory::cells::{K_ARR, K_ARR_I32, K_ARR_NUM};
+    if classes.len() < n {
+        return K_ARR;
+    }
+    classes[..n].iter().fold(K_ARR_I32, |k, c| match (k, c) {
+        (_, 2) => K_ARR,
+        (K_ARR, _) => K_ARR,
+        (_, 1) => K_ARR_NUM,
+        (k, _) => k,
+    })
+}
+
 fn int_cond(op: Op) -> Cond {
     match op {
         Op::Lt | Op::LtSkip => Cond::Lt,
@@ -1375,7 +1442,13 @@ pub fn compile(
             let laned_here = !lanes_at[h].is_empty();
             let int_hdr = facts.int_hdrs.iter().find(|(hh, _)| *hh == h);
             let dbl_hdr = facts.dbl_hdrs.iter().find(|(hh, _)| *hh == h);
-            if facts.loop_spec.iter().any(|(hh, _)| *hh == h) || laned_here || int_hdr.is_some() || dbl_hdr.is_some() {
+            let dbl_osr = facts.dbl_osr.iter().find(|(hh, _)| *hh == h);
+            if facts.loop_spec.iter().any(|(hh, _)| *hh == h)
+                || laned_here
+                || int_hdr.is_some()
+                || dbl_hdr.is_some()
+                || dbl_osr.is_some()
+            {
                 // speculated header: entering mid-loop must re-establish
                 // the guards (slots are current; d-homes just reloaded)
                 let vs: &[u8] = facts
@@ -1398,6 +1471,9 @@ pub fn compile(
                     emit_lane_guard(&mut c, hv, &[], fail);
                 }
                 if let Some((_, dv)) = dbl_hdr {
+                    emit_dbl_guard(&mut c, dv, fail);
+                }
+                if let Some((_, dv)) = dbl_osr {
                     emit_dbl_guard(&mut c, dv, fail);
                 }
                 // every enclosing laned loop's registers, outer first
@@ -2549,7 +2625,9 @@ fn emit_inline_call(
     for (cpc, cins) in callee.body().code.iter().enumerate() {
         match cins.op {
             Op::NewArrayLit => {
-                c.emit_arr_lit(map(cins.a), map(cins.b), cins.c as usize);
+                // no facts for an inlined callee: its literal takes the
+                // widest kind, which every later store admits
+                c.emit_arr_lit(map(cins.a), map(cins.b), cins.c as usize, tsr_memory::cells::K_ARR);
                 c.a.movz(14, 0, 0); // closure addr clobbered; GetUpval reloads
             }
             Op::NewObjectLit => {
@@ -2820,6 +2898,8 @@ fn emit_op(
 
         Op::Add | Op::Sub | Op::Mul => {
             let (cb, cc) = (cls_of(facts, pc, 0, smi), cls_of(facts, pc, 1, smi));
+            // this destination already overflowed i32 at run time
+            let withdrawn = (facts.no_int >> (ins.a as u32).min(63)) & 1 == 1;
             let is_int = |x: Cls| matches!(x, Cls::Int | Cls::IntK(_));
             let is_dbl = |x: Cls| matches!(x, Cls::Dbl | Cls::IntK(_));
             // an operand the lane machinery holds as an integer: in the
@@ -2827,7 +2907,7 @@ fn emit_op(
             let laned = |c: &C, v: u8| {
                 c.lane_on && in_lane && (c.lane_of(v).is_some() || c.itmp == Some(v) || c.int_ok.contains(&v))
             };
-            if smi && facts.int_static && (is_int(cb) || laned(c, ins.b)) && (is_int(cc) || laned(c, ins.c)) {
+            if smi && facts.int_static && !withdrawn && (is_int(cb) || laned(c, ins.b)) && (is_int(cc) || laned(c, ins.c)) {
                 // proven ints: 32-bit flag-setting op straight off the
                 // tagged bits (the low word is the int, no unboxing). A
                 // result outside i32 — or a zero product owing a -0 —
@@ -2949,6 +3029,38 @@ fn emit_op(
                     _ => unreachable!(),
                 }
                 c.int_dst(ins.a, 14, pc);
+                return;
+            }
+            // Speculation withdrawn: this function's arithmetic is
+            // double arithmetic (the analysis types it `Dbl`), so
+            // convert both operands once and use the FP unit — the tag
+            // dispatch below would cost four branches an iteration.
+            if smi && withdrawn && num_bc {
+                let db = if cb == Cls::Num {
+                    c.fetch_x(ins.b, 8);
+                    c.any_to_dbl(8, 0);
+                    0
+                } else {
+                    load_dbl(c, cb, ins.b, 0)
+                };
+                let dc = if cc == Cls::Num {
+                    c.fetch_x(ins.c, 9);
+                    c.any_to_dbl(9, 1);
+                    1
+                } else {
+                    load_dbl(c, cc, ins.c, 1)
+                };
+                let dst = if ins.a < LOW { (8 + ins.a) as u32 } else { 2 };
+                match ins.op {
+                    Op::Add => c.a.fadd(dst, db, dc),
+                    Op::Sub => c.a.fsub(dst, db, dc),
+                    Op::Mul => c.a.fmul(dst, db, dc),
+                    _ => unreachable!(),
+                }
+                if ins.a >= LOW {
+                    c.a.str_d_imm(dst, R_SLOTS, C::slot(ins.a));
+                }
+                c.fix_int_write(ins.a, pc);
                 return;
             }
             if dbl_bc || (smi && is_dbl(cb) && is_dbl(cc) && (cb == Cls::Dbl || cc == Cls::Dbl)) {
@@ -3945,6 +4057,10 @@ fn emit_op(
         Op::GetIndex => {
             let slow = c.a.new_label();
             let done = c.a.new_label();
+            // a site specialized to an element kind must not fall back to
+            // the helper: an out-of-bounds read hands back undefined,
+            // which is not the type the consumers were compiled for
+            let ek = facts.elem_kind.get(pc).copied().unwrap_or(EK_ANY);
             if let Some(o) = c.offsets {
                 // An index the lane already holds as an integer needs no
                 // tag guard and no integrality check: it is a sign-extended
@@ -4005,6 +4121,9 @@ fn emit_op(
                     c.a.fcmp(1, 0);
                     c.a.b_cond(Cond::Ne, slow);
                 }
+                if ek != EK_ANY {
+                    c.arr_kind_guard(10, ek, slow);
+                }
                 c.arr_len(14, 10);
                 c.a.cmp_reg(13, 14);
                 c.a.b_cond(Cond::Hs, slow);
@@ -4014,13 +4133,17 @@ fn emit_op(
                 c.a.b(done);
             }
             c.a.bind(slow);
-            c.a.mov(0, R_REALM);
-            c.proto_into(1);
-            c.a.mov_imm64(2, pc as u64);
-            c.fetch_x(ins.b, 3);
-            c.fetch_x(ins.c, 4);
-            c.thin_keep_arrays(c.helpers.get_index);
-            c.put_x(ins.a, 0);
+            if ek != EK_ANY {
+                c.deopt_at(pc);
+            } else {
+                c.a.mov(0, R_REALM);
+                c.proto_into(1);
+                c.a.mov_imm64(2, pc as u64);
+                c.fetch_x(ins.b, 3);
+                c.fetch_x(ins.c, 4);
+                c.thin_keep_arrays(c.helpers.get_index);
+                c.put_x(ins.a, 0);
+            }
             c.a.bind(done);
         }
         Op::SetIndex => {
@@ -4089,11 +4212,21 @@ fn emit_op(
                     c.a.fcmp(1, 0);
                     c.a.b_cond(Cond::Ne, slow);
                 }
-                c.arr_len(14, 10);
+                c.a.ldr_imm(12, 10, 0); // meta: kind low, length high
+                c.a.lsr_imm(14, 12, 32);
                 c.a.cmp_reg(13, 14);
                 c.a.b_cond(Cond::Hs, slow); // growth or out of range
-                c.arr_vals(17, 10, &o);
                 c.fetch_x(ins.c, 9);
+                // a store the array's element kind does not admit goes to
+                // the helper, which widens it. An integer needs no check:
+                // every array kind admits one.
+                let val_int = facts.int_facts.get(pc).is_some_and(|f| f[2])
+                    || c.lane_of(ins.c).is_some()
+                    || c.itmp == Some(ins.c);
+                if !val_int {
+                    c.arr_store_ok(12, 9, slow);
+                }
+                c.arr_vals(17, 10, &o);
                 c.a.str_reg_lsl3(9, 17, 13);
                 c.a.b(done);
             }
@@ -4175,6 +4308,14 @@ fn emit_op(
                 c.a.b_cond(Cond::Hs, slow); // full -> helper (regrow)
                 c.a.add_imm(17, 17, o.elems_vals);
                 c.fetch_x(ins.b, 9);
+                // the pushed value must suit the array's element kind
+                // (x12 already holds the meta word); the helper widens
+                if !(facts.int_facts.get(pc).is_some_and(|f| f[1])
+                    || c.lane_of(ins.b).is_some()
+                    || c.itmp == Some(ins.b))
+                {
+                    c.arr_store_ok(12, 9, slow);
+                }
                 c.a.str_reg_lsl3(9, 17, 13);
                 c.a.mov_imm64(14, 1u64 << 32);
                 c.a.add_reg(12, 12, 14);
@@ -4292,7 +4433,11 @@ fn emit_op(
                 }
             };
             if ins.op == Op::NewArrayLit {
-                c.emit_arr_lit(ins.a, ins.b, n);
+                let kind = lit_arr_kind(
+                    facts.lit_vals.get(pc).map(|v| v.as_slice()).unwrap_or(&[]),
+                    n,
+                );
+                c.emit_arr_lit(ins.a, ins.b, n, kind);
             } else if let Some(&(shape_ptr, sn)) = lit_shapes.get(pc).filter(|&&(sp, _)| sp != 0) {
                 // which literal values need an Int32 check: the field is
                 // Int32 (as of now — widening later only relaxes it) and

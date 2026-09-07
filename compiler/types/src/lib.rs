@@ -40,6 +40,11 @@ pub struct TypedProto {
     /// as Dbl; the fall-in edge (and OSR entry) converts an int-tagged
     /// value to a double and deopts on a non-number.
     pub dbl_hdrs: Vec<(usize, Vec<u8>)>,
+    /// Per back-edge header: every vreg the analysis holds as a double
+    /// there. The fall-in edge needs no guard (the same analysis typed
+    /// the value on that edge), but an OSR entry does — the interpreter
+    /// hands over whatever representation it happened to produce.
+    pub dbl_osr: Vec<(usize, Vec<u8>)>,
     /// Loop-header speculation: (header pc, vregs to number-guard on the
     /// preheader edge). Inside the loop these flow as proven Num; the
     /// compiler must guard the fall-in path (and OSR entries) and deopt
@@ -81,6 +86,13 @@ pub struct TypedProto {
 /// Field representation as the caller reports it per pc, for GetField
 /// and SetField sites with a warm monomorphic cache: 0 Int32, 1 Number,
 /// 2 Any / unknown.
+/// Element kinds a GetIndex site may be specialized to, from the array
+/// cell's kind (see `tsr_memory::cells`): what every array that reached
+/// the site during warmup was made of.
+pub const EK_I32: u8 = 0;
+pub const EK_NUM: u8 = 1;
+pub const EK_ANY: u8 = 2;
+
 pub const REPR_INT32: u8 = 0;
 pub const REPR_NUMBER: u8 = 1;
 pub const REPR_ANY: u8 = 2;
@@ -161,7 +173,14 @@ fn arith(a: T, b: T, int_static: bool) -> T {
     } else if int_static && a.is_int() && b.is_int() {
         T::IntV // the compiled op deopts on overflow
     } else if a.is_num() && b.is_num() {
-        T::Num
+        // A withdrawn destination is compiled as double arithmetic (the
+        // emitter converts both operands), so it really is a double —
+        // but only where every entry into the region converts it, which
+        // is why `dbl_hdrs` carries Dbl-typed vregs at each loop header
+        // for the fall-in edge and for OSR. Typing this `Dbl` without
+        // that guard let compiled code read an int-tagged home as a
+        // double and hung `acc += i`.
+        if int_static { T::Num } else { T::Dbl }
     } else {
         T::Top
     }
@@ -171,7 +190,21 @@ fn arith(a: T, b: T, int_static: bool) -> T {
 /// constants are int-tagged). `int_static`: type `IntV op IntV` as
 /// `IntV`, which the compiled op enforces with an overflow deopt;
 /// withdrawn (`Num`) after those deopts repeat.
-pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: bool) -> TypedProto {
+pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, no_int: u64) -> TypedProto {
+    analyze_with(proto, field_repr, &[], smi, no_int)
+}
+
+pub fn analyze_with(
+    proto: &FunctionProto,
+    field_repr: &[u8],
+    elem_kind: &[u8],
+    smi: bool,
+    no_int: u64,
+) -> TypedProto {
+    // integer speculation is per value: a vreg whose arithmetic already
+    // overflowed i32 at run time is typed `Num` and compiled as doubles,
+    // while the counters beside it keep their integer arms
+    let int_ok = |a: usize| smi && (no_int >> (a as u32).min(63)) & 1 == 0;
     let reject = |reason: &'static str| TypedProto {
         opt_ok: false,
         reason,
@@ -181,6 +214,7 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
         arg_guard: Vec::new(),
         arg_repr: Vec::new(),
         dbl_hdrs: Vec::new(),
+        dbl_osr: Vec::new(),
         loop_spec: Vec::new(),
         int_hdrs: Vec::new(),
         int_spec: Vec::new(),
@@ -189,6 +223,7 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
         lit_vals: Vec::new(),
     };
     let repr_at = |pc: usize| field_repr.get(pc).copied().unwrap_or(REPR_ANY);
+    let ekind_at = |pc: usize| elem_kind.get(pc).copied().unwrap_or(EK_ANY);
     if proto.arity > 8 {
         return reject("arity > 8 (unprofiled)");
     }
@@ -481,11 +516,11 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
             Op::LoadNull | Op::LoadUndef => s[a] = T::Top,
             Op::Move => s[a] = fact(&s, ins.b),
             // string concat possible unless both proven Num
-            Op::Add => s[a] = arith(fact(&s, ins.b), fact(&s, ins.c), int_static),
+            Op::Add => s[a] = arith(fact(&s, ins.b), fact(&s, ins.c), int_ok(a)),
             Op::Sub | Op::Mul => {
                 let (b, c) = (fact(&s, ins.b), fact(&s, ins.c));
                 // numeric result or runtime error — numeric either way
-                s[a] = if b.is_num() && c.is_num() { arith(b, c, int_static) } else { T::Num };
+                s[a] = if b.is_num() && c.is_num() { arith(b, c, int_ok(a)) } else { T::Num };
             }
             Op::Div | Op::Pow => s[a] = T::Dbl,
             // -0 and i32::MIN leave the int range; the lane keeps its own
@@ -502,7 +537,7 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
                     T::IntV => true,
                     _ => false,
                 };
-                s[a] = if int_static && b.is_int() && div_ok { T::IntV } else { T::Num };
+                s[a] = if int_ok(a) && b.is_int() && div_ok { T::IntV } else { T::Num };
             }
             Op::UShr => s[a] = T::Num,
             // ToInt32 results are ints when small ints are on
@@ -532,6 +567,16 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
                 s[a] = match repr_at(pc) {
                     REPR_INT32 => T::IntV,
                     REPR_NUMBER => T::Num,
+                    _ => T::Top,
+                }
+            }
+            // a warm array site: every array seen here was made of one
+            // kind, and the compiled site guards it, so the loaded
+            // element carries that type instead of being unknown
+            Op::GetIndex => {
+                s[a] = match ekind_at(pc) {
+                    EK_I32 if smi => T::IntV,
+                    EK_I32 | EK_NUM => T::Num,
                     _ => T::Top,
                 }
             }
@@ -571,6 +616,7 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
     // paid once per loop entry instead of per use.
     let mut int_spec: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut int_hdrs: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut dbl_at: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut headers: Vec<usize> = body
         .code
         .iter()
@@ -623,6 +669,8 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
                     Op::Move | Op::Neg | Op::BitNot => int_operand(i.b, 0),
                     // a field the shape vouches for as Int32
                     Op::GetField => repr_at(pc2) == REPR_INT32,
+                    // an element of an int-only array
+                    Op::GetIndex => ekind_at(pc2) == EK_I32,
                     _ if keeps_int(i.op) => {
                         int_operand(i.b, 0) && int_operand(i.c, 1)
                     }
@@ -639,7 +687,7 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
         }
 
         let keep: Vec<u8> = (0..nregs)
-            .filter(|&r| hs[r].is_num() && cand[r])
+            .filter(|&r| hs[r].is_num() && cand[r] && int_ok(r))
             .map(|r| r as u8)
             .collect();
         if !keep.is_empty() {
@@ -648,6 +696,14 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
         let ints: Vec<u8> = (0..nregs).filter(|&r| hs[r].is_int()).map(|r| r as u8).collect();
         if !ints.is_empty() {
             int_hdrs.push((h, ints));
+        }
+        // Mirror of the above for doubles: a vreg the analysis holds as
+        // a double here must BE one on every edge into this header —
+        // the fall-in guard covers the loop entry, this covers OSR,
+        // where the interpreter hands over whatever it happened to make.
+        let dbls: Vec<u8> = (0..nregs).filter(|&r| hs[r] == T::Dbl).map(|r| r as u8).collect();
+        if !dbls.is_empty() {
+            dbl_at.push((h, dbls));
         }
     }
 
@@ -659,6 +715,15 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
         let Some(s) = &states[pc] else { continue };
         let f = |r: u8| s.get(r as usize).copied().is_some_and(|t| t.is_int());
         int_facts[pc] = [f(ins.a), f(ins.b), f(ins.c)];
+        if ins.op == Op::NewArrayLit {
+            lit_vals[pc] = (0..ins.c as usize)
+                .map(|j| match s.get(ins.b as usize + j).copied() {
+                    Some(t) if t.is_int() => 0,
+                    Some(t) if t.is_num() => 1,
+                    _ => 2,
+                })
+                .collect();
+        }
         if ins.op == Op::NewObjectLit {
             if let Some(Const::Keys(k)) = body.consts.get(ins.c as usize) {
                 lit_vals[pc] = (0..k.len())
@@ -672,6 +737,8 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
         }
     }
 
+    dbl_at.sort_by_key(|(h, _)| *h);
+
     TypedProto {
         opt_ok: true,
         reason: "",
@@ -681,6 +748,7 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: 
         arg_guard,
         arg_repr,
         dbl_hdrs,
+        dbl_osr: dbl_at,
         loop_spec,
         int_hdrs,
         int_spec,

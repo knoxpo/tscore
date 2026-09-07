@@ -1422,7 +1422,8 @@ impl Heap {
     }
     /// Host-built array (see `alloc_obj_host`).
     pub fn alloc_arr_host(&mut self, values: &[Value]) -> Ref {
-        let a = self.alloc_old_cell(K_ARR, ARR_WORDS, 0);
+        let k = values.iter().fold(K_ARR_I32, |k, v| ekind_join(k, ekind_of(*v)));
+        let a = self.alloc_old_cell(k, ARR_WORDS, 0);
         let e = self.alloc_elems(values.len().max(4), false);
         set_word(a, 1, e);
         elems_slice_mut(e, values.len()).copy_from_slice(values);
@@ -1497,13 +1498,29 @@ impl Heap {
 
     #[inline(always)]
     pub fn arr(&self, r: Ref) -> &[Value] {
-        debug_assert_eq!(kind_of(meta_at(r)), K_ARR);
+        debug_assert!(is_arr(kind_of(meta_at(r))));
         elems_slice(word(r, 1), len_of(meta_at(r)))
     }
+    /// Raw mutable element storage. Anything written through this may be
+    /// of any kind, so the array widens to `K_ARR` first — prefer
+    /// `arr_store`, which widens by what it actually stores.
     #[inline(always)]
     pub fn arr_mut(&mut self, r: Ref) -> &mut [Value] {
-        debug_assert_eq!(kind_of(meta_at(r)), K_ARR);
+        debug_assert!(is_arr(kind_of(meta_at(r))));
+        set_meta(r, with_kind(meta_at(r), K_ARR));
         elems_slice_mut(word(r, 1), len_of(meta_at(r)))
+    }
+    /// Store into an existing element slot, widening the array's element
+    /// kind to admit `v`.
+    #[inline(always)]
+    pub fn arr_store(&mut self, r: Ref, i: usize, v: Value) {
+        let m = meta_at(r);
+        debug_assert!(is_arr(kind_of(m)));
+        let k = ekind_join(kind_of(m), ekind_of(v));
+        if k != kind_of(m) {
+            set_meta(r, with_kind(m, k));
+        }
+        elems_slice_mut(word(r, 1), len_of(m))[i] = v;
     }
     #[inline(always)]
     pub fn arr_len(&self, r: Ref) -> usize {
@@ -1515,11 +1532,10 @@ impl Heap {
         let young = self.young_on();
         let a = if young {
             let a = self.young.alloc(ARR_WORDS);
-            set_meta(a, meta(K_ARR, ARR_WORDS, 0));
+            set_meta(a, meta(K_ARR_I32, ARR_WORDS, 0));
             a
         } else {
-            let a = self.alloc_old_cell(K_ARR, ARR_WORDS, 0);
-            a
+            self.alloc_old_cell(K_ARR_I32, ARR_WORDS, 0)
         };
         let e = self.alloc_elems(cap.max(4), young);
         set_word(a, 1, e);
@@ -1530,7 +1546,8 @@ impl Heap {
     pub fn alloc_arr_lit(&mut self, values: &[Value]) -> Ref {
         let a = self.alloc_arr_empty(values.len());
         elems_slice_mut(word(a, 1), values.len()).copy_from_slice(values);
-        set_meta(a, with_len(meta_at(a), values.len()));
+        let k = values.iter().fold(K_ARR_I32, |k, v| ekind_join(k, ekind_of(*v)));
+        set_meta(a, with_kind(with_len(meta_at(a), values.len()), k));
         a
     }
 
@@ -1547,7 +1564,8 @@ impl Heap {
             e
         };
         elems_slice_mut(e, n + 1)[n] = v;
-        set_meta(r, with_len(meta_at(r), n + 1));
+        let m = meta_at(r);
+        set_meta(r, with_kind(with_len(m, n + 1), ekind_join(kind_of(m), ekind_of(v))));
     }
 
     /// Truncate or extend (with undefined) to `len`.
@@ -1657,7 +1675,7 @@ pub const ELEMS_YOUNG_MAX: usize = 512;
 fn cell_tag(kind: u64) -> u64 {
     match kind {
         K_OBJ => TAG_OBJ,
-        K_ARR => TAG_ARR,
+        K_ARR | K_ARR_I32 | K_ARR_NUM => TAG_ARR,
         K_CLOSURE => TAG_CLOSURE,
         K_CELL => TAG_CELL,
         _ => unreachable!("no Value tag for cell kind {kind}"),

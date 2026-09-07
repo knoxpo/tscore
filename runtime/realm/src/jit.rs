@@ -625,7 +625,7 @@ fn step(
                             return Ok(0);
                         };
                         if i < n {
-                            realm.heap.arr_mut(r)[i] = v;
+                            realm.heap.arr_store(r, i, v);
                         } else if i == n {
                             realm.heap.arr_push(r, v);
                         } else {
@@ -888,7 +888,7 @@ extern "C" fn h_set_index(
                 return ok(r, 0);
             };
             if i < n {
-                r.heap.arr_mut(ar)[i] = v;
+                r.heap.arr_store(ar, i, v);
             } else if i == n {
                 r.heap.arr_push(ar, v);
             } else {
@@ -1407,6 +1407,13 @@ fn note_deopt(proto: &FunctionProto, osr: bool, resume: u64) -> bool {
     if std::env::var_os("TSC_DEOPT_DEBUG").is_some() {
         eprintln!("[deopt] {}'{}' resume={resume} count={deopts} tier={} no_int_spec={}", if osr { "osr " } else { "" }, proto.name, jit.tier.load(Relaxed), jit.no_int_spec.load(Relaxed));
     }
+    // the instruction we resume at is the one that overflowed; its
+    // destination is the value to stop treating as an integer
+    if let Some(ins) = proto.body().code.get(resume as usize) {
+        if matches!(ins.op, Op::Add | Op::Sub | Op::Mul | Op::Mod) {
+            jit.no_int_vregs.fetch_or(1u64 << (ins.a as u32).min(63), Relaxed);
+        }
+    }
     if deopts >= 3 && !jit.no_int_spec.swap(true, Relaxed) {
         jit.deopts.store(0, Relaxed);
         jit.recompile.store(true, Relaxed);
@@ -1532,8 +1539,27 @@ fn compile_optimizing(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> 
         let warm = ic_baked.iter().filter(|e| e.is_some()).count();
         eprintln!("[ics] '{}': {warm}/{sites} field sites baked", proto.name);
     }
+    // what every array reaching each GetIndex site was made of: the
+    // analysis types the loaded element from it, the compiler guards it
+    let elem_kind: Vec<u8> = proto
+        .body()
+        .code
+        .iter()
+        .enumerate()
+        .map(|(pc, i)| {
+            if i.op != Op::GetIndex {
+                return tsc_types::EK_ANY;
+            }
+            match proto.jit.ic_load(n_code, pc) {
+                k if k == tsr_memory::cells::K_ARR_I32 => tsc_types::EK_I32,
+                k if k == tsr_memory::cells::K_ARR_NUM => tsc_types::EK_NUM,
+                _ => tsc_types::EK_ANY,
+            }
+        })
+        .collect();
     let smi = tsr_memory::smi_on();
-    let typed = tsc_types::analyze(proto, &field_repr, smi, smi && !proto.jit.no_int_spec.load(Relaxed));
+    let no_int = proto.jit.no_int_vregs.load(Relaxed);
+    let typed = tsc_types::analyze_with(proto, &field_repr, &elem_kind, smi, no_int);
     if !typed.opt_ok {
         return None;
     }
@@ -1559,15 +1585,18 @@ fn compile_optimizing(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> 
         num: &typed.num_facts,
         jumpif: &jumpif,
         arg_guard: &typed.arg_guard,
-        int_static: smi && !proto.jit.no_int_spec.load(Relaxed),
+        int_static: smi,
+        no_int,
         arg_repr: &typed.arg_repr,
         dbl_hdrs: &typed.dbl_hdrs,
+        dbl_osr: &typed.dbl_osr,
         const_ops: &typed.const_ops,
         ic_baked: &ic_baked,
         loop_spec: &typed.loop_spec,
         int_hdrs: if smi { &typed.int_hdrs } else { &[] },
-        int_spec: if proto.jit.no_int_spec.load(Relaxed) { &[] } else { &typed.int_spec },
+        int_spec: &typed.int_spec,
         field_repr: &field_repr,
+        elem_kind: &elem_kind,
         int_facts: &typed.int_facts,
         dbl: &typed.dbl_facts,
         lit_vals: &typed.lit_vals,

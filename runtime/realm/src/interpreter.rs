@@ -981,9 +981,30 @@ fn run_frame(
                 let idx = reg!(realm, base + ins.c as usize);
                 let v = if idx.is_number() {
                     match obj.as_array() {
-                        Some(r) => tsr_memory::array_index_v(idx)
+                        Some(r) => {
+                            // element-kind feedback for the compiler, while
+                            // this proto is still cold (the same shape as
+                            // the argument feedback above)
+                            if proto.jit.tier.load(std::sync::atomic::Ordering::Relaxed)
+                                == tsc_ir::TIER_COLD
+                            {
+                                let n = proto.body().code.len();
+                                let k = tsr_memory::cells::kind_of(tsr_memory::cells::meta_at(r));
+                                let cur = proto.jit.ic_load(n, pc);
+                                // widen across every array this site saw
+                                let k = if cur == 0 {
+                                    k
+                                } else {
+                                    tsr_memory::cells::ekind_join(cur, k)
+                                };
+                                if k != cur {
+                                    proto.jit.ic_store_raw(n, pc, k);
+                                }
+                            }
+                            tsr_memory::array_index_v(idx)
                             .and_then(|i| realm.heap.arr(r).get(i).copied())
-                            .unwrap_or(Value::UNDEFINED),
+                            .unwrap_or(Value::UNDEFINED)
+                        }
                         None => return Err(err(proto, pc, format!(
                             "cannot index {} with number", obj.type_of()))),
                     }
@@ -1009,7 +1030,7 @@ fn run_frame(
                             // array expando properties unsupported — ignored
                             if let Some(i) = tsr_memory::array_index_v(idx) {
                                 if i < n {
-                                    realm.heap.arr_mut(r)[i] = v;
+                                    realm.heap.arr_store(r, i, v);
                                 } else if i == n {
                                     realm.heap.arr_push(r, v);
                                     realm.heap.allocs_since_gc += 1;

@@ -19,11 +19,51 @@ use std::sync::Arc;
 use tsc_ir::FunctionProto;
 
 pub const K_OBJ: u64 = 1;
+/// Array whose elements are anything (the widest kind).
 pub const K_ARR: u64 = 2;
 pub const K_ELEMS: u64 = 3;
 pub const K_CLOSURE: u64 = 4;
 pub const K_CELL: u64 = 5;
 pub const K_FREE: u64 = 6;
+/// Array whose every element is int-tagged. Holds no references, so a
+/// collection never has to look inside it.
+pub const K_ARR_I32: u64 = 7;
+/// Array whose every element is a number (int-tagged or double).
+pub const K_ARR_NUM: u64 = 8;
+
+/// Is this cell kind one of the array kinds?
+#[inline(always)]
+pub fn is_arr(k: u64) -> bool {
+    k == K_ARR || k == K_ARR_I32 || k == K_ARR_NUM
+}
+/// The narrowest array kind that can hold `v`.
+#[inline(always)]
+pub fn ekind_of(v: crate::Value) -> u64 {
+    if v.is_int() {
+        K_ARR_I32
+    } else if v.is_number() {
+        K_ARR_NUM
+    } else {
+        K_ARR
+    }
+}
+/// Widen `cur` to also admit `add`. Widening only, like a shape's
+/// representation: `I32 -> NUM -> ANY`, and never back.
+#[inline(always)]
+pub fn ekind_join(cur: u64, add: u64) -> u64 {
+    if cur == add {
+        cur
+    } else if cur == K_ARR || add == K_ARR {
+        K_ARR
+    } else {
+        K_ARR_NUM
+    }
+}
+/// The same meta word with a different cell kind.
+#[inline(always)]
+pub fn with_kind(m: u64, kind: u64) -> u64 {
+    (m & !(0xF << KIND_SHIFT)) | (kind << KIND_SHIFT)
+}
 
 pub const M_FWD: u64 = 1;
 pub const M_MARK: u64 = 2;

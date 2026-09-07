@@ -70,10 +70,15 @@ fn trace_cell(heap: &Heap, a: Ref, work: &mut Vec<Value>) {
                 work.extend_from_slice(elems_slice(o.spill, n - OBJ_INLINE));
             }
         }
-        K_ARR => {
+        K_ARR | K_ARR_NUM => {
             let e = word(a, 1);
             mark_cell(e);
             work.extend_from_slice(elems_slice(e, len_of(m)));
+        }
+        // every element is an int: the chunk is live, its contents are
+        // not references, so there is nothing to trace inside it
+        K_ARR_I32 => {
+            mark_cell(word(a, 1));
         }
         K_CLOSURE => work.extend_from_slice(heap.closure(a).upvals()),
         K_CELL => work.push(*heap.cell(a)),
@@ -365,7 +370,7 @@ fn scan_cell(a: Ref, heap: &mut Heap, m: &mut tsr_memory::GcScratch, nur: &mut t
                 heap.obj_mut(a).set_val(i, nv);
             }
         }
-        K_ARR => {
+        K_ARR | K_ARR_NUM => {
             let e = forward_elems(word(a, 1), heap);
             set_word(a, 1, e);
             let n = len_of(mt);
@@ -373,6 +378,12 @@ fn scan_cell(a: Ref, heap: &mut Heap, m: &mut tsr_memory::GcScratch, nur: &mut t
                 let v = elems_slice(e, n)[i];
                 elems_slice_mut(e, n)[i] = forward(v, heap, m, nur);
             }
+        }
+        // int elements are not references: the chunk still moves, its
+        // contents need no rewriting
+        K_ARR_I32 => {
+            let e = forward_elems(word(a, 1), heap);
+            set_word(a, 1, e);
         }
         K_CLOSURE => {
             let n = len_of(mt);

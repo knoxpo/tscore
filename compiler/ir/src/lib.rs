@@ -165,6 +165,13 @@ pub struct JitState {
     /// grew past 2^31), so the header guard kept deopting. Recompiled
     /// once without it instead of demoting to baseline.
     pub no_int_spec: std::sync::atomic::AtomicBool,
+    /// Vregs whose integer arithmetic overflowed i32 at run time (bit
+    /// per vreg, vregs >= 64 fold onto bit 63). Overflow is a property
+    /// of a value, not of a function: withdrawing speculation from the
+    /// whole function also demoted loop counters that never overflow,
+    /// which cost more than it saved (`acc += i` past 2^31 ran 5x
+    /// slower than the same loop with small ints off).
+    pub no_int_vregs: std::sync::atomic::AtomicU64,
     /// Arg-tag bitmasks observed during profiling: 1=number seen,
     /// 2=non-number seen. Fixed 8 slots (args beyond 8 unprofiled).
     pub arg_seen: [AtomicU8; 8],
@@ -210,6 +217,18 @@ impl JitState {
             ((shape_id as u64) << 32) | (slot as u64 + 1),
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// Raw per-pc IC write, for sites whose payload is not a
+    /// (shape, slot) pair — GetIndex records its array's element kind
+    /// here, and no pc is ever both a field site and an index site.
+    pub fn ic_store_raw(&self, code_len: usize, pc: usize, v: u64) {
+        let ics = self.ics.get_or_init(|| {
+            (0..code_len)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect()
+        });
+        ics[pc].store(v, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Force-init and return the TIC table base (for baking into JIT code).
