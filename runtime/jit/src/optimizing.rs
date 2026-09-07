@@ -37,7 +37,7 @@ const R_CLOSURE: u32 = 22;
 const R_ACACHE: u32 = 22;
 /// Realm.const_cache entries (mirrors tsr_realm::CONST_CACHE; 16-byte (key, Value) pairs).
 const CONST_CACHE: usize = 512;
-const CLOSURE_SLOT: u32 = 8;
+const CLOSURE_SLOT: u32 = 24;
 const R_POLL: u32 = 24;
 const R_PROTO: u32 = 26;
 /// Call depth, unless this function traded it for the integer lane.
@@ -56,11 +56,16 @@ const R_DEPTH: u32 = 23;
 /// by `step_full` on every generic slow path (1.5% on promises), and the
 /// safepoint counter is decremented on every back edge, where a spill
 /// would cost instructions per loop iteration.
-const DEPTH_SLOT: u32 = 0;
-/// The loop-carried integer lane. Holds one `int_spec` vreg as a raw
-/// integer for the body of its loop, so an integer dependency chain stops
-/// round-tripping through f64 between every operation.
-const R_LANE: u32 = 23;
+const DEPTH_SLOT: u32 = 16;
+/// `proto.jit.code` from a `*const FunctionProto`
+const JIT_CODE_OFF: u32 =
+    (std::mem::offset_of!(FunctionProto, jit) + std::mem::offset_of!(tsc_ir::JitState, code)) as u32;
+/// proto pointer's frame slot in int_lane mode (x26 is a lane there)
+const PROTO_SLOT: u32 = 0;
+/// integer lane registers, in assignment order: x23 (depth's), x26
+/// (proto's) and x27 (sentinel's), all stashed or rematerialized in
+/// int_lane mode
+const LANE_REGS: [u32; 3] = [23, 26, 27];
 /// Holds one in-flight integer intermediate — an expression like
 /// `(s * 31 + i) % M` only ever has one live at a time.
 ///
@@ -89,6 +94,7 @@ const LOW: u8 = 8;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum JCond {
     Num,
+    Int,
     Bool,
     Other,
 }
@@ -100,6 +106,16 @@ pub struct Facts<'a> {
     pub jumpif: &'a [JCond],
     /// per-arg: entry guard proves numeric
     pub arg_guard: &'a [bool],
+    /// integer speculation is on: `IntV op IntV` may deopt on overflow.
+    /// Withdrawn after repeated deopts — then int operands take the
+    /// tag-dispatching arm, whose overflow makes a double instead
+    pub int_static: bool,
+    /// per-arg representation the guard pins: 0 any number, 1 int
+    /// (integral double converts in place), 2 double (int converts)
+    pub arg_repr: &'a [u8],
+    /// per header: vregs pinned double there; the fall-in edge and OSR
+    /// entry convert an int-tagged value (non-number deopts)
+    pub dbl_hdrs: &'a [(usize, Vec<u8>)],
     /// per-pc (b, c): operand is a known integer constant
     pub const_ops: &'a [[Option<i64>; 2]],
     /// per-pc: warmed GetField/SetField IC contents (shape id, slot) —
@@ -108,6 +124,9 @@ pub struct Facts<'a> {
     /// loop-header speculation: (header pc, vregs) — number-guard on the
     /// fall-in edge and at OSR entry; deopt resumes at the header
     pub loop_spec: &'a [(usize, Vec<u8>)],
+    /// per header: vregs typed integer there; an OSR entry normalizes
+    /// them to int-tagged homes (empty when small ints are off)
+    pub int_hdrs: &'a [(usize, Vec<u8>)],
     /// Loop-carried vregs worth holding unboxed in an integer register.
     /// Non-empty means this function pays for the extra frame slot that
     /// frees x23; empty means its frame is untouched.
@@ -118,6 +137,9 @@ pub struct Facts<'a> {
     pub field_repr: &'a [u8],
     /// per-pc, per-operand: proven i32 integer
     pub int_facts: &'a [[bool; 3]],
+    /// per-pc, per-operand: a double for certain (never int-tagged); the
+    /// unguarded FP lanes need this, not `num`
+    pub dbl: &'a [[bool; 3]],
     /// per NewObjectLit pc: value classes (0 int, 1 num, 2 unknown)
     pub lit_vals: &'a [Vec<u8>],
 }
@@ -132,15 +154,25 @@ struct C {
     ret: Label,
     helpers: Helpers,
     offsets: Option<HeapOffsets>,
+    /// Small ints are live: int-tagged values exist and compiled code
+    /// produces them.
+    smi: bool,
     ics_base: u64,
     tics_base: u64,
     n_low: u8,
     /// This function traded x23 for a frame slot to get an integer lane.
     int_lane: bool,
-    /// vreg held as a raw integer in R_LANE for the current loop.
-    lane: Option<u8>,
+    /// vregs held as raw integers in lane registers for the current
+    /// loop nest: (vreg, register).
+    lanes: Vec<(u8, u32)>,
     /// vreg whose integer value is currently in R_ITMP (block-local).
     itmp: Option<u8>,
+    /// R_ITMP holds `itmp`'s value but its home does not: the write is
+    /// deferred until the vreg is still live where the register is
+    /// reassigned, cleared, spilled or branched away from
+    itmp_dirty: bool,
+    /// the bytecode (for liveness at those points)
+    code: Vec<Instr>,
     /// x22 is the array-base cache in this function.
     acache_on: bool,
     /// x22 is the integer lane's intermediate in this function.
@@ -151,6 +183,31 @@ struct C {
     /// needs no verification; anything outside this set does, because a
     /// bare `fcvtzs` would silently truncate a fraction.
     int_ok: Vec<u8>,
+    /// Out-of-line code emitted after the epilogue: the rarely-taken
+    /// side of a fast-path branch (a deopt, a product's -0 check), so
+    /// the fast path never takes a branch.
+    stubs: Vec<Stub>,
+    /// per pc: the lanes live there (for exit syncs)
+    lanes_at: Vec<Vec<(u8, u32)>>,
+    /// integer speculation on: an int `%` yields an int or deopts (-0,
+    /// x % 0), which is what lets the analysis type it IntV
+    int_static: bool,
+    /// `Skip; Jump` fusion: the Jump at pc+1 is a forward jump nobody
+    /// else targets, so the skip branches on the inverted condition to
+    /// its target and the Jump itself is not emitted.
+    fuse: Option<Label>,
+    skip_next: bool,
+}
+
+enum Stub {
+    /// deopt to `pc` (homes intact; `lanes` as at the branch site)
+    Deopt { l: Label, pc: usize, lanes: Vec<(u8, u32)>, itmp: Option<(u8, bool)> },
+    /// a branch leaving a laned loop: write the lanes it drops to their
+    /// homes, then go
+    Exit { l: Label, sync: Vec<(u8, u32)>, target: Label },
+    /// a zero product owes -0 when either factor is negative: deopt
+    /// then, else back to `ok`
+    MulZero { l: Label, ib: u32, ic: u32, ok: Label, deopt: Label },
 }
 
 impl C {
@@ -158,13 +215,103 @@ impl C {
         i as u32 * 8
     }
 
+    /// R_ITMP's vreg, when its home is stale and the vreg is read again
+    /// from `pc` on (before being rewritten): the sync it needs.
+    fn itmp_live_at(&self, pc: usize) -> Option<u8> {
+        match self.itmp {
+            Some(v) if self.itmp_dirty && live_at(&self.code, pc, v) => Some(v),
+            _ => None,
+        }
+    }
+    /// Write R_ITMP's value to its vreg's home (it was deferred).
+    fn sync_itmp(&mut self, v: u8) {
+        self.sync_lane(v, R_ITMP);
+        self.itmp_dirty = false;
+    }
+    /// R_ITMP is about to be reassigned (to `new`, or freed): give the
+    /// old vreg its home back if anything from `pc` on still reads it.
+    fn retire_itmp(&mut self, pc: usize, new: Option<u8>) {
+        if let Some(old) = self.itmp {
+            if new != Some(old) {
+                if let Some(v) = self.itmp_live_at(pc) {
+                    self.sync_itmp(v);
+                }
+            }
+        }
+        self.itmp_dirty = false;
+    }
+    /// Drop the intermediate at a point control may leave the block
+    /// (a merge, a loop end): its home first, if still needed.
+    fn clear_itmp(&mut self, pc: usize) {
+        self.retire_itmp(pc, None);
+        self.itmp = None;
+    }
+
     /// Operand vreg into an FP register (its home dreg, or `scratch`).
+    /// A laned vreg's home is stale: its register is boxed instead.
     fn fetch(&mut self, v: u8, scratch: u32) -> u32 {
+        if self.itmp == Some(v) {
+            self.box_lane(9, R_ITMP);
+            self.a.fmov_dx(scratch, 9);
+            return scratch;
+        }
+        if let Some(r) = self.lane_of(v) {
+            if self.smi {
+                self.box_lane(9, r);
+                self.a.fmov_dx(scratch, 9);
+            } else {
+                self.a.scvtf(scratch, r);
+            }
+            return scratch;
+        }
         if v < LOW {
             (8 + v) as u32
         } else {
             self.a.ldr_d_imm(scratch, R_SLOTS, Self::slot(v));
             scratch
+        }
+    }
+
+    /// x{x} = the boxed Value of the integer in lane register x{r}.
+    fn box_lane(&mut self, x: u32, r: u32) {
+        if self.smi {
+            self.a.orr_reg32(x, 31, r);
+            self.a.movk(x, tsr_memory::TAG_INT as u16, 48);
+        } else {
+            self.a.scvtf(0, r);
+            self.a.fmov_xd(x, 0);
+        }
+    }
+    /// Write lane register x{r}'s value to vreg `v`'s home (d-reg or
+    /// slot) — the sync a laned vreg pays only at loop exits and spills.
+    fn sync_lane(&mut self, v: u8, r: u32) {
+        if self.smi {
+            self.box_lane(9, r);
+            if v < LOW {
+                self.a.fmov_dx((8 + v) as u32, 9);
+            } else {
+                self.a.str_imm(9, R_SLOTS, Self::slot(v));
+            }
+        } else if v < LOW {
+            self.a.scvtf((8 + v) as u32, r);
+        } else {
+            self.a.scvtf(0, r);
+            self.a.str_d_imm(0, R_SLOTS, Self::slot(v));
+        }
+    }
+    /// vreg `v`'s current Value into its slot for a helper that reads
+    /// slots (a laned vreg from its register, a low vreg from its home).
+    fn spill_vreg(&mut self, v: u8) {
+        if self.itmp == Some(v) && self.itmp_dirty {
+            self.box_lane(9, R_ITMP);
+            self.a.str_imm(9, R_SLOTS, Self::slot(v));
+            return;
+        }
+        if let Some(r) = self.lane_of(v) {
+            self.box_lane(9, r);
+            self.a.str_imm(9, R_SLOTS, Self::slot(v));
+        } else if v < LOW {
+            self.a.str_d_imm((8 + v) as u32, R_SLOTS, Self::slot(v));
         }
     }
 
@@ -180,8 +327,45 @@ impl C {
         }
     }
 
-    /// vreg bits into a GP register.
+    /// The lane register holding vreg `v` as a raw integer, if any.
+    fn lane_of(&self, v: u8) -> Option<u32> {
+        self.lanes.iter().find(|(lv, _)| *lv == v).map(|(_, r)| *r)
+    }
+    /// x{x} = the proto pointer (x26 in plain mode, a frame slot when
+    /// the lanes own it).
+    fn proto_into(&mut self, x: u32) {
+        if self.int_lane {
+            self.a.ldr_imm(x, SP, PROTO_SLOT);
+        } else {
+            self.a.mov(x, R_PROTO);
+        }
+    }
+    /// Flags = x{x} vs the error sentinel (x27 in plain mode; an
+    /// immediate when the lanes own it — x9 is dead after any blr).
+    fn cmp_sentinel(&mut self, x: u32) {
+        if self.int_lane {
+            self.a.mov_imm64(9, JIT_ERR_SENTINEL);
+            self.a.cmp_reg(x, 9);
+        } else {
+            self.a.cmp_reg(x, R_SENTINEL);
+        }
+    }
+
+    /// vreg bits into a GP register (a laned vreg from its register).
     fn fetch_x(&mut self, v: u8, x: u32) {
+        if self.itmp == Some(v) {
+            self.box_lane(x, R_ITMP);
+            return;
+        }
+        if let Some(r) = self.lane_of(v) {
+            self.box_lane(x, r);
+            return;
+        }
+        self.home_x(v, x);
+    }
+    /// vreg `v`'s home bits into a GP register, whatever the lanes say
+    /// (for an arm that just wrote the home and must re-derive the lane).
+    fn home_x(&mut self, v: u8, x: u32) {
         if v < LOW {
             self.a.fmov_xd(x, (8 + v) as u32);
         } else {
@@ -198,9 +382,20 @@ impl C {
         }
     }
 
+    /// Every home to its slot, laned vregs from their registers (x9).
     fn spill_low(&mut self) {
         for i in 0..self.n_low {
             self.a.str_d_imm((8 + i) as u32, R_SLOTS, Self::slot(i));
+        }
+        for (v, r) in self.lanes.clone() {
+            self.box_lane(9, r);
+            self.a.str_imm(9, R_SLOTS, Self::slot(v));
+        }
+        if let Some(v) = self.itmp {
+            if self.itmp_dirty {
+                self.box_lane(9, R_ITMP);
+                self.a.str_imm(9, R_SLOTS, Self::slot(v));
+            }
         }
     }
 
@@ -215,13 +410,45 @@ impl C {
         self.put_x(v, 8);
     }
 
-    /// x10 = tag of x{src}; branch to `slow` when not a number.
+    /// x10 = tag of x{src}; branch to `slow` when neither double nor int.
+    fn guard_numeric(&mut self, src: u32, slow: Label) {
+        self.a.lsr_imm(10, src, 48);
+        self.a.cmp_reg(10, R_TAGLIM);
+        self.a.b_cond(Cond::Hi, slow);
+    }
+    /// x10 = tag of x{src}; branch to `slow` when not a double.
     fn guard_number(&mut self, src: u32, slow: Label) {
         self.a.lsr_imm(10, src, 48);
         self.a.cmp_reg(10, R_TAGLIM);
         self.a.b_cond(Cond::Hs, slow);
     }
 
+
+    /// Box the i32 in w{x} as an int-tagged Value in x{x} (2 instrs).
+    fn box_int(&mut self, x: u32) {
+        self.a.orr_reg32(x, 31, x); // zero-extend: mov wX, wX
+        self.a.movk(x, tsr_memory::TAG_INT as u16, 48);
+    }
+    /// x{x} = the sign-extended i32 held by the int-tagged value in x{x}.
+    fn unbox_int(&mut self, x: u32) {
+        self.a.sxtw(x, x);
+    }
+    /// d{d} = the numeric value in x{x} as a double, whichever
+    /// representation it has. Clobbers x17 (the operand pair x8/x9 stays
+    /// intact, so two of these can run back to back).
+    fn any_to_dbl(&mut self, x: u32, d: u32) {
+        let dbl = self.a.new_label();
+        let done = self.a.new_label();
+        self.a.lsr_imm(17, x, 48);
+        self.a.cmp_reg(17, R_TAGLIM);
+        self.a.b_cond(Cond::Ne, dbl);
+        self.a.sxtw(x, x);
+        self.a.scvtf(d, x);
+        self.a.b(done);
+        self.a.bind(dbl);
+        self.a.fmov_dx(d, x);
+        self.a.bind(done);
+    }
 
     /// x{dst} = the cell address in the boxed value x{src} (low 48 bits).
     fn unbox(&mut self, dst: u32, src: u32) {
@@ -262,14 +489,21 @@ impl C {
     /// intermediate; otherwise it costs the `fcvtzs` that the boxed
     /// representation requires. Callers must have proven `v` numeric.
     fn int_src(&mut self, v: u8, scratch: u32) -> u32 {
-        if self.lane == Some(v) {
-            return R_LANE;
+        if let Some(r) = self.lane_of(v) {
+            return r;
         }
         if self.itmp == Some(v) {
             return R_ITMP;
         }
-        let d = self.fetch(v, 0);
-        self.a.fcvtzs(scratch, d);
+        if self.smi {
+            // an int-tagged home: the lane guard and every int producer
+            // keep int_ok homes that way
+            self.fetch_x(v, scratch);
+            self.unbox_int(scratch);
+        } else {
+            let d = self.fetch(v, 0);
+            self.a.fcvtzs(scratch, d);
+        }
         scratch
     }
 
@@ -297,17 +531,113 @@ impl C {
         self.a.b(self.deopt_exit);
         self.a.bind(ok);
 
-        let home = if self.lane == Some(v) { R_LANE } else { R_ITMP };
+        let home = self.lane_of(v).unwrap_or(R_ITMP);
+        if home == R_ITMP {
+            self.retire_itmp(pc + 1, Some(v));
+        }
         if src != home {
             self.a.mov(home, src);
         }
-        if self.lane == Some(v) {
+        if home != R_ITMP {
             self.itmp = None;
-        } else {
-            self.itmp = Some(v);
+            return; // laned: the register is the value until a sync point
         }
-        self.a.scvtf(3, home);
-        self.put(v, 3);
+        self.itmp = Some(v);
+        if self.smi {
+            self.a.mov(14, home);
+            self.box_int(14);
+            self.put_x(v, 14);
+        } else {
+            self.a.scvtf(3, home);
+            self.put(v, 3);
+        }
+    }
+
+    /// `int_dst` for a result already proven to fit i32, held
+    /// zero-extended in w{src}: the integer register takes it
+    /// sign-extended, the home takes it int-tagged. Clobbers x{src}.
+    ///
+    /// Small ints on: an integer register (lane or intermediate) holds
+    /// its value in the low word only — consumers use w-forms or sign-
+    /// extend themselves — so the move here is free and off the chain.
+    fn int_dst_w(&mut self, v: u8, src: u32, pc: usize) {
+        let home = self.lane_of(v).unwrap_or(R_ITMP);
+        if home == R_ITMP {
+            self.retire_itmp(pc + 1, Some(v));
+        }
+        self.a.mov(home, src);
+        if home != R_ITMP {
+            self.itmp = None;
+            return; // laned: the register is the value until a sync point
+        }
+        // the register is the value; the home is written only where
+        // something will read it (liveness at the reassignment)
+        self.itmp = Some(v);
+        self.itmp_dirty = true;
+    }
+
+    /// After an arm wrote vreg `v`'s home without keeping its integer
+    /// views: bring the lane / intermediate registers that claim `v`
+    /// back in sync and (small ints on) make an int_ok home int-tagged
+    /// again — or deopt past `pc` when the home no longer holds an exact
+    /// i32. Clobbers x8, x9, x12, d0, d1.
+    fn fix_int_write(&mut self, v: u8, pc: usize) {
+        let regs: Vec<u32> =
+            self.lane_of(v).into_iter().chain((self.itmp == Some(v)).then_some(R_ITMP)).collect();
+        let int_home = self.smi && self.int_ok.contains(&v);
+        if regs.is_empty() && !int_home {
+            return;
+        }
+        let r = regs.first().copied().unwrap_or(9);
+        let done = self.a.new_label();
+        let bad = self.a.new_label();
+        self.home_x(v, 8);
+        if self.smi {
+            let is_int = self.a.new_label();
+            self.a.lsr_imm(9, 8, 48);
+            self.a.cmp_reg(9, R_TAGLIM);
+            self.a.b_cond(Cond::Eq, is_int);
+            self.a.b_cond(Cond::Hi, bad);
+            self.a.fmov_dx(0, 8);
+            self.a.fcvtzs(r, 0);
+            self.a.scvtf(1, r);
+            self.a.fcmp(1, 0);
+            self.a.b_cond(Cond::Ne, bad);
+            self.a.sxtw(12, r);
+            self.a.cmp_reg(12, r);
+            self.a.b_cond(Cond::Ne, bad); // wider than i32
+            if int_home {
+                self.a.orr_reg32(8, 31, r);
+                self.a.movk(8, tsr_memory::TAG_INT as u16, 48);
+                self.put_x(v, 8);
+            }
+            self.a.b(done);
+            self.a.bind(is_int);
+            self.a.mov(r, 8); // low word is the int
+        } else {
+            self.a.fmov_dx(0, 8);
+            self.a.fcvtzs(r, 0);
+            self.a.scvtf(1, r);
+            self.a.fcmp(1, 0);
+            self.a.b_cond(Cond::Ne, bad);
+            self.a.sxtw(12, r);
+            self.a.cmp_reg(12, r);
+            self.a.b_cond(Cond::Ne, bad);
+        }
+        self.a.b(done);
+        self.a.bind(bad);
+        // the op has already run and its home is right: resume AFTER it
+        // (resuming at pc re-applied `acc += x` — lane_overflow was 794
+        // over). The home, not the (stale) lane register, is the truth
+        // for this vreg at this spill.
+        let saved = self.lanes.clone();
+        self.lanes.retain(|(lv, _)| *lv != v);
+        self.deopt_at(pc + 1);
+        self.lanes = saved;
+        self.a.bind(done);
+        for &r2 in &regs[1..] {
+            self.a.mov(r2, r);
+        }
     }
 
     /// Current closure, either still in its register or loaded.
@@ -331,7 +661,7 @@ impl C {
         }
         self.fetch_x(v, 8);
         self.a.lsr_imm(10, 8, 48);
-        self.a.movz(11, 0xFFFC, 0); // TAG_ARR
+        self.a.movz(11, tsr_memory::TAG_ARR as u16, 0); // TAG_ARR
         self.a.cmp_reg(10, 11);
         self.a.b_cond(Cond::Ne, slow);
         self.unbox(dst, 8);
@@ -366,12 +696,13 @@ impl C {
         let ok = self.a.new_label();
         self.a.lsr_imm(11, xv, 48);
         self.a.cmp_reg(11, R_TAGLIM);
+        // a number (with small ints on, the int tag counts) needs no barrier
         if !ref_ok {
             // numbers only: the plain guard, no extra branch on the fast path
-            self.a.b_cond(Cond::Hs, fail);
+            self.a.b_cond(if self.smi { Cond::Hi } else { Cond::Hs }, fail);
             return;
         }
-        self.a.b_cond(Cond::Lo, ok);
+        self.a.b_cond(if self.smi { Cond::Ls } else { Cond::Lo }, ok);
         self.unbox(12, xobj);
         self.young_test(12, 14, &o, ok);
         self.a.ldr_imm(14, 12, 0); // meta
@@ -463,7 +794,7 @@ impl C {
         if let Some(o) = o.filter(|_| n <= 8) {
             // the cell stores a raw proto pointer: keep the target alive
             tsr_memory::hold_proto(child);
-            self.bump_old(2 + n as u32, 0xFFFD, &o, slow); // TAG_CLOSURE
+            self.bump_old(2 + n as u32, tsr_memory::TAG_CLOSURE, &o, slow); // TAG_CLOSURE
             self.a.mov_imm64(14, tsr_memory::cells::meta(tsr_memory::cells::K_CLOSURE, 2 + n, n));
             self.a.str_imm(14, 13, 0);
             self.a.mov_imm64(14, std::sync::Arc::as_ptr(child) as u64);
@@ -473,7 +804,7 @@ impl C {
                     tsc_ir::UpvalSrc::ParentLocal(r) => {
                         self.fetch_x(reg(r), 9);
                         self.a.lsr_imm(11, 9, 48);
-                        self.a.movz(14, 0xFFFE, 0); // TAG_CELL
+                        self.a.movz(14, tsr_memory::TAG_CELL as u16, 0); // TAG_CELL
                         self.a.cmp_reg(11, 14);
                         self.a.b_cond(Cond::Ne, slow);
                     }
@@ -494,9 +825,7 @@ impl C {
                 tsc_ir::UpvalSrc::ParentLocal(r) | tsc_ir::UpvalSrc::ParentLocalValue(r) => reg(r),
                 tsc_ir::UpvalSrc::ParentUpval(_) => continue,
             };
-            if src < LOW {
-                self.a.str_d_imm((8 + src) as u32, R_SLOTS, C::slot(src));
-            }
+            self.spill_vreg(src);
         }
         self.a.mov(0, R_REALM);
         self.a.mov_imm64(1, slow_proto);
@@ -529,11 +858,47 @@ impl C {
         self.a.mov_imm64(1, pc as u64);
         self.a.b(self.deopt_exit);
     }
+    /// A label that deopts to `pc`, emitted out of line: branch to it
+    /// on the rare condition and the fast path stays straight.
+    fn deopt_stub(&mut self, pc: usize) -> Label {
+        let l = self.a.new_label();
+        let lanes = self.lanes.clone();
+        let itmp = self.itmp.map(|v| (v, self.itmp_dirty));
+        self.stubs.push(Stub::Deopt { l, pc, lanes, itmp });
+        l
+    }
+    /// The label to branch to for bytecode `target` from `pc`: the
+    /// target itself, or a stub that first syncs the lanes the branch
+    /// leaves behind (the target is outside their loop).
+    fn exit_label(&mut self, pc: usize, target: usize) -> Label {
+        let here = self.lanes_at.get(pc).cloned().unwrap_or_default();
+        let there = self.lanes_at.get(target).cloned().unwrap_or_default();
+        let mut sync: Vec<(u8, u32)> = here.into_iter().filter(|l| !there.contains(l)).collect();
+        if let Some(v) = self.itmp_live_at(target) {
+            sync.push((v, R_ITMP));
+        }
+        let t = self.pc_labels[target];
+        if sync.is_empty() {
+            return t;
+        }
+        let l = self.a.new_label();
+        self.stubs.push(Stub::Exit { l, sync, target: t });
+        l
+    }
 
     /// The boxed number in `xv` has an exact i32 value and is not -0 —
     /// what an Int32 field may hold. Clobbers d0, d1, x11, x12 only —
     /// the literal template holds its object address in x13.
     fn int32_check(&mut self, xv: u32, fail: Label) {
+        let ok = self.a.new_label();
+        if self.smi {
+            // Int32 is the int tag itself: an integral double widens the
+            // field (the helper does it) rather than passing as an int
+            self.a.lsr_imm(11, xv, 48);
+            self.a.cmp_reg(11, R_TAGLIM);
+            self.a.b_cond(Cond::Ne, fail);
+            return;
+        }
         self.a.fmov_dx(0, xv);
         self.a.fcvtzs(11, 0);
         self.a.scvtf(1, 11);
@@ -545,6 +910,7 @@ impl C {
         self.a.mov_imm64(12, (-0.0f64).to_bits());
         self.a.cmp_reg(xv, 12);
         self.a.b_cond(Cond::Eq, fail);
+        self.a.bind(ok);
     }
 
     /// Array literal of `n` values from vregs `first..`: one bump holding
@@ -570,16 +936,14 @@ impl C {
                 c.a.str_imm(9, 13, 16 + o.elems_vals + i as u32 * 8);
             }
             // slack past `n` is never read
-            c.tag_addr(0, 0xFFFC); // TAG_ARR
+            c.tag_addr(0, tsr_memory::TAG_ARR); // TAG_ARR
             c.a.b(done);
         }
         c.a.bind(slow);
         // helper reads values from slots — flush the ones living in
         // d-registers (allocation never GCs, no reload needed)
         for v in first..first + n as u8 {
-            if v < LOW {
-                c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
-            }
+            c.spill_vreg(v);
         }
         c.a.mov(0, R_REALM);
         c.a.mov(1, R_BASE);
@@ -612,9 +976,10 @@ impl C {
                 c.fetch_x(first + i, 9);
                 let cls = checks.get(i as usize).copied().unwrap_or(0);
                 if cls == 2 || cls == 3 {
+                    // a number: with small ints on, an int-tagged value is one
                     c.a.lsr_imm(11, 9, 48);
                     c.a.cmp_reg(11, R_TAGLIM);
-                    c.a.b_cond(Cond::Hs, slow);
+                    c.a.b_cond(if c.smi { Cond::Hi } else { Cond::Hs }, slow);
                 }
                 if cls == 1 || cls == 2 {
                     c.int32_check(9, slow);
@@ -622,14 +987,12 @@ impl C {
                 c.a.str_imm(9, 13, o.obj_inline + i as u32 * 8);
             }
             c.a.str_imm(31, 13, o.obj_spill); // xzr: no spill
-            c.tag_addr(0, 0xFFFB); // TAG_OBJ
+            c.tag_addr(0, tsr_memory::TAG_OBJ); // TAG_OBJ
             c.a.b(done);
         }
         c.a.bind(slow);
         for v in first..first + sn {
-            if v < LOW {
-                c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
-            }
+            c.spill_vreg(v);
         }
         // shape baked at compile time: no per-alloc cache lookup
         c.a.mov(0, R_REALM);
@@ -658,7 +1021,7 @@ impl C {
     fn thin(&mut self, addr: usize) {
         self.a.mov_imm64(8, addr as u64);
         self.a.blr(8);
-        self.a.cmp_reg(0, R_SENTINEL);
+        self.cmp_sentinel(0);
         self.a.b_cond(Cond::Eq, self.bail);
         self.a.add_reg(R_SLOTS, 1, R_BASE);
         self.zero_cache();
@@ -672,7 +1035,7 @@ impl C {
     fn thin_keep_arrays(&mut self, addr: usize) {
         self.a.mov_imm64(8, addr as u64);
         self.a.blr(8);
-        self.a.cmp_reg(0, R_SENTINEL);
+        self.cmp_sentinel(0);
         self.a.b_cond(Cond::Eq, self.bail);
         self.a.add_reg(R_SLOTS, 1, R_BASE);
         self.a.movz(15, 0, 0);
@@ -684,18 +1047,112 @@ impl C {
     fn step_full(&mut self, pc: usize) {
         self.spill_low();
         self.a.mov(0, R_REALM);
-        self.a.mov(1, R_PROTO);
+        self.proto_into(1);
         self.a.mov_imm64(2, pc as u64);
         self.a.mov(3, R_BASE);
         let cl = self.closure(4);
         self.a.mov(4, cl);
         self.a.mov_imm64(8, self.helpers.step as u64);
         self.a.blr(8);
-        self.a.cmp_reg(0, R_SENTINEL);
+        self.cmp_sentinel(0);
         self.a.b_cond(Cond::Eq, self.bail);
         self.a.add_reg(R_SLOTS, 1, R_BASE);
         self.reload_low();
         self.zero_cache();
+    }
+}
+
+/// Signed-integer condition for a compare op (`js_cond` gives the FP one).
+fn int_cond(op: Op) -> Cond {
+    match op {
+        Op::Lt | Op::LtSkip => Cond::Lt,
+        Op::Le | Op::LeSkip => Cond::Le,
+        Op::Gt | Op::GtSkip => Cond::Gt,
+        Op::Ge | Op::GeSkip => Cond::Ge,
+        Op::Eq | Op::EqSkip => Cond::Eq,
+        Op::Ne | Op::NeSkip => Cond::Ne,
+        _ => unreachable!(),
+    }
+}
+
+/// What the analysis proved about an operand's representation.
+#[derive(Clone, Copy, PartialEq)]
+enum Cls {
+    /// an integer constant in i32 range
+    IntK(i64),
+    /// an int-tagged value
+    Int,
+    /// a double for certain
+    Dbl,
+    /// numeric, representation unknown
+    Num,
+    Other,
+}
+
+impl Cls {
+    /// The class with `Other` demoted to `Num` (after a numeric guard).
+    fn min_num(self) -> Cls {
+        if self == Cls::Other { Cls::Num } else { self }
+    }
+}
+
+fn cls_of(facts: &Facts, pc: usize, side: usize, smi: bool) -> Cls {
+    if let Some(k) = facts.const_ops.get(pc).and_then(|o| o[side]) {
+        if (i32::MIN as i64..=i32::MAX as i64).contains(&k) {
+            return Cls::IntK(k);
+        }
+    }
+    let f = |v: &[[bool; 3]]| v.get(pc).is_some_and(|x| x[side + 1]);
+    if f(facts.dbl) {
+        Cls::Dbl
+    } else if smi && f(facts.int_facts) {
+        Cls::Int
+    } else if f(facts.num) {
+        Cls::Num
+    } else {
+        Cls::Other
+    }
+}
+
+/// Load an operand as a double into d{d} (or return its home). Only for
+/// `IntK`/`Dbl`/`Int` classes; `Num` needs the dynamic path.
+fn load_dbl(c: &mut C, cls: Cls, v: u8, d: u32) -> u32 {
+    // scratch x12: the operand pair x8/x9 of a caller stays intact
+    match cls {
+        Cls::IntK(k) => {
+            c.a.mov_imm64(12, (k as f64).to_bits());
+            c.a.fmov_dx(d, 12);
+            d
+        }
+        Cls::Int => {
+            c.fetch_x(v, 12);
+            c.a.sxtw(12, 12);
+            c.a.scvtf(d, 12);
+            d
+        }
+        _ => c.fetch(v, d),
+    }
+}
+
+/// Load an operand as an i32 in the low word of x{x} (consumers use
+/// the w-forms; the upper word is the tag or a sign extension). `IntK`
+/// or `Int` (an int-tagged home, or the lane / intermediate register).
+fn load_int(c: &mut C, cls: Cls, v: u8, x: u32) -> u32 {
+    match cls {
+        Cls::IntK(k) => {
+            c.a.mov_imm64(x, k as u64);
+            x
+        }
+        _ => {
+            if let Some(r) = c.lane_of(v) {
+                return r;
+            }
+            if c.itmp == Some(v) {
+                return R_ITMP;
+            }
+            c.fetch_x(v, x);
+            x
+        }
     }
 }
 
@@ -757,6 +1214,54 @@ pub fn compile(
         }
     }
 
+    // Integer lanes. Loops outer-first; each takes its picks into the
+    // lane registers its enclosing loops left free, so a nest keeps the
+    // outer counter live through the inner loop. Per pc: the lanes and
+    // int_ok vregs of every enclosing laned loop.
+    let loops: Vec<(usize, usize)> = {
+        let mut hs: Vec<(usize, usize)> = pbody
+            .code
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.op == Op::Jump && i.sbx() < 0)
+            .map(|(pc, i)| ((pc as i64 + i.sbx() as i64 + 1) as usize, pc))
+            .collect();
+        hs.sort_by_key(|&(h, e)| (std::cmp::Reverse(e - h), h));
+        hs.dedup_by_key(|&mut (h, _)| h);
+        hs.reverse(); // innermost first: the hot loop picks its registers first
+        hs
+    };
+    let mut lane_assign: Vec<(usize, Vec<(u8, u32)>)> = Vec::new();
+    let mut lanes_at: Vec<Vec<(u8, u32)>> = vec![Vec::new(); pbody.code.len() + 2];
+    let mut int_ok_at: Vec<Vec<u8>> = vec![Vec::new(); pbody.code.len() + 2];
+    for &(h, end) in &loops {
+        let Some((_, vs)) = facts.int_spec.iter().find(|(hh, _)| *hh == h) else { continue };
+        // registers the loops nested inside this one already hold
+        let mut taken: Vec<(u8, u32)> = Vec::new();
+        for pc in h..=end {
+            for l in &lanes_at[pc] {
+                if !taken.contains(l) {
+                    taken.push(*l);
+                }
+            }
+        }
+        let free: Vec<u32> =
+            LANE_REGS.iter().copied().filter(|r| !taken.iter().any(|(_, t)| t == r)).collect();
+        let picks: Vec<(u8, u32)> = lane_picks(pbody, facts, h, vs)
+            .into_iter()
+            .filter(|v| !taken.iter().any(|(tv, _)| tv == v))
+            .zip(free)
+            .collect();
+        if picks.is_empty() {
+            continue;
+        }
+        for pc in h..=end {
+            lanes_at[pc].extend(picks.iter().copied());
+            int_ok_at[pc].extend(vs.iter().copied());
+        }
+        lane_assign.push((h, picks));
+    }
+
     let n_low = pbody.n_regs.min(LOW);
     let mut c = {
         let mut a = Asm::new();
@@ -768,31 +1273,14 @@ pub fn compile(
         // left one of them unused in any function that does both, which is
         // every realistic one.
         let acache_on = pbody.code.iter().any(|i| matches!(i.op, Op::Len | Op::GetIndex));
-        let lane_on = facts.int_spec.iter().any(|(h, vs)| {
-            let end = pbody
-                .code
-                .iter()
-                .enumerate()
-                .filter(|(p2, i)| {
-                    i.op == Op::Jump
-                        && i.sbx() < 0
-                        && (*p2 as i64 + i.sbx() as i64 + 1) as usize == *h
-                })
-                .map(|(p2, _)| p2)
-                .max()
-                .unwrap_or(*h);
-            !pbody.code[*h..=end]
-                .iter()
-                .any(|_| false) // array loops allowed: x21 is the intermediate now, x22 stays the array cache
-                && lane_here(pbody, facts, *h, vs).is_some()
-        });
+        let lane_on = !lane_assign.is_empty();
         let int_lane = acache_on || lane_on;
         let bail = a.new_label();
         let await_exit = a.new_label();
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, ics_base, tics_base, n_low, int_lane, lane: None, itmp: None, acache_on, lane_on, int_ok: Vec::new() }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, fuse: None, skip_next: false }
     };
     let out = c.a.new_label();
 
@@ -815,17 +1303,18 @@ pub fn compile(
     // keeps SP 16-byte aligned)
     if c.int_lane {
         c.a.stp_pre(4, 3, SP, -16);
+        c.a.stp_pre(1, 1, SP, -16); // proto: x26 is a lane register
         if c.acache_on {
             c.a.movz(R_ACACHE, 0, 0);
         }
     } else {
         c.a.mov(R_DEPTH, 4);
         c.a.mov(R_CLOSURE, 3);
+        c.a.mov(R_PROTO, 1);
+        c.a.mov_imm64(R_SENTINEL, JIT_ERR_SENTINEL);
     }
     c.a.mov(R_REALM, 0);
-    c.a.mov(R_PROTO, 1);
     c.a.mov(R_BASE, 2);
-    c.a.mov_imm64(R_SENTINEL, JIT_ERR_SENTINEL);
     c.a.movz(R_TAGLIM, 0xFFF9, 0);
     c.a.movz(R_POLL, SAFEPOINT_INTERVAL, 0);
 
@@ -853,10 +1342,17 @@ pub fn compile(
         if !g {
             continue;
         }
-        c.fetch_x(i as u8, 8);
-        c.a.lsr_imm(9, 8, 48);
-        c.a.cmp_reg(9, R_TAGLIM);
-        c.a.b_cond(Cond::Hs, deopt_entry);
+        match facts.arg_repr.get(i).copied().unwrap_or(0) {
+            // int-tagged, or an integral double normalized in place
+            1 => emit_lane_guard(&mut c, &[i as u8], &[], deopt_entry),
+            2 => emit_dbl_guard(&mut c, &[i as u8], deopt_entry),
+            _ => {
+                c.fetch_x(i as u8, 8);
+                c.a.lsr_imm(9, 8, 48);
+                c.a.cmp_reg(9, R_TAGLIM);
+                c.a.b_cond(Cond::Hi, deopt_entry); // numeric: an int or a double
+            }
+        }
     }
 
     // OSR dispatch: start_pc != 0 jumps to the matching loop header
@@ -876,11 +1372,10 @@ pub fn compile(
         for h in headers {
             c.a.mov_imm64(8, h as u64);
             c.a.cmp_reg(R_STARTPC, 8);
-            let ints = c
-                .lane_on
-                .then(|| facts.int_spec.iter().find(|(hh, _)| *hh == h))
-                .flatten();
-            if facts.loop_spec.iter().any(|(hh, _)| *hh == h) || ints.is_some() {
+            let laned_here = !lanes_at[h].is_empty();
+            let int_hdr = facts.int_hdrs.iter().find(|(hh, _)| *hh == h);
+            let dbl_hdr = facts.dbl_hdrs.iter().find(|(hh, _)| *hh == h);
+            if facts.loop_spec.iter().any(|(hh, _)| *hh == h) || laned_here || int_hdr.is_some() || dbl_hdr.is_some() {
                 // speculated header: entering mid-loop must re-establish
                 // the guards (slots are current; d-homes just reloaded)
                 let vs: &[u8] = facts
@@ -895,12 +1390,22 @@ pub fn compile(
                     c.fetch_x(v, 8);
                     c.a.lsr_imm(10, 8, 48);
                     c.a.cmp_reg(10, R_TAGLIM);
-                    c.a.b_cond(Cond::Hs, fail);
+                    c.a.b_cond(Cond::Hi, fail);
                 }
-                if let Some((_, ivs)) = ints {
-                    let laned = lane_pick(pbody, facts, h, ivs);
-                    if laned.is_some() {
-                        emit_lane_guard(&mut c, ivs, laned, fail);
+                // int-typed vregs first: the interpreter may hand over an
+                // integral double where the body reads int bits
+                if let Some((_, hv)) = int_hdr {
+                    emit_lane_guard(&mut c, hv, &[], fail);
+                }
+                if let Some((_, dv)) = dbl_hdr {
+                    emit_dbl_guard(&mut c, dv, fail);
+                }
+                // every enclosing laned loop's registers, outer first
+                for (lh, laned) in lane_assign.iter() {
+                    let lend = loops.iter().find(|(x, _)| x == lh).map_or(*lh, |(_, e)| *e);
+                    if *lh <= h && h <= lend {
+                        let (_, vs) = facts.int_spec.iter().find(|(hh, _)| hh == lh).unwrap();
+                        emit_lane_guard(&mut c, vs, laned, fail);
                     }
                 }
                 let l = c.pc_labels[h];
@@ -949,41 +1454,8 @@ pub fn compile(
             _ => {}
         }
     }
-    // pcs inside a loop that took the integer lane: there x22 is the
-    // integer intermediate, so the array cache must keep off it
-    let mut in_lane = vec![false; pbody.code.len() + 2];
-    if c.lane_on {
-        for (h, vs) in facts.int_spec.iter() {
-            if lane_here(pbody, facts, *h, vs).is_none() {
-                continue;
-            }
-            let end = pbody
-                .code
-                .iter()
-                .enumerate()
-                .filter(|(p2, i)| {
-                    i.op == Op::Jump
-                        && i.sbx() < 0
-                        && (*p2 as i64 + i.sbx() as i64 + 1) as usize == *h
-                })
-                .map(|(p2, _)| p2)
-                .max()
-                .unwrap_or(*h);
-            // The lane and the array-base cache each want a register per
-            // loop. A loop that indexes arrays keeps it for the cache:
-            // losing that measured 12.8% on a three-read array loop,
-            // against what the lane wins there.
-            if pbody.code[*h..=end]
-                .iter()
-                .any(|_| false) // array loops allowed: x21 is the intermediate now, x22 stays the array cache
-            {
-                continue;
-            }
-            for f in in_lane.iter_mut().take(end + 1).skip(*h) {
-                *f = true;
-            }
-        }
-    }
+    let in_lane: Vec<bool> = lanes_at.iter().map(|l| !l.is_empty()).collect();
+    c.lanes_at = lanes_at.clone();
     let mut fcache: Option<u8> = None;
     // which vreg's array data pointer is in R_ACACHE (0 there = invalid)
     let mut acache: Option<u8> = None;
@@ -1060,10 +1532,15 @@ pub fn compile(
         // vreg would read a register nothing reloaded: two consecutive
         // loops on one counter ran the second from the first's final
         // value (found the day array loops became eligible).
+        // (this header's own picks join after its guard, which reads
+        // their homes)
+        c.lanes = lanes_at[pc].clone();
+        if let Some((_, own)) = lane_assign.iter().find(|(h, _)| *h == pc) {
+            c.lanes.retain(|l| !own.contains(l));
+        }
+        c.int_ok = int_ok_at[pc].clone();
         if !in_lane[pc] {
-            c.lane = None;
-            c.itmp = None;
-            c.int_ok.clear();
+            c.clear_itmp(pc);
         }
         // loop-header speculation: guard the fall-in path (back-edges jump
         // to the label BELOW these guards and are already proven)
@@ -1072,25 +1549,34 @@ pub fn compile(
         // edge only — back edges branch to the label below it — so an
         // integer chain pays one conversion per loop entry instead of two
         // per iteration.
-        if c.lane_on {
-            if let Some((_, vs)) = facts.int_spec.iter().find(|(h, _)| *h == pc) {
-                let laned = lane_here(pbody, facts, pc, vs);
-                if laned.is_some() {
-                    let ok = c.a.new_label();
-                    let fail = c.a.new_label();
-                    emit_lane_guard(&mut c, vs, laned, fail);
-                    c.a.b(ok);
-                    c.a.bind(fail);
-                    c.spill_low();
-                    c.a.movz(0, 2, 0);
-                    c.a.mov_imm64(1, pc as u64);
-                    c.a.b(c.deopt_exit);
-                    c.a.bind(ok);
-                    c.lane = laned;
-                    c.itmp = None;
-                    c.int_ok = vs.clone();
-                }
-            }
+        if let Some((_, laned)) = lane_assign.iter().find(|(h, _)| *h == pc) {
+            let (_, vs) = facts.int_spec.iter().find(|(h, _)| *h == pc).unwrap();
+            let ok = c.a.new_label();
+            let fail = c.a.new_label();
+            emit_lane_guard(&mut c, vs, laned, fail);
+            c.a.b(ok);
+            c.a.bind(fail);
+            c.spill_low();
+            c.a.movz(0, 2, 0);
+            c.a.mov_imm64(1, pc as u64);
+            c.a.b(c.deopt_exit);
+            c.a.bind(ok);
+            c.clear_itmp(pc);
+            c.lanes = lanes_at[pc].clone();
+        }
+        // double pinning: the fall-in edge converts an int (`let zr = 0`
+        // into a double recurrence); back edges arrive as doubles
+        if let Some((_, vs)) = facts.dbl_hdrs.iter().find(|(h, _)| *h == pc) {
+            let fail = c.a.new_label();
+            let pass = c.a.new_label();
+            emit_dbl_guard(&mut c, vs, fail);
+            c.a.b(pass);
+            c.a.bind(fail);
+            c.spill_low();
+            c.a.movz(0, 2, 0);
+            c.a.mov_imm64(1, pc as u64);
+            c.a.b(c.deopt_exit);
+            c.a.bind(pass);
         }
         if let Some((_, vs)) = facts.loop_spec.iter().find(|(h, _)| *h == pc) {
             let fail = c.a.new_label();
@@ -1099,7 +1585,7 @@ pub fn compile(
                 c.fetch_x(v, 8);
                 c.a.lsr_imm(10, 8, 48);
                 c.a.cmp_reg(10, R_TAGLIM);
-                c.a.b_cond(Cond::Hs, fail);
+                c.a.b_cond(Cond::Hi, fail);
             }
             c.a.b(pass);
             c.a.bind(fail);
@@ -1111,6 +1597,18 @@ pub fn compile(
         }
         let l = c.pc_labels[pc];
         c.a.bind(l);
+        if c.skip_next {
+            // the Jump a Skip just fused away
+            c.skip_next = false;
+            continue;
+        }
+        c.fuse = match pbody.code.get(pc + 1) {
+            Some(j) if j.op == Op::Jump && j.sbx() >= 0 && !jump_targets[pc + 1] => {
+                let target = (pc as i64 + 1 + j.sbx() as i64 + 1) as usize;
+                Some(c.exit_label(pc, target))
+            }
+            _ => None,
+        };
         emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache, in_lane[pc], primary_at[pc]);
         // ops with only cold-path blrs (which zero x15) preserve the cache;
         // everything else — calls, allocation, heap ops that clobber
@@ -1129,11 +1627,13 @@ pub fn compile(
         // R_ITMP is callee-saved, so an intermediate survives intervening
         // ops and calls; it dies only when its vreg is rewritten by
         // something other than an integer arm, or at a merge
-        if c.itmp == Some(ins.a) && !matches!(ins.op, Op::Add | Op::Sub | Op::Mul | Op::Mod) {
+        if c.itmp == Some(ins.a) && !matches!(ins.op, Op::Add | Op::Sub | Op::Mul | Op::Mod | Op::GetField) {
+            // rewritten by another arm: the home is the value
             c.itmp = None;
+            c.itmp_dirty = false;
         }
         if jump_targets[pc.saturating_add(1)] {
-            c.itmp = None;
+            c.clear_itmp(pc + 1);
         }
         // the array cache follows the same conservative set plus its own
         // arms; a back edge runs a safepoint, which can move the arena
@@ -1203,7 +1703,7 @@ pub fn compile(
     c.a.movz(0, 3, 0); // suspend: info stashed in realm.jit_await
     c.a.bind(out);
     if c.int_lane {
-        c.a.ldp_post(9, 10, SP, 16); // discard the depth slot
+        c.a.add_imm(SP, SP, 32); // discard the proto and depth slots
     }
     for i in (0..d_pairs).rev() {
         // ldp d(8+2i), d(9+2i), [sp], #16
@@ -1218,7 +1718,87 @@ pub fn compile(
     c.a.ldp_post(29, 30, SP, 16);
     c.a.ret();
 
+    // out-of-line stubs (each ends in a branch back or a deopt exit)
+    for st in std::mem::take(&mut c.stubs) {
+        match st {
+            Stub::Deopt { l, pc, lanes, itmp } => {
+                c.a.bind(l);
+                let saved = std::mem::replace(&mut c.lanes, lanes);
+                let (si, sd) = (c.itmp, c.itmp_dirty);
+                (c.itmp, c.itmp_dirty) = match itmp {
+                    Some((v, d)) => (Some(v), d),
+                    None => (None, false),
+                };
+                c.deopt_at(pc);
+                c.lanes = saved;
+                (c.itmp, c.itmp_dirty) = (si, sd);
+            }
+            Stub::Exit { l, sync, target } => {
+                c.a.bind(l);
+                for (v, r) in sync {
+                    c.sync_lane(v, r);
+                }
+                c.a.b(target);
+            }
+            Stub::MulZero { l, ib, ic, ok, deopt } => {
+                c.a.bind(l);
+                c.a.orr_reg32(12, ib, ic);
+                c.a.cmp_imm32(12, 0);
+                c.a.b_cond(Cond::Lt, deopt);
+                c.a.b(ok);
+            }
+        }
+    }
+
     Some(c.a.finish())
+}
+
+/// Does anything from `start` on read vreg `v` before rewriting it?
+/// A DFS over the bytecode's forward and backward edges; operand sets
+/// are exact for the plain ops and conservative (read) for the rest.
+fn live_at(code: &[Instr], start: usize, v: u8) -> bool {
+    let reads = |i: &Instr| -> bool {
+        match i.op {
+            Op::LoadConst | Op::LoadInt | Op::LoadBool | Op::LoadNull | Op::LoadUndef
+            | Op::Jump | Op::GetGlobal | Op::Halt => false,
+            Op::Return | Op::JumpIfFalse | Op::JumpIfTrue | Op::Await => i.a == v,
+            Op::Call => v == i.a || (v > i.a && v as usize <= i.a as usize + i.b as usize),
+            Op::NewArrayLit => v >= i.b && (v as usize) < i.b as usize + i.c as usize,
+            Op::NewObjectLit | Op::Concat | Op::Closure => true,
+            Op::SetField | Op::SetIndex | Op::ArrayPush | Op::StoreCell | Op::SetUpval
+            | Op::NewCell => i.a == v || i.b == v || i.c == v,
+            _ => i.b == v || i.c == v,
+        }
+    };
+    let mut seen = vec![false; code.len() + 2];
+    let mut stack = vec![start];
+    while let Some(pc) = stack.pop() {
+        if pc >= code.len() || seen[pc] {
+            continue;
+        }
+        seen[pc] = true;
+        let i = &code[pc];
+        if reads(i) {
+            return true;
+        }
+        if writes_a_op(i.op) && i.a == v {
+            continue; // rewritten on this path
+        }
+        match i.op {
+            Op::Jump => stack.push((pc as i64 + i.sbx() as i64 + 1) as usize),
+            Op::JumpIfFalse | Op::JumpIfTrue => {
+                stack.push(pc + 1);
+                stack.push((pc as i64 + i.sbx() as i64 + 1) as usize);
+            }
+            Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip | Op::GeSkip => {
+                stack.push(pc + 1);
+                stack.push(pc + 2);
+            }
+            Op::Return | Op::Halt => {}
+            _ => stack.push(pc + 1),
+        }
+    }
+    false
 }
 
 /// Magic-number constants for signed division by a fixed divisor:
@@ -1279,18 +1859,151 @@ fn magic_div(d: i64) -> Option<(i64, u32)> {
 /// loop that tiers up mid-flight arrives at the header label directly,
 /// below the fall-in guard, and would otherwise run the body against an
 /// uninitialised lane register.
-fn emit_lane_guard(c: &mut C, vs: &[u8], laned: Option<u8>, fail: Label) {
+/// Each vreg in `vs` becomes a double in its home: an int-tagged value
+/// converts, a double passes, anything else branches to `fail`.
+fn emit_dbl_guard(c: &mut C, vs: &[u8], fail: Label) {
     for &v in vs {
-        let d = c.fetch(v, 0);
-        c.a.fcvtzs(10, d);
-        c.a.scvtf(1, 10);
-        c.a.fcmp(1, d); // integral?
-        c.a.b_cond(Cond::Ne, fail);
-        c.a.sxtw(12, 10);
-        c.a.cmp_reg(12, 10);
-        c.a.b_cond(Cond::Ne, fail); // wider than i32
-        if Some(v) == laned {
-            c.a.mov(R_LANE, 10);
+        let next = c.a.new_label();
+        c.fetch_x(v, 8);
+        c.a.lsr_imm(10, 8, 48);
+        c.a.cmp_reg(10, R_TAGLIM);
+        c.a.b_cond(Cond::Hi, fail);
+        c.a.b_cond(Cond::Ne, next); // already a double
+        c.a.sxtw(8, 8);
+        c.a.scvtf(0, 8);
+        c.put(v, 0);
+        c.a.bind(next);
+    }
+}
+
+/// `+ - *` on two numeric operands of unknown representation (small
+/// ints on): both int-tagged -> 32-bit op, overflow or a -0 product
+/// -> doubles; any other mix -> doubles. Result to vreg `va`'s home.
+/// Callers must have proven both operands numeric.
+fn emit_arith_dyn(c: &mut C, op: Op, vb: u8, vc: u8, va: u8) {
+    let as_dbl = c.a.new_label();
+    let done = c.a.new_label();
+    let nz = c.a.new_label();
+    let zero = c.a.new_label();
+    if !c.int_static {
+        // speculation withdrawn here: the values that reached this op
+        // outgrew i32, so doubles are the common case — test for two
+        // doubles first and run them straight from the homes
+        let mixed = c.a.new_label();
+        c.fetch_x(vb, 8);
+        c.fetch_x(vc, 9);
+        c.a.lsr_imm(10, 8, 48);
+        c.a.cmp_reg(10, R_TAGLIM);
+        c.a.b_cond(Cond::Hs, mixed);
+        c.a.lsr_imm(11, 9, 48);
+        c.a.cmp_reg(11, R_TAGLIM);
+        c.a.b_cond(Cond::Hs, mixed);
+        c.a.fmov_dx(0, 8);
+        c.a.fmov_dx(1, 9);
+        match op {
+            Op::Add => c.a.fadd(0, 0, 1),
+            Op::Sub => c.a.fsub(0, 0, 1),
+            Op::Mul => c.a.fmul(0, 0, 1),
+            _ => unreachable!(),
+        }
+        c.put(va, 0);
+        c.a.b(done);
+        c.a.bind(mixed);
+        c.a.cmp_reg(10, R_TAGLIM);
+        c.a.b_cond(Cond::Ne, as_dbl);
+        c.a.cmp_reg(11, R_TAGLIM);
+        c.a.b_cond(Cond::Ne, as_dbl);
+    } else {
+        c.fetch_x(vb, 8);
+        c.fetch_x(vc, 9);
+        c.a.lsr_imm(10, 8, 48);
+        c.a.lsr_imm(11, 9, 48);
+        c.a.cmp_reg(10, R_TAGLIM);
+        c.a.b_cond(Cond::Ne, as_dbl);
+        c.a.cmp_reg(11, R_TAGLIM);
+        c.a.b_cond(Cond::Ne, as_dbl);
+    }
+    match op {
+        Op::Add => {
+            c.a.adds_reg32(14, 8, 9);
+            c.a.b_cond(Cond::Vs, as_dbl);
+        }
+        Op::Sub => {
+            c.a.subs_reg32(14, 8, 9);
+            c.a.b_cond(Cond::Vs, as_dbl);
+        }
+        Op::Mul => {
+            c.a.smull(14, 8, 9);
+            c.a.cmp_ext_sxtw(14, 14);
+            c.a.b_cond(Cond::Ne, as_dbl);
+            c.a.orr_reg32(14, 31, 14);
+            c.a.cbz32(14, zero);
+        }
+        _ => unreachable!(),
+    }
+    c.a.bind(nz);
+    c.a.movk(14, tsr_memory::TAG_INT as u16, 48);
+    c.put_x(va, 14);
+    c.a.b(done);
+    if op == Op::Mul {
+        // a zero product owes -0 when either factor is negative
+        c.a.bind(zero);
+        c.a.orr_reg32(12, 8, 9);
+        c.a.cmp_imm32(12, 0);
+        c.a.b_cond(Cond::Ge, nz);
+    }
+    c.a.bind(as_dbl);
+    c.any_to_dbl(8, 0);
+    c.any_to_dbl(9, 1);
+    match op {
+        Op::Add => c.a.fadd(0, 0, 1),
+        Op::Sub => c.a.fsub(0, 0, 1),
+        Op::Mul => c.a.fmul(0, 0, 1),
+        _ => unreachable!(),
+    }
+    c.put(va, 0);
+    c.a.bind(done);
+}
+
+fn emit_lane_guard(c: &mut C, vs: &[u8], laned: &[(u8, u32)], fail: Label) {
+    for &v in vs {
+        if c.smi {
+            // int-tagged already, or an integral i32 double that becomes
+            // one here: inside the loop every int_ok home is int-tagged
+            let is_int = c.a.new_label();
+            let next = c.a.new_label();
+            c.fetch_x(v, 8);
+            c.a.lsr_imm(9, 8, 48);
+            c.a.cmp_reg(9, R_TAGLIM);
+            c.a.b_cond(Cond::Eq, is_int);
+            c.a.b_cond(Cond::Hi, fail);
+            c.a.fmov_dx(0, 8);
+            c.a.fcvtzs(10, 0);
+            c.a.scvtf(1, 10);
+            c.a.fcmp(1, 0); // integral?
+            c.a.b_cond(Cond::Ne, fail);
+            c.a.sxtw(12, 10);
+            c.a.cmp_reg(12, 10);
+            c.a.b_cond(Cond::Ne, fail); // wider than i32
+            c.a.mov(8, 10);
+            c.box_int(8);
+            c.put_x(v, 8);
+            c.a.b(next);
+            c.a.bind(is_int);
+            c.a.sxtw(10, 8);
+            c.a.bind(next);
+        } else {
+            let d = c.fetch(v, 0);
+            c.a.fcvtzs(10, d);
+            c.a.scvtf(1, 10);
+            c.a.fcmp(1, d); // integral?
+            c.a.b_cond(Cond::Ne, fail);
+            c.a.sxtw(12, 10);
+            c.a.cmp_reg(12, 10);
+            c.a.b_cond(Cond::Ne, fail); // wider than i32
+        }
+        if let Some(&(_, r)) = laned.iter().find(|(lv, _)| *lv == v) {
+            c.a.mov(r, 10);
         }
     }
 }
@@ -1312,26 +2025,7 @@ fn writes_a_op(op: Op) -> bool {
     )
 }
 
-fn lane_here(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> Option<u8> {
-    let pick = lane_pick(pbody, facts, h, vs)?;
-    let end = pbody
-        .code
-        .iter()
-        .enumerate()
-        .filter(|(p2, i)| {
-            i.op == Op::Jump && i.sbx() < 0 && (*p2 as i64 + i.sbx() as i64 + 1) as usize == h
-        })
-        .map(|(p2, _)| p2)
-        .max()
-        .unwrap_or(h);
-    let inner_laned = facts
-        .int_spec
-        .iter()
-        .any(|(h2, vs2)| *h2 > h && *h2 <= end && lane_pick(pbody, facts, *h2, vs2).is_some());
-    (!inner_laned).then_some(pick)
-}
-
-fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> Option<u8> {
+fn lane_picks(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> Vec<u8> {
     let end = pbody
         .code
         .iter()
@@ -1353,7 +2047,7 @@ fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> O
     // became eligible. There is no integer chain worth keeping across a
     // suspension anyway.
     if pbody.code[h..=end].iter().any(|i| i.op == Op::Await) {
-        return None;
+        return Vec::new();
     }
     let converts = pbody.code[h..=end].iter().enumerate().any(|(off, i)| match i.op {
         Op::Mod => facts
@@ -1365,8 +2059,12 @@ fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> O
         | Op::BitNot => true,
         _ => false,
     });
-    if !converts {
-        return None;
+    // With small ints on, every write to a d-homed int is an fmov round
+    // trip (~10 cycles on the loop-carried chain: primes ran 2.7x
+    // slower with `d++` boxed); a GP home pays for itself without any
+    // conversion to remove.
+    if !converts && !tsr_memory::smi_on() {
+        return Vec::new();
     }
     let handled = |v: u8| {
         pbody.code[h..=end].iter().enumerate().all(|(off, i)| {
@@ -1375,6 +2073,8 @@ fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> O
             }
             match i.op {
                 Op::Add | Op::Sub | Op::Mul => true,
+                // ToInt32 results are ints (UShr may not fit one)
+                Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::BitNot => true,
                 // a divisor with no magic number falls back to a path that
                 // writes the home but not the lane register
                 Op::Mod => facts
@@ -1419,11 +2119,30 @@ fn lane_pick(pbody: &tsc_ir::ProtoBody, facts: &Facts, h: usize, vs: &[u8]) -> O
             i.a == v && matches!(i.op, Op::Add | Op::Sub | Op::Mul) && (i.b == v || i.c == v)
         })
     };
-    vs.iter()
-        .copied()
-        .find(|&v| v >= LOW && handled(v) && accumulates(v))
-        .or_else(|| vs.iter().copied().find(|&v| handled(v) && converted(v)))
-        .or_else(|| vs.iter().copied().find(|&v| handled(v)))
+    // Order: loop-carried values first (a boxed one round-trips through
+    // its home on the carried chain every iteration), slot-homed ones
+    // ahead of register-homed; then the converting ops' results; then
+    // the rest.
+    let mut out: Vec<u8> = Vec::new();
+    for v in vs.iter().copied().filter(|&v| v >= LOW && handled(v) && accumulates(v)) {
+        out.push(v);
+    }
+    for v in vs.iter().copied().filter(|&v| handled(v) && accumulates(v)) {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    for v in vs.iter().copied().filter(|&v| handled(v) && converted(v)) {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    for v in vs.iter().copied().filter(|&v| handled(v)) {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out
 }
 
 /// Mod with a known integer divisor: the divisor needs no runtime
@@ -1443,9 +2162,24 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
     // When it already lives in an integer register the check is not just
     // redundant, it is the pair of conversions this lane exists to remove.
     if let Some(src) = int_in {
-        if src != 10 {
-            c.a.mov(10, src);
-        }
+        c.a.sxtw(10, src); // an int register is valid in its low word only
+    } else if c.smi {
+        // raw home bits: an int-tagged dividend is the integer itself, a
+        // double must prove integral
+        let dbl = c.a.new_label();
+        let join = c.a.new_label();
+        c.a.fmov_xd(8, db);
+        c.a.lsr_imm(9, 8, 48);
+        c.a.cmp_reg(9, R_TAGLIM);
+        c.a.b_cond(Cond::Ne, dbl);
+        c.a.sxtw(10, 8);
+        c.a.b(join);
+        c.a.bind(dbl);
+        c.a.fcvtzs(10, db);
+        c.a.scvtf(2, 10);
+        c.a.fcmp(2, db);
+        c.a.b_cond(Cond::Ne, slow);
+        c.a.bind(join);
     } else {
         c.a.fcvtzs(10, db);
         c.a.scvtf(2, 10);
@@ -1484,17 +2218,33 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
     // consumer is usually an accumulate, and reading it back from the
     // boxed home costs the scvtf/fcvtzs pair on that loop-carried chain
     // (objects ran at that chain's latency). |r| < |d| fits i32.
-    let keep = c.lane.is_some() && c.lane != Some(a_reg);
-    if d.unsigned_abs() <= 16 {
-        if c.lane == Some(a_reg) {
-            c.a.mov(R_LANE, 13);
+    let keep = !c.lanes.is_empty() && c.lane_of(a_reg).is_none();
+    if keep {
+        c.retire_itmp(pc + 1, Some(a_reg));
+    }
+    if c.smi && i32::try_from(d).is_ok() {
+        // small ints: the remainder is an int-tagged home (|r| < |d|
+        // fits i32); only a zero remainder of a negative dividend is the
+        // double -0, and that branch is predicted by the dividend's sign
+        if let Some(r) = c.lane_of(a_reg) {
+            c.a.mov(r, 13);
+        }
+        if keep {
+            c.a.mov(R_ITMP, 13);
+        }
+        mod_int_result(c, a_reg, 10, 13, pc);
+    } else if d.unsigned_abs() <= 16 {
+        if let Some(r) = c.lane_of(a_reg) {
+            c.a.mov(r, 13);
         }
         if keep {
             c.a.mov(R_ITMP, 13);
         }
         c.a.scvtf(dst, 13);
         c.a.fmov_xd(14, dst);
-        c.a.fmov_xd(9, db);
+        // the dividend's sign bit: from the integer in x10 (its boxed
+        // form may be int-tagged, whose bit 63 is set)
+        c.a.asr_imm(9, 10, 63);
         c.a.mov_imm64(12, 0x8000_0000_0000_0000);
         c.a.and_reg(9, 9, 12);
         c.a.orr_reg(14, 14, 9);
@@ -1505,11 +2255,11 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
     } else {
         let nonzero = c.a.new_label();
         c.a.cbnz(13, nonzero);
-        c.a.fmov_xd(14, db);
+        c.a.asr_imm(14, 10, 63);
         c.a.mov_imm64(12, 0x8000_0000_0000_0000);
         c.a.and_reg(14, 14, 12);
-        if c.lane == Some(a_reg) {
-            c.a.movz(R_LANE, 0, 0);
+        if let Some(r) = c.lane_of(a_reg) {
+            c.a.movz(r, 0, 0);
         }
         if keep {
             c.a.movz(R_ITMP, 0, 0);
@@ -1517,8 +2267,8 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
         c.put_x(a_reg, 14);
         c.a.b(done);
         c.a.bind(nonzero);
-        if c.lane == Some(a_reg) {
-            c.a.mov(R_LANE, 13);
+        if let Some(r) = c.lane_of(a_reg) {
+            c.a.mov(r, 13);
         }
         if keep {
             c.a.mov(R_ITMP, 13);
@@ -1553,12 +2303,89 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
     c.a.bind(done);
     if keep {
         c.itmp = Some(a_reg);
+        c.itmp_dirty = false; // every tail wrote the home
+    }
+}
+
+/// Box the integer remainder w{r} of dividend w{n} into vreg a's home:
+/// int-tagged, except a zero remainder of a negative dividend, which
+/// is -0. Clobbers x14.
+fn mod_int_result(c: &mut C, a_reg: u8, n: u32, r: u32, pc: usize) {
+    let ok = c.a.new_label();
+    if c.lane_of(a_reg).is_some() || c.int_static {
+        // a -0 has no integer form, so that case runs in the interpreter
+        // (a laned register is the value; otherwise the home takes the
+        // int — the analysis typed this result IntV)
+        let bad = c.deopt_stub(pc);
+        c.a.cmp_imm32(n, 0);
+        c.a.b_cond(Cond::Ge, ok);
+        c.a.cbz32(r, bad);
+        c.a.bind(ok);
+        if c.lane_of(a_reg).is_none() {
+            c.a.orr_reg32(14, 31, r);
+            c.a.movk(14, tsr_memory::TAG_INT as u16, 48);
+            c.put_x(a_reg, 14);
+        }
+        return;
+    }
+    c.a.orr_reg32(14, 31, r);
+    c.a.movk(14, tsr_memory::TAG_INT as u16, 48);
+    c.a.cmp_imm32(n, 0);
+    c.a.b_cond(Cond::Ge, ok);
+    c.a.cbnz32(r, ok);
+    c.a.movz(14, 0x8000, 48); // -0.0
+    c.a.bind(ok);
+    c.put_x(a_reg, 14);
+}
+
+/// Mod of two ints held in the low words of x{xb}/x{xc} (small ints
+/// on): sdiv on the chain, `x % 0` is NaN. Result lands in vreg a's home
+/// as an int (or -0).
+fn emit_mod_int(c: &mut C, a_reg: u8, xb: u32, xc: u32, pc: usize) {
+    let keep = !c.lanes.is_empty() && c.lane_of(a_reg).is_none();
+    if keep {
+        c.retire_itmp(pc + 1, Some(a_reg));
+    }
+    let zero = c.a.new_label();
+    let done = c.a.new_label();
+    c.a.cbz32(xc, zero);
+    c.a.sdiv32(12, xb, xc);
+    c.a.msub32(13, 12, xc, xb);
+    if let Some(r) = c.lane_of(a_reg) {
+        c.a.mov(r, 13);
+    }
+    if keep {
+        c.a.mov(R_ITMP, 13);
+    }
+    mod_int_result(c, a_reg, xb, 13, pc);
+    c.a.b(done);
+    c.a.bind(zero);
+    // x % 0 = NaN, which no integer register (or an IntV-typed result)
+    // can hold
+    if c.lane_of(a_reg).is_some() || keep || c.int_static {
+        c.deopt_at(pc);
+    } else {
+        c.a.mov_imm64(14, f64::NAN.to_bits());
+        c.put_x(a_reg, 14);
+    }
+    c.a.bind(done);
+    if keep {
+        c.itmp = Some(a_reg);
+        c.itmp_dirty = false;
+    } else if c.itmp == Some(a_reg) {
+        c.itmp = None;
+        c.itmp_dirty = false;
     }
 }
 
 /// Integer-fast-path Mod on numeric inputs in d{db}/d{dc}; falls back to
 /// libm fmod. Result lands in vreg a's home.
 fn emit_mod_num(c: &mut C, a_reg: u8, db: u32, dc: u32, fmod_addr: usize) {
+    // the result is boxed straight to the home: no intermediate survives
+    if c.itmp == Some(a_reg) {
+        c.itmp = None;
+        c.itmp_dirty = false;
+    }
     let slow = c.a.new_label();
     let done = c.a.new_label();
     c.a.fcvtzs(10, db);
@@ -1574,8 +2401,8 @@ fn emit_mod_num(c: &mut C, a_reg: u8, db: u32, dc: u32, fmod_addr: usize) {
     c.a.msub(13, 12, 11, 10);
     let nonzero = c.a.new_label();
     c.a.cbnz(13, nonzero);
-    // remainder 0: ±0 with the dividend's sign
-    c.a.fmov_xd(14, db);
+    // remainder 0: ±0 with the dividend's sign (from the integer)
+    c.a.asr_imm(14, 10, 63);
     c.a.mov_imm64(12, 0x8000_0000_0000_0000);
     c.a.and_reg(14, 14, 12);
     c.put_x(a_reg, 14);
@@ -1689,7 +2516,7 @@ fn emit_inline_call(
     // callee identity: closure tag + stored proto word
     c.fetch_x(ins.a, 8);
     c.a.lsr_imm(10, 8, 48);
-    c.a.movz(11, 0xFFFD, 0); // TAG_CLOSURE
+    c.a.movz(11, tsr_memory::TAG_CLOSURE as u16, 0); // TAG_CLOSURE
     c.a.cmp_reg(10, 11);
     c.a.b_cond(Cond::Ne, generic);
     c.unbox(10, 8);
@@ -1701,11 +2528,23 @@ fn emit_inline_call(
     // except Mod, whose int path uses 10-14 — reload there if needed)
     c.a.mov(14, 10);
 
+    // number guard: with small ints on, an int-tagged operand is a number
+    // too (the arms dispatch on the tag or convert)
     let guard = |c: &mut C, v: u8, g: Label| {
         c.fetch_x(v, 8);
         c.a.lsr_imm(10, 8, 48);
         c.a.cmp_reg(10, R_TAGLIM);
-        c.a.b_cond(Cond::Hs, g);
+        c.a.b_cond(if c.smi { Cond::Hi } else { Cond::Hs }, g);
+    };
+    // the (guarded) numeric vreg as a double in d{d} — or its home
+    let dfetch = |c: &mut C, v: u8, d: u32| -> u32 {
+        if c.smi {
+            c.fetch_x(v, 8);
+            c.any_to_dbl(8, d);
+            d
+        } else {
+            c.fetch(v, d)
+        }
     };
     for (cpc, cins) in callee.body().code.iter().enumerate() {
         match cins.op {
@@ -1731,7 +2570,7 @@ fn emit_inline_call(
                 c.emit_obj_lit(map(cins.a), map(cins.b), sn as u8, shape_ptr, &checks);
                 c.a.movz(14, 0, 0);
             }
-            Op::LoadInt => c.put_bits(map(cins.a), Value::number(cins.sbx() as f64).bits()),
+            Op::LoadInt => c.put_bits(map(cins.a), if c.smi { Value::int(cins.sbx()) } else { Value::number(cins.sbx() as f64) }.bits()),
             Op::LoadUndef => c.put_bits(map(cins.a), Value::UNDEFINED.bits()),
             Op::LoadNull => c.put_bits(map(cins.a), Value::NULL.bits()),
             Op::LoadBool => c.put_bits(
@@ -1740,7 +2579,7 @@ fn emit_inline_call(
             ),
             Op::LoadConst => {
                 let bits = match &callee.body().consts[cins.bx() as usize] {
-                    Const::Number(n) => Value::number(*n).bits(),
+                    Const::Number(n) => if c.smi { Value::num(*n) } else { Value::number(*n) }.bits(),
                     _ => unreachable!("inlinable checked"),
                 };
                 c.put_bits(map(cins.a), bits);
@@ -1752,8 +2591,12 @@ fn emit_inline_call(
             Op::Add | Op::Sub | Op::Mul | Op::Div => {
                 guard(c, map(cins.b), generic);
                 guard(c, map(cins.c), generic);
-                let db = c.fetch(map(cins.b), 0);
-                let dc = c.fetch(map(cins.c), 1);
+                if c.smi && cins.op != Op::Div {
+                    emit_arith_dyn(c, cins.op, map(cins.b), map(cins.c), map(cins.a));
+                    continue;
+                }
+                let db = dfetch(c, map(cins.b), 0);
+                let dc = dfetch(c, map(cins.c), 1);
                 let dst = if map(cins.a) < LOW { (8 + map(cins.a)) as u32 } else { 2 };
                 match cins.op {
                     Op::Add => c.a.fadd(dst, db, dc),
@@ -1775,15 +2618,18 @@ fn emit_inline_call(
                     .rev()
                     .find(|i| writes_a_op(i.op) && i.a == cins.c)
                     .and_then(|i| (i.op == Op::LoadInt).then(|| i.sbx() as i64));
-                let db = c.fetch(map(cins.b), 0);
                 match const_div {
                     Some(d) => {
+                        // raw home: the constant path dispatches on the tag
+                        let db = c.fetch(map(cins.b), 0);
                         emit_mod_const(c, map(cins.a), db, d, fmod_addr, None, pc);
                         c.itmp = None; // window vreg: not an intermediate for the caller
+                        c.itmp_dirty = false;
                     }
                     None => {
                         guard(c, map(cins.c), generic);
-                        let dc = c.fetch(map(cins.c), 1);
+                        let db = dfetch(c, map(cins.b), 0);
+                        let dc = dfetch(c, map(cins.c), 1);
                         emit_mod_num(c, map(cins.a), db, dc, fmod_addr);
                     }
                 }
@@ -1814,7 +2660,7 @@ fn emit_inline_call(
             }
             Op::Neg => {
                 guard(c, map(cins.b), generic);
-                let db = c.fetch(map(cins.b), 0);
+                let db = dfetch(c, map(cins.b), 0);
                 let dst = if map(cins.a) < LOW { (8 + map(cins.a)) as u32 } else { 0 };
                 c.a.fneg(dst, db);
                 if map(cins.a) >= LOW {
@@ -1828,10 +2674,10 @@ fn emit_inline_call(
                 if !unary {
                     guard(c, map(cins.c), generic);
                 }
-                let db = c.fetch(map(cins.b), 0);
+                let db = dfetch(c, map(cins.b), 0);
                 c.a.fcvtzs(10, db);
                 if !unary {
-                    let dc = c.fetch(map(cins.c), 1);
+                    let dc = dfetch(c, map(cins.c), 1);
                     c.a.fcvtzs(11, dc);
                 }
                 let mut unsigned = false;
@@ -1918,8 +2764,12 @@ fn emit_op(
     let pbody = proto.body();
     let num_bc = facts.num[pc][1] && facts.num[pc][2];
     let num_b = facts.num[pc][1];
+    let smi = c.smi;
+    // doubles for certain: the unguarded FP lanes need these
+    let dbl_bc = facts.dbl[pc][1] && facts.dbl[pc][2];
+    let dbl_b = facts.dbl[pc][1];
     match ins.op {
-        Op::LoadInt => c.put_bits(ins.a, Value::number(ins.sbx() as f64).bits()),
+        Op::LoadInt => c.put_bits(ins.a, if smi { Value::int(ins.sbx()) } else { Value::number(ins.sbx() as f64) }.bits()),
         Op::LoadBool => c.put_bits(
             ins.a,
             if ins.b != 0 { Value::TRUE.bits() } else { Value::FALSE.bits() },
@@ -1927,7 +2777,7 @@ fn emit_op(
         Op::LoadNull => c.put_bits(ins.a, Value::NULL.bits()),
         Op::LoadUndef => c.put_bits(ins.a, Value::UNDEFINED.bits()),
         Op::LoadConst => match pbody.consts.get(ins.bx() as usize) {
-            Some(Const::Number(n)) => c.put_bits(ins.a, Value::number(*n).bits()),
+            Some(Const::Number(n)) => c.put_bits(ins.a, if smi { Value::num(*n) } else { Value::number(*n) }.bits()),
             // A string constant is interned per realm in a direct-mapped
             // cache keyed on the constant's address — a compile-time
             // constant, so its slot is too. Probe inline; the helper
@@ -1948,7 +2798,7 @@ fn emit_op(
                 c.a.b(done);
                 c.a.bind(slow);
                 c.a.mov(0, R_REALM);
-                c.a.mov(1, R_PROTO);
+                c.proto_into(1);
                 c.a.mov_imm64(2, ins.bx() as u64);
                 c.thin_keep_arrays(c.helpers.load_const);
                 c.a.bind(done);
@@ -1957,7 +2807,7 @@ fn emit_op(
             // other consts — thin helper (no spill/reload)
             _ => {
                 c.a.mov(0, R_REALM);
-                c.a.mov(1, R_PROTO);
+                c.proto_into(1);
                 c.a.mov_imm64(2, ins.bx() as u64);
                 c.thin_keep_arrays(c.helpers.load_const);
                 c.put_x(ins.a, 0);
@@ -1969,22 +2819,112 @@ fn emit_op(
         }
 
         Op::Add | Op::Sub | Op::Mul => {
-            // integer lane: when either operand already lives in an
-            // integer register, stay there. Leaving the lane would mean a
-            // conversion out and another back in, and both would sit in
-            // the middle of the dependency chain.
+            let (cb, cc) = (cls_of(facts, pc, 0, smi), cls_of(facts, pc, 1, smi));
+            let is_int = |x: Cls| matches!(x, Cls::Int | Cls::IntK(_));
+            let is_dbl = |x: Cls| matches!(x, Cls::Dbl | Cls::IntK(_));
+            // an operand the lane machinery holds as an integer: in the
+            // lane / intermediate register, or an int_ok home
+            let laned = |c: &C, v: u8| {
+                c.lane_on && in_lane && (c.lane_of(v).is_some() || c.itmp == Some(v) || c.int_ok.contains(&v))
+            };
+            if smi && facts.int_static && (is_int(cb) || laned(c, ins.b)) && (is_int(cc) || laned(c, ins.c)) {
+                // proven ints: 32-bit flag-setting op straight off the
+                // tagged bits (the low word is the int, no unboxing). A
+                // result outside i32 — or a zero product owing a -0 —
+                // deopts to this pc and the interpreter makes a double.
+                let opnd = |c: &mut C, cls: Cls, v: u8, x: u32| -> u32 {
+                    if let Cls::IntK(k) = cls {
+                        c.a.mov_imm64(x, k as u64);
+                        return x;
+                    }
+                    if let Some(r) = c.lane_of(v) {
+                return r;
+            }
+                    if c.itmp == Some(v) {
+                        return R_ITMP;
+                    }
+                    c.fetch_x(v, x);
+                    x
+                };
+                let ib = opnd(c, cb, ins.b, 10);
+                let bad = c.deopt_stub(pc);
+                // a small constant right operand is an immediate
+                let imm = match cc {
+                    Cls::IntK(k) if (0..4096).contains(&k) => Some((k as u32, false)),
+                    Cls::IntK(k) if (-4095..0).contains(&k) => Some(((-k) as u32, true)),
+                    _ => None,
+                };
+                match (ins.op, imm) {
+                    (Op::Add, Some((k, neg))) => {
+                        if neg { c.a.subs_imm32(14, ib, k) } else { c.a.adds_imm32(14, ib, k) }
+                        c.a.b_cond(Cond::Vs, bad);
+                    }
+                    (Op::Sub, Some((k, neg))) => {
+                        if neg { c.a.adds_imm32(14, ib, k) } else { c.a.subs_imm32(14, ib, k) }
+                        c.a.b_cond(Cond::Vs, bad);
+                    }
+                    (Op::Add, None) => {
+                        let ic = opnd(c, cc, ins.c, 11);
+                        c.a.adds_reg32(14, ib, ic);
+                        c.a.b_cond(Cond::Vs, bad);
+                    }
+                    (Op::Sub, None) => {
+                        let ic = opnd(c, cc, ins.c, 11);
+                        c.a.subs_reg32(14, ib, ic);
+                        c.a.b_cond(Cond::Vs, bad);
+                    }
+                    (Op::Mul, _) => {
+                        let ic = opnd(c, cc, ins.c, 11);
+                        c.a.smull(14, ib, ic);
+                        c.a.cmp_ext_sxtw(14, 14); // fits i32?
+                        c.a.b_cond(Cond::Ne, bad);
+                        // A zero product owes -0 only when a factor is
+                        // negative; a positive constant factor rules that
+                        // out (0 * k is +0), so the check goes entirely.
+                        let pos_k = matches!(cb, Cls::IntK(k) if k > 0)
+                            || matches!(cc, Cls::IntK(k) if k > 0);
+                        if !pos_k {
+                            let ok = c.a.new_label();
+                            let z = c.a.new_label();
+                            c.a.cbz32(14, z);
+                            c.stubs.push(Stub::MulZero { l: z, ib, ic, ok, deopt: bad });
+                            c.a.bind(ok);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                if c.lane_on && in_lane {
+                    // the lane / intermediate register bookkeeping owns
+                    // this vreg: int_dst updates it and syncs the home
+                    c.int_dst_w(ins.a, 14, pc);
+                } else {
+                    c.a.orr_reg32(14, 31, 14); // zero-extend for the box
+                    c.a.movk(14, tsr_memory::TAG_INT as u16, 48);
+                    c.put_x(ins.a, 14);
+                    if c.itmp == Some(ins.a) {
+                        c.itmp = None;
+                        c.itmp_dirty = false;
+                    }
+                }
+                return;
+            }
+            // integer lane (doubles): when either operand already lives
+            // in an integer register, stay there. Leaving the lane would
+            // mean a conversion out and another back in, and both would
+            // sit in the middle of the dependency chain.
             let known_int = |c: &C, v: u8, side: usize| {
-                c.lane == Some(v)
+                c.lane_of(v).is_some()
                     || c.itmp == Some(v)
                     || c.int_ok.contains(&v)
                     || facts.const_ops.get(pc).and_then(|o| o[side]).is_some()
             };
-            if num_bc
+            if !smi
+                && num_bc
                 && c.lane_on
                 && in_lane
-                && (c.lane == Some(ins.b)
+                && (c.lane_of(ins.b).is_some()
                     || c.itmp == Some(ins.b)
-                    || c.lane == Some(ins.c)
+                    || c.lane_of(ins.c).is_some()
                     || c.itmp == Some(ins.c))
                 && known_int(c, ins.b, 0)
                 && known_int(c, ins.c, 1)
@@ -2011,9 +2951,9 @@ fn emit_op(
                 c.int_dst(ins.a, 14, pc);
                 return;
             }
-            if num_bc {
-                let db = c.fetch(ins.b, 0);
-                let dc = c.fetch(ins.c, 1);
+            if dbl_bc || (smi && is_dbl(cb) && is_dbl(cc) && (cb == Cls::Dbl || cc == Cls::Dbl)) {
+                let db = load_dbl(c, cb, ins.b, 0);
+                let dc = load_dbl(c, cc, ins.c, 1);
                 let dst = if ins.a < LOW { (8 + ins.a) as u32 } else { 2 };
                 match ins.op {
                     Op::Add => c.a.fadd(dst, db, dc),
@@ -2024,6 +2964,14 @@ fn emit_op(
                 if ins.a >= LOW {
                     c.a.str_d_imm(dst, R_SLOTS, C::slot(ins.a));
                 }
+                // a laned / int_ok destination: the double result must
+                // land in its integer views too (multi-lane: `p.x + p.y`
+                // into x27 was left stale by this arm — objects read 0)
+                c.fix_int_write(ins.a, pc);
+            } else if smi && cb != Cls::Other && cc != Cls::Other {
+                // numeric, representation unknown: dispatch on the tags
+                emit_arith_dyn(c, ins.op, ins.b, ins.c, ins.a);
+                c.fix_int_write(ins.a, pc);
             } else {
                 // guarded: numbers inline, anything else (concat, errors)
                 // through the interpreter step
@@ -2031,10 +2979,10 @@ fn emit_op(
                 let done = c.a.new_label();
                 c.fetch_x(ins.b, 8);
                 c.fetch_x(ins.c, 9);
-                c.guard_number(8, slow);
-                c.guard_number(9, slow);
-                c.a.fmov_dx(0, 8);
-                c.a.fmov_dx(1, 9);
+                c.guard_numeric(8, slow);
+                c.guard_numeric(9, slow);
+                c.any_to_dbl(8, 0);
+                c.any_to_dbl(9, 1);
                 match ins.op {
                     Op::Add => c.a.fadd(0, 0, 1),
                     Op::Sub => c.a.fsub(0, 0, 1),
@@ -2049,7 +2997,7 @@ fn emit_op(
                     // string `+` is common enough that spilling every
                     // d-register into h_step for it dominated the cost
                     c.a.mov(0, R_REALM);
-                    c.a.mov(1, R_PROTO);
+                    c.proto_into(1);
                     c.a.mov_imm64(2, pc as u64);
                     c.fetch_x(ins.b, 3);
                     c.fetch_x(ins.c, 4);
@@ -2059,12 +3007,23 @@ fn emit_op(
                     c.step_full(pc);
                 }
                 c.a.bind(done);
+                c.fix_int_write(ins.a, pc);
             }
         }
         Op::Div => {
+            let (cb, cc) = (cls_of(facts, pc, 0, smi), cls_of(facts, pc, 1, smi));
             if num_bc {
-                let db = c.fetch(ins.b, 0);
-                let dc = c.fetch(ins.c, 1);
+                let (db, dc) = if smi {
+                    // every numeric class converts to a double, statically
+                    // or by its tag; the quotient is a double
+                    c.fetch_x(ins.b, 8);
+                    c.fetch_x(ins.c, 9);
+                    let db = if cb == Cls::Num { c.any_to_dbl(8, 0); 0 } else { load_dbl(c, cb, ins.b, 0) };
+                    let dc = if cc == Cls::Num { c.any_to_dbl(9, 1); 1 } else { load_dbl(c, cc, ins.c, 1) };
+                    (db, dc)
+                } else {
+                    (c.fetch(ins.b, 0), c.fetch(ins.c, 1))
+                };
                 let dst = if ins.a < LOW { (8 + ins.a) as u32 } else { 2 };
                 c.a.fdiv(dst, db, dc);
                 if ins.a >= LOW {
@@ -2078,37 +3037,89 @@ fn emit_op(
         Op::Mod => {
             let const_div = facts.const_ops.get(pc).and_then(|o| o[1]);
             if num_bc {
-                let db = c.fetch(ins.b, 0);
+                let cb = cls_of(facts, pc, 0, smi);
+                let int_b = (c.lane_on && in_lane && (c.lane_of(ins.b).is_some() || c.itmp == Some(ins.b)))
+                    || (facts.int_facts.get(pc).is_some_and(|f| f[1]) && (smi || const_div.is_some()));
+                let cc = cls_of(facts, pc, 1, smi);
+                if smi && const_div.is_none() && int_b && matches!(cc, Cls::Int | Cls::IntK(_)) {
+                    let xb = load_int(c, cb, ins.b, 10);
+                    let xc = load_int(c, cc, ins.c, 11);
+                    emit_mod_int(c, ins.a, xb, xc, pc);
+                    return;
+                }
+                // the dividend as a double in d0 (an int converts; an
+                // unknown representation dispatches): the sign fixup and
+                // the fallback read it
+                let db = if !smi {
+                    c.fetch(ins.b, 0)
+                } else if int_b && const_div.is_some_and(|d| magic_div(d).is_some()) {
+                    0 // the magic path reads the integer only
+                } else if int_b {
+                    let x = c.int_src(ins.b, 10);
+                    c.a.scvtf_w(0, x);
+                    0
+                } else if cb == Cls::Num && const_div.is_some() {
+                    c.fetch(ins.b, 0) // raw home: the constant path dispatches on the tag
+                } else if cb == Cls::Num {
+                    c.fetch_x(ins.b, 8);
+                    c.any_to_dbl(8, 0);
+                    0
+                } else {
+                    load_dbl(c, cb, ins.b, 0)
+                };
                 if let Some(d) = const_div {
-                    let int_in = ((c.lane_on
-                        && in_lane
-                        && (c.lane == Some(ins.b) || c.itmp == Some(ins.b)))
-                        || facts.int_facts.get(pc).is_some_and(|f| f[1]))
-                        .then(|| c.int_src(ins.b, 10));
+                    let int_in = int_b.then(|| c.int_src(ins.b, 10));
                     emit_mod_const(c, ins.a, db, d, fmod_addr, int_in, pc);
                     return;
                 }
-                let dc = c.fetch(ins.c, 1);
+                let dc = if !smi {
+                    c.fetch(ins.c, 1)
+                } else {
+                    let cc = cls_of(facts, pc, 1, smi);
+                    if cc == Cls::Num {
+                        c.fetch_x(ins.c, 9);
+                        c.any_to_dbl(9, 1);
+                        1
+                    } else {
+                        load_dbl(c, cc, ins.c, 1)
+                    }
+                };
                 emit_mod_num(c, ins.a, db, dc, fmod_addr);
+                c.fix_int_write(ins.a, pc);
             } else {
                 let slow = c.a.new_label();
                 let done = c.a.new_label();
                 c.fetch_x(ins.b, 8);
-                c.guard_number(8, slow);
-                c.a.fmov_dx(0, 8);
+                if smi {
+                    c.guard_numeric(8, slow);
+                } else {
+                    c.guard_number(8, slow);
+                }
                 if let Some(d) = const_div {
                     // divisor is a compile-time integer: no fetch, no
-                    // guard, no runtime integer round-trip for it
+                    // guard, no runtime integer round-trip for it (raw
+                    // bits in d0: the constant path dispatches on the tag)
+                    c.a.fmov_dx(0, 8);
                     emit_mod_const(c, ins.a, 0, d, fmod_addr, None, pc);
                 } else {
                     c.fetch_x(ins.c, 9);
-                    c.guard_number(9, slow);
-                    c.a.fmov_dx(1, 9);
+                    if smi {
+                        c.guard_numeric(9, slow);
+                        c.any_to_dbl(8, 0);
+                        c.any_to_dbl(9, 1);
+                    } else {
+                        c.guard_number(9, slow);
+                        c.a.fmov_dx(0, 8);
+                        c.a.fmov_dx(1, 9);
+                    }
                     emit_mod_num(c, ins.a, 0, 1, fmod_addr);
                 }
                 c.a.b(done);
                 c.a.bind(slow);
                 c.step_full(pc);
+                // the fast path left the result in an integer register
+                // too; the helper wrote only the home
+                c.fix_int_write(ins.a, pc);
                 c.a.bind(done);
             }
         }
@@ -2144,7 +3155,7 @@ fn emit_op(
             c.a.bind(done);
         }
         Op::Neg => {
-            if num_b {
+            if dbl_b {
                 let db = c.fetch(ins.b, 0);
                 let dst = if ins.a < LOW { (8 + ins.a) as u32 } else { 0 };
                 c.a.fneg(dst, db);
@@ -2152,11 +3163,13 @@ fn emit_op(
                     c.a.str_d_imm(dst, R_SLOTS, C::slot(ins.a));
                 }
             } else {
+                // an int negates as a double here: -0 and i32::MIN make
+                // the int form wrong, and Neg is rare
                 let slow = c.a.new_label();
                 let done = c.a.new_label();
                 c.fetch_x(ins.b, 8);
-                c.guard_number(8, slow);
-                c.a.fmov_dx(0, 8);
+                c.guard_numeric(8, slow);
+                c.any_to_dbl(8, 0);
                 c.a.fneg(0, 0);
                 c.put(ins.a, 0);
                 c.a.b(done);
@@ -2164,30 +3177,66 @@ fn emit_op(
                 c.step_full(pc);
                 c.a.bind(done);
             }
+            c.fix_int_write(ins.a, pc);
         }
         Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr | Op::BitNot => {
             let unary = ins.op == Op::BitNot;
             let proven = if unary { num_b } else { num_bc };
             let slow = c.a.new_label();
             let done = c.a.new_label();
+            // x{x} = ToInt32 of the operand: an int outright, a double
+            // through fcvtzs (out-of-range doubles are the interpreter's)
+            let to_i32 = |c: &mut C, cls: Cls, v: u8, x: u32, d: u32| match cls {
+                Cls::IntK(k) => c.a.mov_imm64(x, k as u64),
+                Cls::Int if c.smi => {
+                    // lane / intermediate register first: the home is a
+                    // 10-cycle round trip (`(s * 31 + i) & m` ran 3x slower)
+                    let r = load_int(c, cls, v, x);
+                    if r != x {
+                        c.a.mov(x, r);
+                    }
+                }
+                Cls::Dbl | Cls::Int => {
+                    let dv = c.fetch(v, d);
+                    c.a.fcvtzs(x, dv);
+                }
+                _ => {
+                    c.fetch_x(v, x);
+                    if c.smi {
+                        let dbl = c.a.new_label();
+                        let have = c.a.new_label();
+                        c.a.lsr_imm(12, x, 48);
+                        c.a.cmp_reg(12, R_TAGLIM);
+                        c.a.b_cond(Cond::Ne, dbl);
+                        c.unbox_int(x);
+                        c.a.b(have);
+                        c.a.bind(dbl);
+                        c.a.fmov_dx(d, x);
+                        c.a.fcvtzs(x, d);
+                        c.a.bind(have);
+                    } else {
+                        c.a.fmov_dx(d, x);
+                        c.a.fcvtzs(x, d);
+                    }
+                }
+            };
+            let (cb, cc) = (cls_of(facts, pc, 0, smi), cls_of(facts, pc, 1, smi));
             if proven {
-                let db = c.fetch(ins.b, 0);
-                c.a.fcvtzs(10, db);
+                to_i32(c, cb, ins.b, 10, 0);
                 if !unary {
-                    let dc = c.fetch(ins.c, 1);
-                    c.a.fcvtzs(11, dc);
+                    to_i32(c, cc, ins.c, 11, 1);
                 }
             } else {
                 c.fetch_x(ins.b, 8);
-                c.guard_number(8, slow);
+                c.guard_numeric(8, slow);
                 if !unary {
                     c.fetch_x(ins.c, 9);
-                    c.guard_number(9, slow);
-                    c.a.fmov_dx(1, 9);
-                    c.a.fcvtzs(11, 1);
+                    c.guard_numeric(9, slow);
                 }
-                c.a.fmov_dx(0, 8);
-                c.a.fcvtzs(10, 0);
+                to_i32(c, if unary { Cls::Num } else { cb.min_num() }, ins.b, 10, 0);
+                if !unary {
+                    to_i32(c, cc.min_num(), ins.c, 11, 1);
+                }
             }
             let mut unsigned = false;
             match ins.op {
@@ -2214,13 +3263,37 @@ fn emit_op(
                 _ => unreachable!(),
             }
             let dst = if ins.a < LOW { (8 + ins.a) as u32 } else { 2 };
-            if unsigned {
+            if smi && !unsigned && c.lane_on && in_lane {
+                // a laned / intermediate destination stays in its register
+                c.int_dst_w(ins.a, 10, pc);
+            } else if smi && !unsigned {
+                c.box_int(10);
+                c.put_x(ins.a, 10);
+            } else if smi {
+                // ToUint32: an int when it fits, else the double
+                let big = c.a.new_label();
+                let stored = c.a.new_label();
+                c.a.cmp_imm(10, 0); // 64-bit view of the zero-extended w10
+                c.a.mov_imm64(12, i32::MAX as u64);
+                c.a.cmp_reg(10, 12);
+                c.a.b_cond(Cond::Hi, big);
+                c.box_int(10);
+                c.put_x(ins.a, 10);
+                c.a.b(stored);
+                c.a.bind(big);
                 c.a.ucvtf_w(dst, 10);
+                c.put(ins.a, dst);
+                c.a.bind(stored);
+                c.fix_int_write(ins.a, pc);
             } else {
-                c.a.scvtf_w(dst, 10);
-            }
-            if ins.a >= LOW {
-                c.a.str_d_imm(dst, R_SLOTS, C::slot(ins.a));
+                if unsigned {
+                    c.a.ucvtf_w(dst, 10);
+                } else {
+                    c.a.scvtf_w(dst, 10);
+                }
+                if ins.a >= LOW {
+                    c.a.str_d_imm(dst, R_SLOTS, C::slot(ins.a));
+                }
             }
             c.a.b(done);
             c.a.bind(slow);
@@ -2231,9 +3304,20 @@ fn emit_op(
         }
 
         Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => {
-            if num_bc {
-                let db = c.fetch(ins.b, 0);
-                let dc = c.fetch(ins.c, 1);
+            let (cb, cc) = (cls_of(facts, pc, 0, smi), cls_of(facts, pc, 1, smi));
+            let is_int = |x: Cls| matches!(x, Cls::Int | Cls::IntK(_));
+            let is_dbl = |x: Cls| matches!(x, Cls::Dbl | Cls::IntK(_));
+            if smi && is_int(cb) && is_int(cc) {
+                let ib = load_int(c, cb, ins.b, 10);
+                let ic = load_int(c, cc, ins.c, 11);
+                c.a.cmp_reg32(ib, ic);
+                c.a.cset(8, int_cond(ins.op));
+                c.a.mov_imm64(9, Value::FALSE.bits());
+                c.a.add_reg(8, 9, 8);
+                c.put_x(ins.a, 8);
+            } else if dbl_bc || (smi && is_dbl(cb) && is_dbl(cc)) {
+                let db = load_dbl(c, cb, ins.b, 0);
+                let dc = load_dbl(c, cc, ins.c, 1);
                 c.a.fcmp(db, dc);
                 c.a.cset(8, js_cond(ins.op));
                 c.a.mov_imm64(9, Value::FALSE.bits());
@@ -2244,10 +3328,10 @@ fn emit_op(
                 let done = c.a.new_label();
                 c.fetch_x(ins.b, 8);
                 c.fetch_x(ins.c, 9);
-                c.guard_number(8, slow);
-                c.guard_number(9, slow);
-                c.a.fmov_dx(0, 8);
-                c.a.fmov_dx(1, 9);
+                c.guard_numeric(8, slow);
+                c.guard_numeric(9, slow);
+                c.any_to_dbl(8, 0);
+                c.any_to_dbl(9, 1);
                 c.a.fcmp(0, 1);
                 c.a.cset(8, js_cond(ins.op));
                 c.a.mov_imm64(9, Value::FALSE.bits());
@@ -2260,29 +3344,89 @@ fn emit_op(
             }
         }
         Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip | Op::GeSkip => {
-            let skip_to = c.pc_labels[pc + 2];
-            if num_bc {
-                let db = c.fetch(ins.b, 0);
-                let dc = c.fetch(ins.c, 1);
+            let skip_to = c.exit_label(pc, pc + 2);
+            // `Skip; Jump T` (the loop-exit idiom): one branch on the
+            // inverted condition straight to T, no taken branch on the
+            // loop path
+            let fuse = c.fuse;
+            let skip = |c: &mut C, cond: Cond| match fuse {
+                Some(t) => c.a.b_cond(cond.invert(), t),
+                None => c.a.b_cond(cond, skip_to),
+            };
+            let (mut cb, mut cc) = (cls_of(facts, pc, 0, smi), cls_of(facts, pc, 1, smi));
+            let is_int = |x: Cls| matches!(x, Cls::Int | Cls::IntK(_));
+            let is_dbl = |x: Cls| matches!(x, Cls::Dbl | Cls::IntK(_));
+            // an operand the lane machinery holds as an integer
+            let laned = |c: &C, v: u8| {
+                c.lane_on && in_lane && (c.lane_of(v).is_some() || c.itmp == Some(v) || c.int_ok.contains(&v))
+            };
+            if smi && cb == Cls::Num && laned(c, ins.b) {
+                cb = Cls::Int;
+            }
+            if smi && cc == Cls::Num && laned(c, ins.c) {
+                cc = Cls::Int;
+            }
+            if smi && is_int(cb) && is_int(cc) {
+                let ib = load_int(c, cb, ins.b, 10);
+                let ic = load_int(c, cc, ins.c, 11);
+                c.a.cmp_reg32(ib, ic);
+                skip(c, int_cond(ins.op));
+            } else if dbl_bc || (smi && is_dbl(cb) && is_dbl(cc)) {
+                let db = load_dbl(c, cb, ins.b, 0);
+                let dc = load_dbl(c, cc, ins.c, 1);
                 c.a.fcmp(db, dc);
-                c.a.b_cond(js_cond(ins.op), skip_to);
+                skip(c, js_cond(ins.op));
+            } else if smi && cb != Cls::Other && cc != Cls::Other {
+                // numeric, representation unknown: ints compare as ints,
+                // any other mix as doubles. A side proven int needs no
+                // tag test (`n % d === 0`: one test, not two).
+                let as_dbl = c.a.new_label();
+                let done = c.a.new_label();
+                let side = |c: &mut C, cls: Cls, v: u8, x: u32| -> u32 {
+                    if is_int(cls) {
+                        load_int(c, cls, v, x)
+                    } else {
+                        c.fetch_x(v, x);
+                        c.a.lsr_imm(12, x, 48);
+                        c.a.cmp_reg(12, R_TAGLIM);
+                        c.a.b_cond(Cond::Ne, as_dbl);
+                        x
+                    }
+                };
+                let xb = side(c, cb, ins.b, 8);
+                let xc = side(c, cc, ins.c, 9);
+                c.a.cmp_reg32(xb, xc);
+                skip(c, int_cond(ins.op));
+                c.a.b(done);
+                c.a.bind(as_dbl);
+                // x8/x9 hold the raw values of the Num sides; int sides
+                // reload as doubles
+                let db = if is_int(cb) { load_dbl(c, cb, ins.b, 0) } else { c.any_to_dbl(8, 0); 0 };
+                let dc = if is_int(cc) { load_dbl(c, cc, ins.c, 1) } else { c.any_to_dbl(9, 1); 1 };
+                c.a.fcmp(db, dc);
+                skip(c, js_cond(ins.op));
+                c.a.bind(done);
             } else {
                 let slow = c.a.new_label();
                 let done = c.a.new_label();
                 c.fetch_x(ins.b, 8);
                 c.fetch_x(ins.c, 9);
-                c.guard_number(8, slow);
-                c.guard_number(9, slow);
-                c.a.fmov_dx(0, 8);
-                c.a.fmov_dx(1, 9);
+                c.guard_numeric(8, slow);
+                c.guard_numeric(9, slow);
+                c.any_to_dbl(8, 0);
+                c.any_to_dbl(9, 1);
                 c.a.fcmp(0, 1);
-                c.a.b_cond(js_cond(ins.op), skip_to);
+                skip(c, js_cond(ins.op));
                 c.a.b(done);
                 c.a.bind(slow);
                 c.step_full(pc);
-                c.a.cbnz(0, skip_to); // ctrl=1: comparison true -> skip
+                match fuse {
+                    Some(t) => c.a.cbz(0, t), // ctrl=0: comparison false -> the jump
+                    None => c.a.cbnz(0, skip_to), // ctrl=1: comparison true -> skip
+                }
                 c.a.bind(done);
             }
+            c.skip_next = fuse.is_some();
         }
 
         Op::Jump => {
@@ -2296,7 +3440,7 @@ fn emit_op(
                 c.a.mov(0, R_REALM);
                 c.a.mov_imm64(8, c.helpers.safepoint as u64);
                 c.a.blr(8);
-                c.a.cmp_reg(0, R_SENTINEL);
+                c.cmp_sentinel(0);
                 c.a.b_cond(Cond::Eq, c.bail);
                 c.a.add_reg(R_SLOTS, 1, R_BASE);
                 c.reload_low();
@@ -2304,12 +3448,12 @@ fn emit_op(
                 c.a.movz(R_POLL, SAFEPOINT_INTERVAL, 0);
                 c.a.bind(no_poll);
             }
-            let t = c.pc_labels[target];
+            let t = c.exit_label(pc, target);
             c.a.b(t);
         }
         Op::JumpIfFalse | Op::JumpIfTrue => {
             let target = (pc as i64 + ins.sbx() as i64 + 1) as usize;
-            let t = c.pc_labels[target];
+            let t = c.exit_label(pc, target);
             match facts.jumpif[pc] {
                 JCond::Num => {
                     let da = c.fetch(ins.a, 0);
@@ -2328,6 +3472,13 @@ fn emit_op(
                         }
                     }
                 }
+                JCond::Int => {
+                    c.fetch_x(ins.a, 8);
+                    match ins.op {
+                        Op::JumpIfFalse => c.a.cbz32(8, t),
+                        _ => c.a.cbnz32(8, t),
+                    }
+                }
                 JCond::Bool => {
                     c.fetch_x(ins.a, 8);
                     c.a.mov_imm64(9, Value::TRUE.bits());
@@ -2342,8 +3493,8 @@ fn emit_op(
                     let fall = c.a.new_label();
                     let slow = c.a.new_label();
                     c.fetch_x(ins.a, 8);
-                    c.guard_number(8, slow);
-                    c.a.fmov_dx(0, 8);
+                    c.guard_numeric(8, slow);
+                    c.any_to_dbl(8, 0);
                     c.a.fcmp_zero(0);
                     match ins.op {
                         Op::JumpIfFalse => {
@@ -2398,7 +3549,7 @@ fn emit_op(
                 // callee value from its (just spilled) slot
                 c.a.ldr_imm(9, R_SLOTS, C::slot(ins.a));
                 c.a.lsr_imm(10, 9, 48);
-                c.a.movz(11, 0xFFFD, 0); // TAG_CLOSURE
+                c.a.movz(11, tsr_memory::TAG_CLOSURE as u16, 0); // TAG_CLOSURE
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
                 // per-pc IC entry
@@ -2437,7 +3588,12 @@ fn emit_op(
                 let d = c.depth(4);
                 c.a.add_imm(4, d, 1);
                 c.a.movz(5, 0, 0);
-                c.a.ldr_imm(16, 13, 16); // ic.code
+                // the callee's CURRENT code, through its proto: the IC's
+                // baked pointer went stale when the callee recompiled
+                // (withdrawn speculation, demotion) and every call kept
+                // deopting through the old code
+                c.a.ldr_imm(16, 1, JIT_CODE_OFF);
+                c.a.cbz(16, slow);
                 c.a.blr(16);
                 // refresh slots base (callee frames may have grown the stack)
                 c.a.ldr_imm(16, R_REALM, o.realm_stack_ptr);
@@ -2469,7 +3625,7 @@ fn emit_op(
             }
             c.a.bind(slow);
             c.a.mov(0, R_REALM);
-            c.a.mov(1, R_PROTO);
+            c.proto_into(1);
             c.a.mov_imm64(2, pc as u64);
             c.a.mov(3, R_BASE);
             c.a.mov_imm64(4, ins.a as u64);
@@ -2478,7 +3634,7 @@ fn emit_op(
             c.a.mov(6, d);
             c.a.mov_imm64(8, c.helpers.call as u64);
             c.a.blr(8);
-            c.a.cmp_reg(0, R_SENTINEL);
+            c.cmp_sentinel(0);
             c.a.b_cond(Cond::Eq, c.bail);
             c.a.add_reg(R_SLOTS, 1, R_BASE);
             c.a.bind(done);
@@ -2496,6 +3652,17 @@ fn emit_op(
         }
 
         Op::GetField => {
+            // a typed Int32 read is an int-tagged value to what follows;
+            // the field may hold an integral double (the shape's Int32
+            // is a value property), so normalize
+            let typed_pc = smi && facts.field_repr.get(pc).copied().unwrap_or(2) == 0;
+            // inside a laned loop the int also lands in the intermediate
+            // register: its consumer reads that instead of round-tripping
+            // the value through the d-home (objects: three reads a pass)
+            let int_tmp = typed_pc && c.lane_on && in_lane && c.lane_of(ins.a).is_none();
+            if int_tmp {
+                c.retire_itmp(pc + 1, Some(ins.a));
+            }
             let slow = c.a.new_label();
             let done = c.a.new_label();
             let full = c.a.new_label();
@@ -2531,6 +3698,9 @@ fn emit_op(
                         c.index_addr(17, 15, 13, 8);
                         c.a.ldr_imm(8, 17, o.obj_inline);
                     }
+                    if int_tmp {
+                        c.a.mov(R_ITMP, 8);
+                    }
                     c.put_x(ins.a, 8);
                     c.a.b(done);
                 }
@@ -2557,7 +3727,7 @@ fn emit_op(
                     let miss = if typed { c.a.new_label() } else { generic };
                     c.fetch_x(ins.b, 8);
                     c.a.lsr_imm(10, 8, 48);
-                    c.a.movz(11, 0xFFFB, 0); // TAG_OBJ
+                    c.a.movz(11, tsr_memory::TAG_OBJ as u16, 0); // TAG_OBJ
                     c.a.cmp_reg(10, 11);
                     c.a.b_cond(Cond::Ne, miss);
                     c.unbox(10, 8);
@@ -2568,6 +3738,9 @@ fn emit_op(
                     c.a.mov(15, 10); // CSE cache: validated address
                     c.a.mov(16, 12); //            + shape id
                     c.a.ldr_imm(8, 10, o.obj_inline + slot * 8);
+                    if int_tmp {
+                        c.a.mov(R_ITMP, 8);
+                    }
                     c.put_x(ins.a, 8);
                     c.a.b(done);
                     if typed {
@@ -2579,7 +3752,7 @@ fn emit_op(
                 // inline IC'd property load (reads only, no GC)
                 c.fetch_x(ins.b, 8);
                 c.a.lsr_imm(10, 8, 48);
-                c.a.movz(11, 0xFFFB, 0); // TAG_OBJ
+                c.a.movz(11, tsr_memory::TAG_OBJ as u16, 0); // TAG_OBJ
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
                 c.unbox(10, 8);
@@ -2598,6 +3771,9 @@ fn emit_op(
                 c.a.b_cond(Cond::Hs, slow); // overflow slot -> helper
                 c.index_addr(17, 10, 13, 8);
                 c.a.ldr_imm(8, 17, o.obj_inline);
+                if int_tmp {
+                    c.a.mov(R_ITMP, 8);
+                }
                 c.put_x(ins.a, 8);
                 c.a.b(done);
             } else {
@@ -2605,13 +3781,23 @@ fn emit_op(
             }
             c.a.bind(slow);
             c.a.mov(0, R_REALM);
-            c.a.mov(1, R_PROTO);
+            c.proto_into(1);
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.b, 3);
             c.a.mov_imm64(4, ins.c as u64);
             c.thin_keep_arrays(c.helpers.get_field);
+            if int_tmp {
+                c.a.mov(R_ITMP, 0);
+            }
             c.put_x(ins.a, 0);
             c.a.bind(done);
+            if int_tmp {
+                c.itmp = Some(ins.a);
+                c.itmp_dirty = false;
+            } else if c.itmp == Some(ins.a) {
+                c.itmp = None;
+                c.itmp_dirty = false;
+            }
             if c.offsets.is_some() && ins.a != ins.b {
                 *fcache = Some(ins.b);
             } else {
@@ -2628,14 +3814,14 @@ fn emit_op(
                 // miss goes to the helper, which widens the shape
                 let int32_field = facts.field_repr.get(pc).copied().unwrap_or(2) == 0
                     && !facts.int_facts.get(pc).is_some_and(|f| f[2])
-                    && c.lane != Some(ins.c)
+                    && c.lane_of(ins.c).is_none()
                     && c.itmp != Some(ins.c);
                 // a non-number may be stored inline only where the field is
                 // known to admit anything: a baked site whose repr is Any
                 let ref_ok = facts.ic_baked.get(pc).copied().flatten().is_some()
                     && facts.field_repr.get(pc).copied().unwrap_or(2) == 2;
                 // a value the lane already holds as an integer is a number
-                let val_int = c.lane == Some(ins.c)
+                let val_int = c.lane_of(ins.c).is_some()
                     || c.itmp == Some(ins.c)
                     || (in_lane && c.int_ok.contains(&ins.c));
                 if *fcache == Some(ins.a) {
@@ -2692,7 +3878,7 @@ fn emit_op(
                     let generic = c.a.new_label();
                     c.fetch_x(ins.a, 8);
                     c.a.lsr_imm(10, 8, 48);
-                    c.a.movz(11, 0xFFFB, 0);
+                    c.a.movz(11, tsr_memory::TAG_OBJ as u16, 0);
                     c.a.cmp_reg(10, 11);
                     c.a.b_cond(Cond::Ne, generic);
                     c.fetch_x(ins.c, 9);
@@ -2718,7 +3904,7 @@ fn emit_op(
                 // existing-slot stores never transition shapes
                 c.fetch_x(ins.a, 8);
                 c.a.lsr_imm(10, 8, 48);
-                c.a.movz(11, 0xFFFB, 0); // TAG_OBJ
+                c.a.movz(11, tsr_memory::TAG_OBJ as u16, 0); // TAG_OBJ
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
                 c.fetch_x(ins.c, 9);
@@ -2745,7 +3931,7 @@ fn emit_op(
             }
             c.a.bind(slow);
             c.a.mov(0, R_REALM);
-            c.a.mov(1, R_PROTO);
+            c.proto_into(1);
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.a, 3);
             c.a.mov_imm64(4, ins.b as u64);
@@ -2768,7 +3954,7 @@ fn emit_op(
                     .get(pc)
                     .and_then(|o| o[1])
                     .filter(|&k| (0..=i32::MAX as i64).contains(&k));
-                let lane_ix = in_lane && (c.lane == Some(ins.c) || c.itmp == Some(ins.c));
+                let lane_ix = in_lane && (c.lane_of(ins.c).is_some() || c.itmp == Some(ins.c));
                 // proven an i32 at this loop's header and kept one by every
                 // write since: the boxed home converts bare
                 let int_ix = in_lane && !lane_ix && c.int_ok.contains(&ins.c);
@@ -2776,7 +3962,7 @@ fn emit_op(
                     // the index guard clobbers x10, so it has to run before
                     // the base pointer lands there
                     c.fetch_x(ins.c, 9);
-                    c.guard_number(9, slow);
+                    c.guard_numeric(9, slow);
                 }
                 let reuse = *acache == Some(ins.b) && c.int_lane;
                 let cache = c.acache_on && primary.is_none_or(|p| p == ins.b);
@@ -2787,11 +3973,31 @@ fn emit_op(
                 if let Some(k) = const_ix {
                     c.a.mov_imm64(13, k as u64);
                 } else if lane_ix {
-                    let r = if c.lane == Some(ins.c) { R_LANE } else { R_ITMP };
-                    c.a.mov(13, r);
+                    let r = c.lane_of(ins.c).unwrap_or(R_ITMP);
+                    c.a.sxtw(13, r);
                 } else if int_ix {
-                    let d = c.fetch(ins.c, 0);
-                    c.a.fcvtzs(13, d);
+                    if smi {
+                        c.fetch_x(ins.c, 13);
+                        c.unbox_int(13);
+                    } else {
+                        let d = c.fetch(ins.c, 0);
+                        c.a.fcvtzs(13, d);
+                    }
+                } else if smi {
+                    let have = c.a.new_label();
+                    let dbl = c.a.new_label();
+                    c.a.lsr_imm(11, 9, 48);
+                    c.a.cmp_reg(11, R_TAGLIM);
+                    c.a.b_cond(Cond::Ne, dbl);
+                    c.a.sxtw(13, 9);
+                    c.a.b(have);
+                    c.a.bind(dbl);
+                    c.a.fmov_dx(0, 9);
+                    c.a.fcvtzs(13, 0);
+                    c.a.scvtf(1, 13);
+                    c.a.fcmp(1, 0);
+                    c.a.b_cond(Cond::Ne, slow);
+                    c.a.bind(have);
                 } else {
                     c.a.fmov_dx(0, 9);
                     c.a.fcvtzs(13, 0);
@@ -2809,7 +4015,7 @@ fn emit_op(
             }
             c.a.bind(slow);
             c.a.mov(0, R_REALM);
-            c.a.mov(1, R_PROTO);
+            c.proto_into(1);
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.b, 3);
             c.fetch_x(ins.c, 4);
@@ -2831,7 +4037,7 @@ fn emit_op(
                 let store = c.a.new_label();
                 c.fetch_x(ins.a, 8);
                 c.a.lsr_imm(10, 8, 48);
-                c.a.movz(11, 0xFFFC, 0); // TAG_ARR
+                c.a.movz(11, tsr_memory::TAG_ARR as u16, 0); // TAG_ARR
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
                 // the index stays a boxed value in x9 (or the lane) until
@@ -2842,10 +4048,10 @@ fn emit_op(
                     .get(pc)
                     .and_then(|o| o[0])
                     .filter(|&k| (0..=i32::MAX as i64).contains(&k));
-                let lane_ix = in_lane && (c.lane == Some(ins.b) || c.itmp == Some(ins.b));
+                let lane_ix = in_lane && (c.lane_of(ins.b).is_some() || c.itmp == Some(ins.b));
                 if !lane_ix && const_ix.is_none() {
                     c.fetch_x(ins.b, 9);
-                    c.guard_number(9, slow);
+                    c.guard_numeric(9, slow);
                 }
                 c.unbox(10, 8);
                 c.young_test(10, 11, &o, store);
@@ -2859,8 +4065,23 @@ fn emit_op(
                 if let Some(k) = const_ix {
                     c.a.mov_imm64(13, k as u64);
                 } else if lane_ix {
-                    let r = if c.lane == Some(ins.b) { R_LANE } else { R_ITMP };
-                    c.a.mov(13, r);
+                    let r = c.lane_of(ins.b).unwrap_or(R_ITMP);
+                    c.a.sxtw(13, r);
+                } else if smi {
+                    let have = c.a.new_label();
+                    let dbl = c.a.new_label();
+                    c.a.lsr_imm(11, 9, 48);
+                    c.a.cmp_reg(11, R_TAGLIM);
+                    c.a.b_cond(Cond::Ne, dbl);
+                    c.a.sxtw(13, 9);
+                    c.a.b(have);
+                    c.a.bind(dbl);
+                    c.a.fmov_dx(0, 9);
+                    c.a.fcvtzs(13, 0);
+                    c.a.scvtf(1, 13);
+                    c.a.fcmp(1, 0);
+                    c.a.b_cond(Cond::Ne, slow);
+                    c.a.bind(have);
                 } else {
                     c.a.fmov_dx(0, 9);
                     c.a.fcvtzs(13, 0);
@@ -2878,7 +4099,7 @@ fn emit_op(
             }
             c.a.bind(slow);
             c.a.mov(0, R_REALM);
-            c.a.mov(1, R_PROTO);
+            c.proto_into(1);
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.a, 3);
             c.fetch_x(ins.b, 4);
@@ -2897,13 +4118,18 @@ fn emit_op(
                     *acache = Some(ins.b);
                 }
                 c.arr_len(14, 10);
-                c.a.scvtf(0, 14);
-                c.put(ins.a, 0);
+                if smi {
+                    c.box_int(14);
+                    c.put_x(ins.a, 14);
+                } else {
+                    c.a.scvtf(0, 14);
+                    c.put(ins.a, 0);
+                }
                 c.a.b(done);
             }
             c.a.bind(slow);
             c.a.mov(0, R_REALM);
-            c.a.mov(1, R_PROTO);
+            c.proto_into(1);
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.b, 3);
             c.thin_keep_arrays(c.helpers.len);
@@ -2957,7 +4183,7 @@ fn emit_op(
             }
             c.a.bind(slow);
             c.a.mov(0, R_REALM);
-            c.a.mov(1, R_PROTO);
+            c.proto_into(1);
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.a, 3);
             c.fetch_x(ins.b, 4);
@@ -2966,7 +4192,7 @@ fn emit_op(
         }
         Op::GetGlobal => {
             c.a.mov(0, R_REALM);
-            c.a.mov(1, R_PROTO);
+            c.proto_into(1);
             c.a.mov_imm64(2, pc as u64);
             c.a.mov_imm64(3, ins.bx() as u64);
             c.thin_keep_arrays(c.helpers.get_global);
@@ -3012,7 +4238,7 @@ fn emit_op(
         }
         Op::LoadCell => {
             c.a.mov(0, R_REALM);
-            c.a.mov(1, R_PROTO);
+            c.proto_into(1);
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.b, 3);
             c.thin_keep_arrays(c.helpers.load_cell);
@@ -3020,7 +4246,7 @@ fn emit_op(
         }
         Op::StoreCell => {
             c.a.mov(0, R_REALM);
-            c.a.mov(1, R_PROTO);
+            c.proto_into(1);
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.a, 3);
             c.fetch_x(ins.b, 4);
@@ -3042,7 +4268,7 @@ fn emit_op(
             let done = c.a.new_label();
             if let Some(o) = c.offsets {
                 use tsr_memory::cells::{meta, K_CELL};
-                c.bump_old(2, 0xFFFE, &o, slow); // TAG_CELL
+                c.bump_old(2, tsr_memory::TAG_CELL, &o, slow); // TAG_CELL
                 c.a.mov_imm64(14, meta(K_CELL, 2, 0));
                 c.a.str_imm(14, 13, 0);
                 c.fetch_x(ins.a, 9);
@@ -3089,7 +4315,7 @@ fn emit_op(
                                 .unwrap_or(v);
                             let int_here = in_lane
                                 && [v, src].iter().any(|&r| {
-                                    c.lane == Some(r) || c.itmp == Some(r) || c.int_ok.contains(&r)
+                                    c.lane_of(r).is_some() || c.itmp == Some(r) || c.int_ok.contains(&r)
                                 });
                             (classes.get(j).copied().unwrap_or(2) == 1
                                 && !int_here
@@ -3100,12 +4326,10 @@ fn emit_op(
                 c.emit_obj_lit(ins.a, ins.b, sn as u8, shape_ptr, &checks);
             } else {
                 for v in ins.b..ins.b + n as u8 {
-                    if v < LOW {
-                        c.a.str_d_imm((8 + v) as u32, R_SLOTS, C::slot(v));
-                    }
+                    c.spill_vreg(v);
                 }
                 c.a.mov(0, R_REALM);
-                c.a.mov(1, R_PROTO);
+                c.proto_into(1);
                 c.a.mov_imm64(2, pc as u64);
                 c.a.mov(3, R_BASE);
                 c.a.mov_imm64(4, ins.b as u64);
@@ -3147,7 +4371,7 @@ fn emit_op(
             c.a.mov_imm64(3, (pc + 1) as u64);
             c.a.mov_imm64(8, c.helpers.await_ as u64);
             c.a.blr(8);
-            c.a.cmp_reg(0, R_SENTINEL);
+            c.cmp_sentinel(0);
             c.a.b_cond(Cond::Eq, c.bail);
             c.a.add_reg(R_SLOTS, 1, R_BASE);
             c.a.mov_imm64(9, JIT_AWAIT_SENTINEL);

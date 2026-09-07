@@ -1,0 +1,26 @@
+add-overflow 2147483648 pos number
+sub-overflow -2147483649 neg number
+mul-overflow 4294967296 pos number
+mul-neg-zero -0 pos number
+mul-zero +0 pos number
+mod-neg-zero -0 pos number
+mod-sign -1 neg number
+mod-zero NaN pos number
+mod-min -0 pos number
+neg-zero -0 pos number
+neg-var-zero -0 pos number
+neg-min 2147483648 pos number
+div 3.5 pos number
+div-exact 4 pos number
+shl -2147483648 neg number
+ushr 4294967295 pos number
+ushr-small 4 pos number
+bitand-double 1 pos number
+bitnot -6 neg number
+bitor-big +0 pos number
+true true true 2.5 1 10000000001
+20 20 10 4 7.5 20
+s42 s42 s0 s2147483648 s3
+653622 4 81702 217874
+-511 false false
+2147483647 true

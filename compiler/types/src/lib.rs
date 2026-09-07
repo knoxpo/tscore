@@ -9,7 +9,10 @@ use tsc_ir::{Const, FunctionProto, Op, TypeHint};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CondFact {
+    /// A double for certain (or any number when small ints are off).
     Num,
+    /// An int-tagged value for certain.
+    Int,
     Bool,
     Other,
 }
@@ -28,11 +31,25 @@ pub struct TypedProto {
     /// Per-arg: entry guard proves this param numeric (annotation or
     /// uniform runtime feedback).
     pub arg_guard: Vec<bool>,
+    /// Per-arg representation the entry guard pins when `arg_guard` is
+    /// set: 0 any number, 1 int-tagged (an integral double converts in
+    /// place), 2 double (an int converts in place).
+    pub arg_repr: Vec<u8>,
+    /// Loop-header representation pinning: (header pc, vregs) that join
+    /// an int fall-in with double back-edges. Inside the loop they flow
+    /// as Dbl; the fall-in edge (and OSR entry) converts an int-tagged
+    /// value to a double and deopts on a non-number.
+    pub dbl_hdrs: Vec<(usize, Vec<u8>)>,
     /// Loop-header speculation: (header pc, vregs to number-guard on the
     /// preheader edge). Inside the loop these flow as proven Num; the
     /// compiler must guard the fall-in path (and OSR entries) and deopt
     /// to the header on a miss.
     pub loop_spec: Vec<(usize, Vec<u8>)>,
+    /// Per back-edge header: every vreg the analysis holds as an integer
+    /// there. An OSR entry must make each one int-tagged (an integral
+    /// double converts, anything else deopts): the interpreter's frame
+    /// may carry a double where compiled code assumes int bits.
+    pub int_hdrs: Vec<(usize, Vec<u8>)>,
     /// Subset of `loop_spec` worth holding unboxed in an integer register
     /// for the body of the loop: (header pc, vregs).
     ///
@@ -52,6 +69,10 @@ pub struct TypedProto {
     /// Per-pc, per-operand (a,b,c): operand is a proven integer in i32
     /// range (a constant, or a field read whose shape says Int32).
     pub int_facts: Vec<[bool; 3]>,
+    /// Per-pc (a,b,c): operand is a double for certain (never int-tagged),
+    /// so the unguarded FP lane may read its bits as an f64. Without
+    /// small ints every number is a double and this equals `num_facts`.
+    pub dbl_facts: Vec<[bool; 3]>,
     /// Per NewObjectLit pc: class of each literal value in order —
     /// 0 proven i32 integer, 1 proven number, 2 unknown.
     pub lit_vals: Vec<Vec<u8>>,
@@ -98,6 +119,10 @@ enum T {
     /// vouches for, or the join of two such constants. Not closed under
     /// arithmetic — that is the lane's business.
     IntV,
+    /// A double for certain: a fractional constant, a quotient, or
+    /// arithmetic with a double operand. Never an int-tagged value.
+    Dbl,
+    /// Numeric, representation unknown (int-tagged or double).
     Num,
     Bool,
     Top,
@@ -105,7 +130,7 @@ enum T {
 
 impl T {
     fn is_num(self) -> bool {
-        matches!(self, T::Num | T::Int(_) | T::IntV)
+        matches!(self, T::Num | T::Int(_) | T::IntV | T::Dbl)
     }
     fn is_int(self) -> bool {
         match self {
@@ -124,12 +149,29 @@ fn join(a: T, b: T) -> T {
         return T::IntV;
     }
     if a.is_num() && b.is_num() {
-        return T::Num; // two different constants: still numeric
+        return T::Num; // int with double, or two different constants
     }
     T::Top
 }
 
-pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
+/// Result representation of `+ - *` on two numeric operands.
+fn arith(a: T, b: T, int_static: bool) -> T {
+    if a == T::Dbl && b.is_num() || b == T::Dbl && a.is_num() {
+        T::Dbl
+    } else if int_static && a.is_int() && b.is_int() {
+        T::IntV // the compiled op deopts on overflow
+    } else if a.is_num() && b.is_num() {
+        T::Num
+    } else {
+        T::Top
+    }
+}
+
+/// `smi`: small ints exist at runtime (Len, bitwise ops and integral
+/// constants are int-tagged). `int_static`: type `IntV op IntV` as
+/// `IntV`, which the compiled op enforces with an overflow deopt;
+/// withdrawn (`Num`) after those deopts repeat.
+pub fn analyze(proto: &FunctionProto, field_repr: &[u8], smi: bool, int_static: bool) -> TypedProto {
     let reject = |reason: &'static str| TypedProto {
         opt_ok: false,
         reason,
@@ -137,9 +179,13 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
         jumpif: Vec::new(),
         const_ops: Vec::new(),
         arg_guard: Vec::new(),
+        arg_repr: Vec::new(),
+        dbl_hdrs: Vec::new(),
         loop_spec: Vec::new(),
+        int_hdrs: Vec::new(),
         int_spec: Vec::new(),
         int_facts: Vec::new(),
+        dbl_facts: Vec::new(),
         lit_vals: Vec::new(),
     };
     let repr_at = |pc: usize| field_repr.get(pc).copied().unwrap_or(REPR_ANY);
@@ -149,11 +195,18 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
 
     // entry: param proven Num by annotation or uniform runtime feedback
     // (entry guard enforces; unproven params flow as Top, no guard)
+    // arg_seen classes: 1 int, 4 double, 2 anything else (OR-ed)
     let mut arg_guard = vec![false; proto.arity as usize];
+    let mut arg_repr = vec![0u8; proto.arity as usize];
     for (i, g) in arg_guard.iter_mut().enumerate() {
         let annotated = proto.arg_types.get(i) == Some(&TypeHint::Num);
         let seen = proto.jit.arg_seen[i].load(std::sync::atomic::Ordering::Relaxed);
-        *g = annotated || seen == 1;
+        *g = annotated || matches!(seen, 1 | 4 | 5);
+        arg_repr[i] = match seen {
+            1 if smi => 1,
+            4 => 2,
+            _ => 0,
+        };
     }
 
     let body = proto.body();
@@ -163,30 +216,35 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
     let mut entry = vec![T::Top; nregs];
     for (i, &g) in arg_guard.iter().enumerate() {
         if g {
-            entry[i] = T::Num;
+            entry[i] = match arg_repr[i] {
+                1 => T::IntV,
+                2 => T::Dbl,
+                _ => T::Num,
+            };
         }
     }
     states[0] = Some(entry.clone());
     let mut work = vec![0usize];
     let mut num_facts = vec![[false; 3]; n];
+    let mut dbl_facts = vec![[false; 3]; n];
     let mut jumpif = vec![CondFact::Other; n];
     let mut const_ops: Vec<[Option<i64>; 2]> = vec![[None; 2]; n];
     // loop-header speculation state (filled between the two passes):
-    // pinned[H] = set of vregs forced Num at header H's merge
-    let mut pinned: std::collections::HashMap<usize, Vec<u8>> =
+    // pinned[H] = vregs forced to a type at header H's merge: Num (the
+    // preheader guard enforces numeric) or Dbl (the preheader converts)
+    let mut pinned: std::collections::HashMap<usize, Vec<(u8, T)>> =
         std::collections::HashMap::new();
 
     let merge = |states: &mut Vec<Option<Vec<T>>>,
                  work: &mut Vec<usize>,
-                 pinned: &std::collections::HashMap<usize, Vec<u8>>,
+                 pinned: &std::collections::HashMap<usize, Vec<(u8, T)>>,
                  t: usize,
                  s: &[T]| {
         let pins = pinned.get(&t);
         let pin = |r: usize, v: T| -> T {
-            if pins.is_some_and(|p| p.contains(&(r as u8))) {
-                T::Num // speculated: the preheader guard enforces this
-            } else {
-                v
+            match pins.and_then(|p| p.iter().find(|(pr, _)| *pr as usize == r)) {
+                Some(&(_, ty)) => ty, // speculated: the preheader enforces this
+                None => v,
             }
         };
         match &mut states[t] {
@@ -215,12 +273,34 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
     };
 
     // ---- two passes: discover speculation candidates, then re-run with
-    // headers pinned Num for them ----
-    for pass in 0..2 {
+    // headers pinned for them (a third pass if a Dbl pin failed to hold)
+    // ----
+    for pass in 0..3 {
+        if pass == 2 {
+            // verify Dbl pins: every back-edge must carry Dbl now
+            let mut bad = false;
+            for (pc, ins) in body.code.iter().enumerate() {
+                if ins.op != Op::Jump || ins.sbx() >= 0 {
+                    continue;
+                }
+                let h = (pc as i64 + ins.sbx() as i64 + 1) as usize;
+                if let (Some(vs), Some(es)) = (pinned.get_mut(&h), &states[pc]) {
+                    let n0 = vs.len();
+                    vs.retain(|&(r, ty)| ty != T::Dbl || es[r as usize] == T::Dbl);
+                    bad |= vs.len() != n0;
+                }
+            }
+            if !bad {
+                break;
+            }
+            pinned.retain(|_, vs| !vs.is_empty());
+        }
         if pass == 1 {
             // candidates: back-edge target H where states[H][v] joined to
-            // Top but every back-edge source carries Num for v
-            let mut spec: std::collections::HashMap<usize, Vec<u8>> =
+            // Top but every back-edge source carries Num for v (pin Num),
+            // or joined to Num while every back-edge carries Dbl (pin Dbl:
+            // `let zr = 0` feeding a double recurrence)
+            let mut spec: std::collections::HashMap<usize, Vec<(u8, T)>> =
                 std::collections::HashMap::new();
             for (pc, ins) in body.code.iter().enumerate() {
                 if ins.op != Op::Jump || ins.sbx() >= 0 {
@@ -231,22 +311,31 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
                     continue;
                 };
                 for r in 0..nregs {
-                    if hs[r] == T::Top && es[r].is_num() {
-                        let e = spec.entry(h).or_default();
-                        if !e.contains(&(r as u8)) {
-                            e.push(r as u8);
-                        }
+                    let ty = if hs[r] == T::Top && es[r].is_num() {
+                        T::Num
+                    } else if smi && hs[r] == T::Num && es[r] == T::Dbl {
+                        T::Dbl
+                    } else {
+                        continue;
+                    };
+                    let e = spec.entry(h).or_default();
+                    if !e.iter().any(|(pr, _)| *pr as usize == r) {
+                        e.push((r as u8, ty));
                     }
                 }
             }
-            // multiple back-edges to one header: require Num on ALL of them
+            // multiple back-edges to one header: require the type on ALL
+            // of them
             for (pc, ins) in body.code.iter().enumerate() {
                 if ins.op != Op::Jump || ins.sbx() >= 0 {
                     continue;
                 }
                 let h = (pc as i64 + ins.sbx() as i64 + 1) as usize;
                 if let (Some(vs), Some(es)) = (spec.get_mut(&h), &states[pc]) {
-                    vs.retain(|&r| es[r as usize].is_num());
+                    vs.retain(|&(r, ty)| match ty {
+                        T::Dbl => es[r as usize] == T::Dbl,
+                        _ => es[r as usize].is_num(),
+                    });
                 }
             }
             // only speculate vregs LIVE-IN at the header: a dead loop
@@ -266,7 +355,7 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
                     .map(|(pc, _)| pc)
                     .max()
                     .unwrap_or(*h);
-                vs.retain(|&r| {
+                vs.retain(|&(r, _)| {
                     for pc in *h..=end {
                         let i = body.code[pc];
                         let reads_a = matches!(
@@ -332,11 +421,14 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
                 break; // nothing to speculate: pass-1 results stand
             }
             pinned = spec;
+        }
+        if pass >= 1 {
             // reset and re-run the fixpoint with pinning
             states = vec![None; n + 1];
             states[0] = Some(entry.clone());
             work = vec![0usize];
             num_facts = vec![[false; 3]; n];
+            dbl_facts = vec![[false; 3]; n];
             jumpif = vec![CondFact::Other; n];
             const_ops = vec![[None; 2]; n];
         }
@@ -357,6 +449,9 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
             fact(&s, ins.b).is_num(),
             fact(&s, ins.c).is_num(),
         ];
+        // a double for certain: with small ints off, every number is
+        let dbl = |t: T| if smi { t == T::Dbl } else { t.is_num() };
+        dbl_facts[pc] = [dbl(fact(&s, ins.a)), dbl(fact(&s, ins.b)), dbl(fact(&s, ins.c))];
         // constant integer operands (b, c) for constant-divisor codegen
         const_ops[pc] = [
             match fact(&s, ins.b) {
@@ -378,36 +473,41 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
                     {
                         T::Int(*n as i64)
                     }
-                    Some(Const::Number(_)) => T::Num,
+                    Some(Const::Number(_)) => T::Dbl,
                     _ => T::Top,
                 }
             }
             Op::LoadBool => s[a] = T::Bool,
             Op::LoadNull | Op::LoadUndef => s[a] = T::Top,
             Op::Move => s[a] = fact(&s, ins.b),
-            Op::Add => {
-                // string concat possible unless both proven Num
-                s[a] = if fact(&s, ins.b).is_num() && fact(&s, ins.c).is_num() {
-                    T::Num
-                } else {
-                    T::Top
-                };
+            // string concat possible unless both proven Num
+            Op::Add => s[a] = arith(fact(&s, ins.b), fact(&s, ins.c), int_static),
+            Op::Sub | Op::Mul => {
+                let (b, c) = (fact(&s, ins.b), fact(&s, ins.c));
+                // numeric result or runtime error — numeric either way
+                s[a] = if b.is_num() && c.is_num() { arith(b, c, int_static) } else { T::Num };
             }
-            Op::Sub
-            | Op::Mul
-            | Op::Div
-            | Op::Mod
-            | Op::Pow
-            | Op::Neg
-            | Op::BitAnd
-            | Op::BitOr
-            | Op::BitXor
-            | Op::Shl
-            | Op::Shr
-            | Op::UShr
-            | Op::BitNot => {
-                // numeric result or runtime error — Num either way
-                s[a] = T::Num;
+            Op::Div | Op::Pow => s[a] = T::Dbl,
+            // -0 and i32::MIN leave the int range; the lane keeps its own
+            // rules for the values it holds
+            Op::Neg => s[a] = if fact(&s, ins.b) == T::Dbl { T::Dbl } else { T::Num },
+            // int % int is an int except for -0 (negative dividend, zero
+            // remainder) and x % 0: with speculation on, the compiled op
+            // deopts on those and the result is an int; the divisor must
+            // have a magic multiplier (|k| >= 2) or be a variable int
+            Op::Mod => {
+                let (b, c) = (fact(&s, ins.b), fact(&s, ins.c));
+                let div_ok = match c {
+                    T::Int(k) => k.unsigned_abs() >= 2 && c.is_int(),
+                    T::IntV => true,
+                    _ => false,
+                };
+                s[a] = if int_static && b.is_int() && div_ok { T::IntV } else { T::Num };
+            }
+            Op::UShr => s[a] = T::Num,
+            // ToInt32 results are ints when small ints are on
+            Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::BitNot => {
+                s[a] = if smi { T::IntV } else { T::Num };
             }
             Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Not => s[a] = T::Bool,
             Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip | Op::GeSkip => {
@@ -418,13 +518,14 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
             }
             Op::JumpIfFalse | Op::JumpIfTrue => {
                 jumpif[pc] = match fact(&s, ins.a) {
-                    x if x.is_num() => CondFact::Num,
+                    x if x.is_int() && smi => CondFact::Int,
+                    x if x.is_num() && (!smi || x == T::Dbl) => CondFact::Num,
                     T::Bool => CondFact::Bool,
                     _ => CondFact::Other,
                 };
                 next = vec![pc + 1, (pc as i64 + ins.sbx() as i64 + 1) as usize];
             }
-            Op::Len => s[a] = T::Num,
+            Op::Len => s[a] = if smi { T::IntV } else { T::Num },
             // a warm monomorphic field read: the shape's representation
             // for that slot is the result type (the site deopts on a miss)
             Op::GetField => {
@@ -448,11 +549,17 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
     }
     } // pass loop
 
-    let loop_spec: Vec<(usize, Vec<u8>)> = {
-        let mut v: Vec<_> = pinned.into_iter().collect();
+    let split = |ty: T| -> Vec<(usize, Vec<u8>)> {
+        let mut v: Vec<(usize, Vec<u8>)> = pinned
+            .iter()
+            .map(|(h, vs)| (*h, vs.iter().filter(|(_, t)| *t == ty).map(|(r, _)| *r).collect()))
+            .filter(|(_, vs): &(usize, Vec<u8>)| !vs.is_empty())
+            .collect();
         v.sort_by_key(|(h, _)| *h);
         v
     };
+    let loop_spec = split(T::Num);
+    let dbl_hdrs = split(T::Dbl);
 
     // integer lane: loop-carried numeric vregs whose every in-loop write
     // keeps an integer an integer. Derived from the header state rather
@@ -463,6 +570,7 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
     // compiler still owes an int32 guard at the header. That guard is
     // paid once per loop entry instead of per use.
     let mut int_spec: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut int_hdrs: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut headers: Vec<usize> = body
         .code
         .iter()
@@ -537,6 +645,10 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
         if !keep.is_empty() {
             int_spec.push((h, keep));
         }
+        let ints: Vec<u8> = (0..nregs).filter(|&r| hs[r].is_int()).map(|r| r as u8).collect();
+        if !ints.is_empty() {
+            int_hdrs.push((h, ints));
+        }
     }
 
     // integer facts per operand and literal value classes, from the
@@ -567,9 +679,13 @@ pub fn analyze(proto: &FunctionProto, field_repr: &[u8]) -> TypedProto {
         jumpif,
         const_ops,
         arg_guard,
+        arg_repr,
+        dbl_hdrs,
         loop_spec,
+        int_hdrs,
         int_spec,
         int_facts,
+        dbl_facts,
         lit_vals,
     }
 }
@@ -645,7 +761,7 @@ mod tests {
                 Instr::abc(Op::Return, 1, 0, 0),
             ],
         );
-        let t = analyze(&p, &[]);
+        let t = analyze(&p, &[], false, false);
         assert!(t.opt_ok);
         assert!(t.arg_guard[0]);
         assert!(t.num_facts[1][1] && t.num_facts[1][2]);
@@ -661,7 +777,7 @@ mod tests {
                 Instr::abc(Op::Return, 1, 0, 0),
             ],
         );
-        let t = analyze(&p, &[]);
+        let t = analyze(&p, &[], false, false);
         assert!(t.opt_ok);
         assert!(!t.arg_guard[0]);
         assert!(!t.num_facts[1][1]); // NewObject result not Num
@@ -706,7 +822,7 @@ mod int_lane {
             Instr::asbx(Op::Jump, 0, -6),
             Instr::abc(Op::Return, 2, 0, 0),
         ]);
-        let t = analyze(&p, &[]);
+        let t = analyze(&p, &[], false, false);
         let vs = &t.int_spec.first().expect("a loop was speculated").1;
         assert!(vs.contains(&1), "counter should be unboxed: {vs:?}");
         assert!(vs.contains(&2), "accumulator should be unboxed: {vs:?}");
@@ -727,7 +843,7 @@ mod int_lane {
             Instr::asbx(Op::Jump, 0, -6),
             Instr::abc(Op::Return, 2, 0, 0),
         ]);
-        let t = analyze(&p, &[]);
+        let t = analyze(&p, &[], false, false);
         let vs = t.int_spec.first().map(|(_, v)| v.clone()).unwrap_or_default();
         assert!(!vs.contains(&2), "divided value must stay boxed: {vs:?}");
     }
@@ -745,7 +861,7 @@ mod int_lane {
             Instr::asbx(Op::Jump, 0, -4),
             Instr::abc(Op::Return, 1, 0, 0),
         ]);
-        let t = analyze(&p, &[]);
+        let t = analyze(&p, &[], false, false);
         let vs = &t.int_spec.first().expect("a loop was found").1;
         assert!(vs.contains(&1), "counter should be unboxed: {vs:?}");
         assert!(!vs.contains(&0), "the parameter is never written: {vs:?}");

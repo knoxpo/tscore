@@ -176,6 +176,8 @@ struct C {
     helpers: Helpers,
     offsets: Option<HeapOffsets>,
     ics_base: u64,
+    /// small ints on: int-tagged values are numbers here too
+    smi: bool,
 }
 
 impl C {
@@ -190,13 +192,47 @@ impl C {
         self.a.str_imm(x, R_SLOTS, Self::slot_off(i));
     }
 
-    /// x10 = tag of x{src}; branch to `slow` when not a number.
-    /// (tag >= 0xFFF9 means non-number; 0xFFF9 lives in R_TAGLIM because it
-    /// exceeds the 12-bit compare immediate.)
-    fn guard_number(&mut self, src: u32, slow: Label) {
+    /// x10 = tag; branch to `slow` when neither a double nor (small ints
+    /// on) an int.
+    fn guard_numeric(&mut self, src: u32, slow: Label) {
         self.a.lsr_imm(10, src, 48);
         self.a.cmp_reg(10, R_TAGLIM);
-        self.a.b_cond(Cond::Hs, slow);
+        self.a.b_cond(if self.smi { Cond::Hi } else { Cond::Hs }, slow);
+    }
+    /// d{d} = the numeric Value in x{x} as a double (an int converts).
+    /// Clobbers x17.
+    fn any_to_dbl(&mut self, x: u32, d: u32) {
+        if !self.smi {
+            self.a.fmov_dx(d, x);
+            return;
+        }
+        let dbl = self.a.new_label();
+        let done = self.a.new_label();
+        self.a.lsr_imm(17, x, 48);
+        self.a.cmp_reg(17, R_TAGLIM);
+        self.a.b_cond(Cond::Ne, dbl);
+        self.a.sxtw(17, x);
+        self.a.scvtf(d, 17);
+        self.a.b(done);
+        self.a.bind(dbl);
+        self.a.fmov_dx(d, x);
+        self.a.bind(done);
+    }
+    /// Branch to `no` unless both x8 and x9 are int-tagged (small ints
+    /// on). Clobbers x10, x11.
+    fn both_ints(&mut self, no: Label) {
+        self.a.lsr_imm(10, 8, 48);
+        self.a.lsr_imm(11, 9, 48);
+        self.a.cmp_reg(10, R_TAGLIM);
+        self.a.b_cond(Cond::Ne, no);
+        self.a.cmp_reg(11, R_TAGLIM);
+        self.a.b_cond(Cond::Ne, no);
+    }
+    /// Box the i32 in w{x} into vreg `a`'s slot.
+    fn store_int(&mut self, x: u32, a: u8) {
+        self.a.orr_reg32(x, 31, x);
+        self.a.movk(x, tsr_memory::TAG_INT as u16, 48);
+        self.store_slot(x, a);
     }
 
 
@@ -293,7 +329,7 @@ pub fn compile(
         let bail = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, ret, helpers, offsets, ics_base }
+        C { a, pc_labels, bail, ret, helpers, offsets, ics_base, smi: tsr_memory::smi_on() }
     };
 
     // prologue
@@ -388,11 +424,25 @@ fn js_cond(op: Op) -> Cond {
     }
 }
 
+/// Signed-integer condition for a compare op.
+fn int_cond(op: Op) -> Cond {
+    match op {
+        Op::Lt | Op::LtSkip => Cond::Lt,
+        Op::Le | Op::LeSkip => Cond::Le,
+        Op::Gt | Op::GtSkip => Cond::Gt,
+        Op::Ge | Op::GeSkip => Cond::Ge,
+        Op::Eq | Op::EqSkip => Cond::Eq,
+        Op::Ne | Op::NeSkip => Cond::Ne,
+        _ => unreachable!(),
+    }
+}
+
 fn emit_op(c: &mut C, pc: usize, ins: Instr) {
     match ins.op {
         // ---- pure inline ----
         Op::LoadInt => {
-            c.a.mov_imm64(8, Value::number(ins.sbx() as f64).bits());
+            let v = if c.smi { Value::int(ins.sbx()) } else { Value::number(ins.sbx() as f64) };
+            c.a.mov_imm64(8, v.bits());
             c.store_slot(8, ins.a);
         }
         Op::LoadBool => {
@@ -420,10 +470,34 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             let done = c.a.new_label();
             c.load_slot(8, ins.b);
             c.load_slot(9, ins.c);
-            c.guard_number(8, slow);
-            c.guard_number(9, slow);
-            c.a.fmov_dx(0, 8);
-            c.a.fmov_dx(1, 9);
+            c.guard_numeric(8, slow);
+            c.guard_numeric(9, slow);
+            if c.smi {
+                // two ints: the remainder is an int, or -0 for a zero
+                // remainder of a negative dividend; x % 0 is the helper's
+                let dbl = c.a.new_label();
+                let ok = c.a.new_label();
+                c.both_ints(dbl);
+                c.a.cbz32(9, slow);
+                c.a.sdiv32(12, 8, 9);
+                c.a.msub32(13, 12, 9, 8);
+                c.a.orr_reg32(14, 31, 13);
+                c.a.movk(14, tsr_memory::TAG_INT as u16, 48);
+                c.a.cmp_imm32(8, 0);
+                c.a.b_cond(Cond::Ge, ok);
+                c.a.cbnz32(13, ok);
+                c.a.movz(14, 0x8000, 48); // -0.0
+                c.a.bind(ok);
+                c.store_slot(14, ins.a);
+                c.a.b(done);
+                c.a.bind(dbl);
+                c.any_to_dbl(8, 0);
+                c.any_to_dbl(9, 1);
+                c.a.fmov_xd(8, 0); // the sign fixup below reads the double's bits
+            } else {
+                c.a.fmov_dx(0, 8);
+                c.a.fmov_dx(1, 9);
+            }
             c.a.fcvtzs(10, 0);
             c.a.scvtf(2, 10);
             c.a.fcmp(2, 0);
@@ -457,10 +531,45 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             let done = c.a.new_label();
             c.load_slot(8, ins.b);
             c.load_slot(9, ins.c);
-            c.guard_number(8, slow);
-            c.guard_number(9, slow);
-            c.a.fmov_dx(0, 8);
-            c.a.fmov_dx(1, 9);
+            c.guard_numeric(8, slow);
+            c.guard_numeric(9, slow);
+            if c.smi {
+                // two ints: a 32-bit op, overflow (or a -0 product) makes
+                // a double like the interpreter would
+                let dbl = c.a.new_label();
+                if ins.op != Op::Div {
+                    c.both_ints(dbl);
+                    match ins.op {
+                        Op::Add => {
+                            c.a.adds_reg32(14, 8, 9);
+                            c.a.b_cond(Cond::Vs, dbl);
+                        }
+                        Op::Sub => {
+                            c.a.subs_reg32(14, 8, 9);
+                            c.a.b_cond(Cond::Vs, dbl);
+                        }
+                        _ => {
+                            let nz = c.a.new_label();
+                            c.a.smull(14, 8, 9);
+                            c.a.cmp_ext_sxtw(14, 14);
+                            c.a.b_cond(Cond::Ne, dbl);
+                            c.a.cbnz32(14, nz);
+                            c.a.orr_reg32(12, 8, 9);
+                            c.a.cmp_imm32(12, 0);
+                            c.a.b_cond(Cond::Lt, dbl);
+                            c.a.bind(nz);
+                        }
+                    }
+                    c.store_int(14, ins.a);
+                    c.a.b(done);
+                }
+                c.a.bind(dbl);
+                c.any_to_dbl(8, 0);
+                c.any_to_dbl(9, 1);
+            } else {
+                c.a.fmov_dx(0, 8);
+                c.a.fmov_dx(1, 9);
+            }
             match ins.op {
                 Op::Add => c.a.fadd(0, 0, 1),
                 Op::Sub => c.a.fsub(0, 0, 1),
@@ -479,8 +588,8 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             let slow = c.a.new_label();
             let done = c.a.new_label();
             c.load_slot(8, ins.b);
-            c.guard_number(8, slow);
-            c.a.fmov_dx(0, 8);
+            c.guard_numeric(8, slow);
+            c.any_to_dbl(8, 0);
             c.a.fneg(0, 0);
             c.a.fmov_xd(8, 0);
             c.store_slot(8, ins.a);
@@ -495,12 +604,27 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             let done = c.a.new_label();
             c.load_slot(8, ins.b);
             c.load_slot(9, ins.c);
-            c.guard_number(8, slow);
-            c.guard_number(9, slow);
-            c.a.fmov_dx(0, 8);
-            c.a.fmov_dx(1, 9);
-            c.a.fcmp(0, 1);
-            c.a.cset(8, js_cond(ins.op));
+            c.guard_numeric(8, slow);
+            c.guard_numeric(9, slow);
+            if c.smi {
+                let dbl = c.a.new_label();
+                let cmp_done = c.a.new_label();
+                c.both_ints(dbl);
+                c.a.cmp_reg32(8, 9);
+                c.a.cset(8, int_cond(ins.op));
+                c.a.b(cmp_done);
+                c.a.bind(dbl);
+                c.any_to_dbl(8, 0);
+                c.any_to_dbl(9, 1);
+                c.a.fcmp(0, 1);
+                c.a.cset(8, js_cond(ins.op));
+                c.a.bind(cmp_done);
+            } else {
+                c.a.fmov_dx(0, 8);
+                c.a.fmov_dx(1, 9);
+                c.a.fcmp(0, 1);
+                c.a.cset(8, js_cond(ins.op));
+            }
             // bool value = FALSE_bits + (0|1)
             c.a.mov_imm64(9, Value::FALSE.bits());
             c.a.add_reg(8, 9, 8);
@@ -517,12 +641,27 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             let done = c.a.new_label();
             c.load_slot(8, ins.b);
             c.load_slot(9, ins.c);
-            c.guard_number(8, slow);
-            c.guard_number(9, slow);
-            c.a.fmov_dx(0, 8);
-            c.a.fmov_dx(1, 9);
-            c.a.fcmp(0, 1);
-            c.a.cset(8, js_cond(ins.op));
+            c.guard_numeric(8, slow);
+            c.guard_numeric(9, slow);
+            if c.smi {
+                let dbl = c.a.new_label();
+                let cmp_done = c.a.new_label();
+                c.both_ints(dbl);
+                c.a.cmp_reg32(8, 9);
+                c.a.cset(8, int_cond(ins.op));
+                c.a.b(cmp_done);
+                c.a.bind(dbl);
+                c.any_to_dbl(8, 0);
+                c.any_to_dbl(9, 1);
+                c.a.fcmp(0, 1);
+                c.a.cset(8, js_cond(ins.op));
+                c.a.bind(cmp_done);
+            } else {
+                c.a.fmov_dx(0, 8);
+                c.a.fmov_dx(1, 9);
+                c.a.fcmp(0, 1);
+                c.a.cset(8, js_cond(ins.op));
+            }
             c.a.mov_imm64(9, Value::FALSE.bits());
             c.a.add_reg(8, 9, 8);
             c.store_slot(8, ins.a);
@@ -539,10 +678,21 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             let skip_to = c.pc_labels[pc + 2];
             c.load_slot(8, ins.b);
             c.load_slot(9, ins.c);
-            c.guard_number(8, slow);
-            c.guard_number(9, slow);
-            c.a.fmov_dx(0, 8);
-            c.a.fmov_dx(1, 9);
+            c.guard_numeric(8, slow);
+            c.guard_numeric(9, slow);
+            if c.smi {
+                let dbl = c.a.new_label();
+                c.both_ints(dbl);
+                c.a.cmp_reg32(8, 9);
+                c.a.b_cond(int_cond(ins.op), skip_to);
+                c.a.b(done);
+                c.a.bind(dbl);
+                c.any_to_dbl(8, 0);
+                c.any_to_dbl(9, 1);
+            } else {
+                c.a.fmov_dx(0, 8);
+                c.a.fmov_dx(1, 9);
+            }
             c.a.fcmp(0, 1);
             c.a.b_cond(js_cond(ins.op), skip_to);
             c.a.b(done);
@@ -578,7 +728,20 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             let fall = c.a.new_label();
             let slow = c.a.new_label();
             c.load_slot(8, ins.a);
-            c.guard_number(8, slow);
+            c.guard_numeric(8, slow);
+            if c.smi {
+                // an int is falsy iff zero
+                let dbl = c.a.new_label();
+                c.a.lsr_imm(10, 8, 48);
+                c.a.cmp_reg(10, R_TAGLIM);
+                c.a.b_cond(Cond::Ne, dbl);
+                match ins.op {
+                    Op::JumpIfFalse => c.a.cbz32(8, t),
+                    _ => c.a.cbnz32(8, t),
+                }
+                c.a.b(fall);
+                c.a.bind(dbl);
+            }
             // number truthiness: falsy iff 0.0/-0.0/NaN
             c.a.fmov_dx(0, 8);
             c.a.fcmp_zero(0);
@@ -632,7 +795,7 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
                 // no allocation, so arena pointers are stable throughout.
                 c.load_slot(8, ins.b);
                 c.a.lsr_imm(10, 8, 48);
-                c.a.movz(11, 0xFFFB, 0); // TAG_OBJ
+                c.a.movz(11, tsr_memory::TAG_OBJ as u16, 0); // TAG_OBJ
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
                 c.a.ubfx64(10, 8, 0, 48); // object address
@@ -677,18 +840,30 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             if let Some(o) = c.offsets {
                 c.load_slot(8, ins.b);
                 c.a.lsr_imm(10, 8, 48);
-                c.a.movz(11, 0xFFFC, 0); // TAG_ARR
+                c.a.movz(11, tsr_memory::TAG_ARR as u16, 0); // TAG_ARR
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow);
                 c.load_slot(9, ins.c);
-                c.guard_number(9, slow);
+                c.guard_numeric(9, slow);
                 c.a.ubfx64(10, 8, 0, 48); // array address
+                let have = c.a.new_label();
+                if c.smi {
+                    // an int index is itself
+                    let dbl = c.a.new_label();
+                    c.a.lsr_imm(11, 9, 48);
+                    c.a.cmp_reg(11, R_TAGLIM);
+                    c.a.b_cond(Cond::Ne, dbl);
+                    c.a.sxtw(13, 9);
+                    c.a.b(have);
+                    c.a.bind(dbl);
+                }
                 // exact-integer index: fcvtzs/scvtf round trip
                 c.a.fmov_dx(0, 9);
                 c.a.fcvtzs(13, 0);
                 c.a.scvtf(1, 13);
                 c.a.fcmp(1, 0);
                 c.a.b_cond(Cond::Ne, slow); // fractional / NaN / huge
+                c.a.bind(have);
                 c.a.ldr_imm(14, 10, 0); // meta: len in the high word
                 c.a.lsr_imm(14, 14, 32);
                 c.a.cmp_reg(13, 14);
@@ -725,14 +900,19 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             if c.offsets.is_some() {
                 c.load_slot(8, ins.b);
                 c.a.lsr_imm(10, 8, 48);
-                c.a.movz(11, 0xFFFC, 0);
+                c.a.movz(11, tsr_memory::TAG_ARR as u16, 0);
                 c.a.cmp_reg(10, 11);
                 c.a.b_cond(Cond::Ne, slow); // strings etc -> helper
                 c.a.ubfx64(10, 8, 0, 48);
                 c.a.ldr_imm(14, 10, 0);
                 c.a.lsr_imm(14, 14, 32);
-                c.a.scvtf(0, 14);
-                c.a.fmov_xd(8, 0);
+                if c.smi {
+                    c.a.mov(8, 14);
+                    c.a.movk(8, tsr_memory::TAG_INT as u16, 48);
+                } else {
+                    c.a.scvtf(0, 14);
+                    c.a.fmov_xd(8, 0);
+                }
                 c.store_slot(8, ins.a);
                 c.a.b(done);
             }

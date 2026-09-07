@@ -331,6 +331,54 @@ impl Asm {
     pub fn sub_imm32(&mut self, rd: Reg, rn: Reg, imm12: u32) {
         self.push(0x5100_0000 | imm12 << 10 | rn << 5 | rd);
     }
+    /// ADDS Wd, Wn, Wm (32-bit, sets flags: V on i32 overflow).
+    pub fn adds_reg32(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.push(0x2B00_0000 | rm << 16 | rn << 5 | rd);
+    }
+    /// SUBS Wd, Wn, Wm (32-bit, sets flags).
+    pub fn subs_reg32(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.push(0x6B00_0000 | rm << 16 | rn << 5 | rd);
+    }
+    /// CMP Wn, Wm (32-bit).
+    pub fn cmp_reg32(&mut self, rn: Reg, rm: Reg) {
+        self.push(0x6B00_0000 | rm << 16 | rn << 5 | XZR);
+    }
+    /// CMP Wn, #imm12 (32-bit).
+    pub fn cmp_imm32(&mut self, rn: Reg, imm12: u32) {
+        self.push(0x7100_0000 | imm12 << 10 | rn << 5 | XZR);
+    }
+    /// SMULL Xd, Wn, Wm — full 64-bit product of two i32s.
+    pub fn smull(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.push(0x9B20_7C00 | rm << 16 | rn << 5 | rd);
+    }
+    /// SDIV Wd, Wn, Wm (32-bit).
+    pub fn sdiv32(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.push(0x1AC0_0C00 | rm << 16 | rn << 5 | rd);
+    }
+    /// MSUB Wd, Wn, Wm, Wa (32-bit; Wd = Wa - Wn*Wm).
+    pub fn msub32(&mut self, rd: Reg, rn: Reg, rm: Reg, ra: Reg) {
+        self.push(0x1B00_8000 | rm << 16 | ra << 10 | rn << 5 | rd);
+    }
+    /// ADDS Wd, Wn, #imm12 (32-bit, sets flags).
+    pub fn adds_imm32(&mut self, rd: Reg, rn: Reg, imm12: u32) {
+        debug_assert!(imm12 < 4096);
+        self.push(0x3100_0000 | imm12 << 10 | rn << 5 | rd);
+    }
+    /// SUBS Wd, Wn, #imm12 (32-bit, sets flags).
+    pub fn subs_imm32(&mut self, rd: Reg, rn: Reg, imm12: u32) {
+        debug_assert!(imm12 < 4096);
+        self.push(0x7100_0000 | imm12 << 10 | rn << 5 | rd);
+    }
+    /// CMP Xn, Wm, SXTW — equal iff Xn is the sign extension of its low
+    /// word (byte-verified: 0xeb2ec1df = cmp x14, w14, sxtw).
+    pub fn cmp_ext_sxtw(&mut self, rn: Reg, rm: Reg) {
+        self.push(0xEB20_C000 | rm << 16 | rn << 5 | XZR);
+    }
+    /// CBZ Wt, label (32-bit).
+    pub fn cbz32(&mut self, rt: Reg, l: Label) {
+        self.fixups.push(Fix::B19(self.code.len(), l));
+        self.push(0x3400_0000 | rt);
+    }
     /// CBNZ Wt, label (32-bit).
     pub fn cbnz32(&mut self, rt: Reg, l: Label) {
         self.fixups.push(Fix::B19(self.code.len(), l));

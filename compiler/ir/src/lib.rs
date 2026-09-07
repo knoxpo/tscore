@@ -156,6 +156,10 @@ pub struct JitState {
     /// The next OSR entry or call recompiles with the cache in hand,
     /// which is what lets that callee inline. Set at most once per site.
     pub recompile: std::sync::atomic::AtomicBool,
+    /// Same request for the OSR variant: the two entries recompile
+    /// independently (one flag was consumed by whichever path asked
+    /// first, and the other kept its speculating code — a deopt storm).
+    pub recompile_osr: std::sync::atomic::AtomicBool,
     /// Integer-lane speculation withdrawn: a loop-carried value the
     /// analysis took for an i32 left that range (an accumulator that
     /// grew past 2^31), so the header guard kept deopting. Recompiled

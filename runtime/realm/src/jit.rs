@@ -158,6 +158,7 @@ pub(crate) fn fill_call_ic(
         } else if !pr.jit.osr_code.load(Acquire).is_null() || !pr.jit.code.load(Acquire).is_null() {
             // compiled without this cache: worth compiling again
             pr.jit.recompile.store(true, Relaxed);
+            pr.jit.recompile_osr.store(true, Relaxed);
         }
     }
 }
@@ -349,7 +350,7 @@ fn step(
     match ins.op {
         Op::LoadConst => {
             let v = match &pbody.consts[ins.bx() as usize] {
-                Const::Number(n) => Value::number(*n),
+                Const::Number(n) => if tsr_memory::smi_on() { Value::num(*n) } else { Value::number(*n) },
                 Const::Str(s) => realm.const_str(s),
                 Const::Keys(_) => Value::UNDEFINED,
             };
@@ -1190,7 +1191,7 @@ extern "C" fn h_load_const(
     let r = realm(p);
     let pr = proto(pp);
     let v = match &pr.body().consts[bx as usize] {
-        Const::Number(n) => Value::number(*n),
+        Const::Number(n) => if tsr_memory::smi_on() { Value::num(*n) } else { Value::number(*n) },
         Const::Str(s) => r.const_str(s),
         Const::Keys(_) => Value::UNDEFINED,
     };
@@ -1404,11 +1405,12 @@ fn note_deopt(proto: &FunctionProto, osr: bool, resume: u64) -> bool {
     let jit = &proto.jit;
     let deopts = jit.deopts.fetch_add(1, Relaxed) + 1;
     if std::env::var_os("TSC_DEOPT_DEBUG").is_some() {
-        eprintln!("[deopt] {}'{}' resume={resume} count={deopts}", if osr { "osr " } else { "" }, proto.name);
+        eprintln!("[deopt] {}'{}' resume={resume} count={deopts} tier={} no_int_spec={}", if osr { "osr " } else { "" }, proto.name, jit.tier.load(Relaxed), jit.no_int_spec.load(Relaxed));
     }
     if deopts >= 3 && !jit.no_int_spec.swap(true, Relaxed) {
         jit.deopts.store(0, Relaxed);
         jit.recompile.store(true, Relaxed);
+        jit.recompile_osr.store(true, Relaxed);
         return false;
     }
     deopts >= 10
@@ -1417,7 +1419,7 @@ fn note_deopt(proto: &FunctionProto, osr: bool, resume: u64) -> bool {
 pub fn osr_slow(proto: &FunctionProto) -> Option<CompiledFn> {
     let jit = &proto.jit;
     let code = jit.osr_code.load(Acquire);
-    if !code.is_null() && !jit.recompile.swap(false, Relaxed) {
+    if !code.is_null() && !jit.recompile_osr.swap(false, Relaxed) {
         return Some(unsafe { std::mem::transmute::<*mut u8, CompiledFn>(code) });
     }
     if !jit_enabled() {
@@ -1530,7 +1532,8 @@ fn compile_optimizing(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> 
         let warm = ic_baked.iter().filter(|e| e.is_some()).count();
         eprintln!("[ics] '{}': {warm}/{sites} field sites baked", proto.name);
     }
-    let typed = tsc_types::analyze(proto, &field_repr);
+    let smi = tsr_memory::smi_on();
+    let typed = tsc_types::analyze(proto, &field_repr, smi, smi && !proto.jit.no_int_spec.load(Relaxed));
     if !typed.opt_ok {
         return None;
     }
@@ -1539,6 +1542,7 @@ fn compile_optimizing(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> 
         .iter()
         .map(|c| match c {
             tsc_types::CondFact::Num => tsr_jit::optimizing::JCond::Num,
+            tsc_types::CondFact::Int => tsr_jit::optimizing::JCond::Int,
             tsc_types::CondFact::Bool => tsr_jit::optimizing::JCond::Bool,
             tsc_types::CondFact::Other => tsr_jit::optimizing::JCond::Other,
         })
@@ -1547,20 +1551,25 @@ fn compile_optimizing(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> 
     // function. Compilation is cold, so the lookup costs nothing.
     if std::env::var_os("TSC_INT_SPEC").is_some() {
         eprintln!(
-            "int_spec {}: {:?}  (loop_spec {:?})",
-            proto.name, typed.int_spec, typed.loop_spec
+            "int_spec {}: {:?}  (loop_spec {:?}) osr={} no_int_spec={}",
+            proto.name, typed.int_spec, typed.loop_spec, for_osr, proto.jit.no_int_spec.load(Relaxed)
         );
     }
     let facts = tsr_jit::optimizing::Facts {
         num: &typed.num_facts,
         jumpif: &jumpif,
         arg_guard: &typed.arg_guard,
+        int_static: smi && !proto.jit.no_int_spec.load(Relaxed),
+        arg_repr: &typed.arg_repr,
+        dbl_hdrs: &typed.dbl_hdrs,
         const_ops: &typed.const_ops,
         ic_baked: &ic_baked,
         loop_spec: &typed.loop_spec,
+        int_hdrs: if smi { &typed.int_hdrs } else { &[] },
         int_spec: if proto.jit.no_int_spec.load(Relaxed) { &[] } else { &typed.int_spec },
         field_repr: &field_repr,
         int_facts: &typed.int_facts,
+        dbl: &typed.dbl_facts,
         lit_vals: &typed.lit_vals,
     };
     let ics = proto.jit.ics_base(proto.body().code.len()) as u64;

@@ -4,7 +4,7 @@ use crate::{Realm, RtError};
 use std::sync::Arc;
 use tsc_ir::{Const, FunctionProto, Op, UpvalSrc};
 use tsr_memory::{
-    to_int32, to_uint32, Coroutine, Foreign, Kind, PromiseError, PromiseState,
+    Coroutine, Foreign, Kind, PromiseError, PromiseState,
     Value,
 };
 
@@ -230,7 +230,8 @@ fn run_frame_tiered(
     if realm.jit_enabled && start_pc == 0 {
         if proto.jit.tier.load(std::sync::atomic::Ordering::Relaxed) == tsc_ir::TIER_COLD {
             for i in 0..(proto.arity as usize).min(8) {
-                let class = if realm.stack[base + i].is_number() { 1 } else { 2 };
+                let v = realm.stack[base + i];
+                let class = if v.is_int() { 1 } else if v.is_number() { 4 } else { 2 };
                 proto.jit.arg_seen[i].fetch_or(class, std::sync::atomic::Ordering::Relaxed);
             }
         }
@@ -386,10 +387,28 @@ macro_rules! num_bin {
 
 macro_rules! int_bin {
     ($realm:ident, $ins:ident, $base:ident, $f:expr) => {{
-        let x = to_num(reg!($realm, $base + $ins.b as usize));
-        let y = to_num(reg!($realm, $base + $ins.c as usize));
-        // int-derived results are never NaN
-        set_reg!($realm, $base + $ins.a as usize, Value::number_unchecked($f(x, y)));
+        let x = tsr_memory::to_int32_v(reg!($realm, $base + $ins.b as usize));
+        let y = tsr_memory::to_int32_v(reg!($realm, $base + $ins.c as usize));
+        let r: i32 = $f(x, y);
+        let v = if tsr_memory::smi_on() { Value::int(r) } else { Value::number(r as f64) };
+        set_reg!($realm, $base + $ins.a as usize, v);
+    }};
+}
+
+/// Binary arithmetic with int operands kept int (small ints on), doubles as
+/// before. `$if` is the int form, `$ff` the f64 form.
+macro_rules! arith_bin {
+    ($realm:ident, $proto:ident, $pc:ident, $ins:ident, $base:ident, $if:expr, $ff:expr) => {{
+        let b = reg!($realm, $base + $ins.b as usize);
+        let c = reg!($realm, $base + $ins.c as usize);
+        if b.is_int() && c.is_int() {
+            set_reg!($realm, $base + $ins.a as usize, $if(b.as_int(), c.as_int()));
+        } else if b.is_number() && c.is_number() {
+            set_reg!($realm, $base + $ins.a as usize, Value::number($ff(b.as_number(), c.as_number())));
+        } else {
+            return Err(err($proto, $pc, format!(
+                "cannot apply arithmetic to {} and {}", b.type_of(), c.type_of())));
+        }
     }};
 }
 
@@ -424,15 +443,6 @@ macro_rules! cmp_skip {
             $pc += 1;
         }
     }};
-}
-
-#[inline(always)]
-fn to_num(v: Value) -> f64 {
-    if v.is_number() {
-        v.as_number()
-    } else {
-        f64::NAN
-    }
 }
 
 fn err(proto: &FunctionProto, pc: usize, msg: String) -> RtError {
@@ -489,7 +499,8 @@ pub fn run_one(
         // type feedback while cold: which arg tags does this fn really see?
         if proto.jit.tier.load(std::sync::atomic::Ordering::Relaxed) == tsc_ir::TIER_COLD {
             for i in 0..(proto.arity as usize).min(8) {
-                let class = if realm.stack[base + i].is_number() { 1 } else { 2 };
+                let v = realm.stack[base + i];
+                let class = if v.is_int() { 1 } else if v.is_number() { 4 } else { 2 };
                 proto.jit.arg_seen[i].fetch_or(class, std::sync::atomic::Ordering::Relaxed);
             }
         }
@@ -544,13 +555,20 @@ fn run_frame(
         match ins.op {
             Op::LoadConst => {
                 let v = match &pbody.consts[ins.bx() as usize] {
-                    Const::Number(n) => Value::number(*n),
+                    Const::Number(n) => if tsr_memory::smi_on() { Value::num(*n) } else { Value::number(*n) },
                     Const::Str(s) => realm.const_str(s),
                     Const::Keys(_) => Value::UNDEFINED,
                 };
                 set_reg!(realm, a, v);
             }
-            Op::LoadInt => set_reg!(realm, a, Value::number_unchecked(ins.sbx() as f64)),
+            Op::LoadInt => {
+                let v = if tsr_memory::smi_on() {
+                    Value::int(ins.sbx())
+                } else {
+                    Value::number(ins.sbx() as f64)
+                };
+                set_reg!(realm, a, v)
+            }
             Op::LoadBool => set_reg!(realm, a, Value::bool(ins.b != 0)),
             Op::LoadNull => set_reg!(realm, a, Value::NULL),
             Op::LoadUndef => set_reg!(realm, a, Value::UNDEFINED),
@@ -559,7 +577,9 @@ fn run_frame(
             Op::Add => {
                 let b = reg!(realm, base + ins.b as usize);
                 let c = reg!(realm, base + ins.c as usize);
-                if b.is_number() && c.is_number() {
+                if b.is_int() && c.is_int() {
+                    set_reg!(realm, a, tsr_memory::int_add(b.as_int(), c.as_int()));
+                } else if b.is_number() && c.is_number() {
                     set_reg!(realm, a, Value::number(b.as_number() + c.as_number()));
                 } else if b.as_str_ref().is_some() || c.as_str_ref().is_some() {
                     // string `+`: lazy concatenation (see concat_values)
@@ -570,35 +590,43 @@ fn run_frame(
                         "cannot add {} and {}", b.type_of(), c.type_of())));
                 }
             }
-            Op::Sub => num_bin!(realm, proto, pc, ins, base, |x: f64, y: f64| x - y),
-            Op::Mul => num_bin!(realm, proto, pc, ins, base, |x: f64, y: f64| x * y),
+            Op::Sub => arith_bin!(realm, proto, pc, ins, base, tsr_memory::int_sub, |x: f64, y: f64| x - y),
+            Op::Mul => arith_bin!(realm, proto, pc, ins, base, tsr_memory::int_mul, |x: f64, y: f64| x * y),
             Op::Div => num_bin!(realm, proto, pc, ins, base, |x: f64, y: f64| x / y),
-            Op::Mod => num_bin!(realm, proto, pc, ins, base, |x: f64, y: f64| x % y),
+            Op::Mod => arith_bin!(realm, proto, pc, ins, base, tsr_memory::int_mod, |x: f64, y: f64| x % y),
             Op::Pow => num_bin!(realm, proto, pc, ins, base, |x: f64, y: f64| x.powf(y)),
             Op::Neg => {
                 let b = reg!(realm, base + ins.b as usize);
-                if b.is_number() {
+                if b.is_int() {
+                    set_reg!(realm, a, tsr_memory::int_neg(b.as_int()));
+                } else if b.is_number() {
                     set_reg!(realm, a, Value::number(-b.as_number()));
                 } else {
                     return Err(err(proto, pc, format!("cannot negate {}", b.type_of())));
                 }
             }
 
-            Op::BitAnd => int_bin!(realm, ins, base, |x, y| (to_int32(x) & to_int32(y)) as f64),
-            Op::BitOr => int_bin!(realm, ins, base, |x, y| (to_int32(x) | to_int32(y)) as f64),
-            Op::BitXor => int_bin!(realm, ins, base, |x, y| (to_int32(x) ^ to_int32(y)) as f64),
-            Op::Shl => int_bin!(realm, ins, base, |x, y| {
-                (to_int32(x) << (to_uint32(y) & 31)) as f64
-            }),
-            Op::Shr => int_bin!(realm, ins, base, |x, y| {
-                (to_int32(x) >> (to_uint32(y) & 31)) as f64
-            }),
-            Op::UShr => int_bin!(realm, ins, base, |x, y| {
-                (to_uint32(x) >> (to_uint32(y) & 31)) as f64
-            }),
+            Op::BitAnd => int_bin!(realm, ins, base, |x: i32, y: i32| x & y),
+            Op::BitOr => int_bin!(realm, ins, base, |x: i32, y: i32| x | y),
+            Op::BitXor => int_bin!(realm, ins, base, |x: i32, y: i32| x ^ y),
+            Op::Shl => int_bin!(realm, ins, base, |x: i32, y: i32| x << (y as u32 & 31)),
+            Op::Shr => int_bin!(realm, ins, base, |x: i32, y: i32| x >> (y as u32 & 31)),
+            Op::UShr => {
+                // ToUint32 result: an int only when it fits i32
+                let x = tsr_memory::to_int32_v(reg!(realm, base + ins.b as usize)) as u32;
+                let y = tsr_memory::to_int32_v(reg!(realm, base + ins.c as usize)) as u32;
+                let r = x >> (y & 31);
+                let v = if tsr_memory::smi_on() && r <= i32::MAX as u32 {
+                    Value::int(r as i32)
+                } else {
+                    Value::number(r as f64)
+                };
+                set_reg!(realm, a, v);
+            }
             Op::BitNot => {
-                let x = to_num(reg!(realm, base + ins.b as usize));
-                set_reg!(realm, a, Value::number_unchecked(!to_int32(x) as f64));
+                let x = tsr_memory::to_int32_v(reg!(realm, base + ins.b as usize));
+                let v = if tsr_memory::smi_on() { Value::int(!x) } else { Value::number(!x as f64) };
+                set_reg!(realm, a, v);
             }
 
             Op::Eq => {
@@ -953,7 +981,7 @@ fn run_frame(
                 let idx = reg!(realm, base + ins.c as usize);
                 let v = if idx.is_number() {
                     match obj.as_array() {
-                        Some(r) => tsr_memory::array_index(idx.as_number())
+                        Some(r) => tsr_memory::array_index_v(idx)
                             .and_then(|i| realm.heap.arr(r).get(i).copied())
                             .unwrap_or(Value::UNDEFINED),
                         None => return Err(err(proto, pc, format!(
@@ -979,7 +1007,7 @@ fn run_frame(
                             let n = realm.heap.arr_len(r);
                             // non-index number keys (negative/fractional):
                             // array expando properties unsupported — ignored
-                            if let Some(i) = tsr_memory::array_index(idx.as_number()) {
+                            if let Some(i) = tsr_memory::array_index_v(idx) {
                                 if i < n {
                                     realm.heap.arr_mut(r)[i] = v;
                                 } else if i == n {
@@ -1006,10 +1034,10 @@ fn run_frame(
             Op::Len => {
                 let b = reg!(realm, base + ins.b as usize);
                 let v = if let Some(r) = b.as_array() {
-                    Value::number(realm.heap.arr(r).len() as f64)
+                    tsr_memory::len_value(realm.heap.arr(r).len())
                 } else if let Some(r) = b.as_str_ref() {
                     // ponytail: char count; UTF-16 length when strings grow up
-                    Value::number(realm.heap.str_at(r).chars().count() as f64)
+                    tsr_memory::len_value(realm.heap.str_at(r).chars().count())
                 } else {
                     return Err(err(proto, pc, format!("{} has no length", b.type_of())));
                 };
@@ -1073,11 +1101,9 @@ fn get_field(realm: &mut Realm, obj: Value, name: &str) -> Result<Value, RtError
             }
             Ok(v)
         }
-        Kind::Array(r) if name == "length" => {
-            Ok(Value::number(realm.heap.arr(r).len() as f64))
-        }
+        Kind::Array(r) if name == "length" => Ok(tsr_memory::len_value(realm.heap.arr(r).len())),
         Kind::Str(r) if name == "length" => {
-            Ok(Value::number(realm.heap.str_at(r).chars().count() as f64))
+            Ok(tsr_memory::len_value(realm.heap.str_at(r).chars().count()))
         }
         _ => Err(RtError::new(format!(
             "cannot read property '{name}' of {}", obj.type_of()))),

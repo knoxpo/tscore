@@ -46,24 +46,30 @@ fn rope_limit() -> usize {
 /// NaN-boxed value: 8 bytes. Real doubles occupy every bit pattern whose
 /// top 16 bits are ≤ 0xFFF8 (hardware NaNs are 0x7FF8/0xFFF8-prefixed and
 /// user code cannot craft payload NaNs — `Value::number` canonicalizes any
-/// NaN input). Tags 0xFFF9..=0xFFFF encode non-number values with a 32-bit
-/// payload (heap `Ref` / native index / singleton id).
+/// NaN input). Tag 0xFFF9 is a 32-bit integer in the low word; tags
+/// 0xFFFA..=0xFFFF encode non-number values with a 48-bit payload (heap
+/// address / arena index / singleton id).
+///
+/// The JIT tests "double" as `tag < 0xFFF9`, "numeric" as `tag <= 0xFFF9`
+/// and "int" as `tag == 0xFFF9`, all against one register.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Value(u64);
 
 const TAG_SHIFT: u32 = 48;
-const TAG_SPECIAL: u64 = 0xFFF9; // payload: 0 null, 1 undefined, 2 false, 3 true
-const TAG_STR: u64 = 0xFFFA;
-const TAG_OBJ: u64 = 0xFFFB;
-const TAG_ARR: u64 = 0xFFFC;
-const TAG_CLOSURE: u64 = 0xFFFD;
-const TAG_CELL: u64 = 0xFFFE;
-const TAG_NATIVE: u64 = 0xFFFF;
+pub const TAG_INT: u64 = 0xFFF9;
+pub const TAG_SPECIAL: u64 = 0xFFFA; // payload: 0 null, 1 undefined, 2 false, 3 true
+pub const TAG_STR: u64 = 0xFFFB;
+pub const TAG_OBJ: u64 = 0xFFFC;
+pub const TAG_ARR: u64 = 0xFFFD;
+pub const TAG_CLOSURE: u64 = 0xFFFE;
+pub const TAG_CELL: u64 = 0xFFFF;
 const CANON_NAN: u64 = 0x7FF8_0000_0000_0000;
 /// TAG_SPECIAL payloads: 0 null, 1 undefined, 2 false, 3 true,
 /// 4 = JIT error sentinel (never a live value), 5..8 reserved,
-/// >= FOREIGN_BASE = foreign arena ref + FOREIGN_BASE.
+/// FOREIGN_BASE.. = foreign arena ref + FOREIGN_BASE (a u32 index),
+/// NATIVE_BASE.. = native function index + NATIVE_BASE.
 const FOREIGN_BASE: u64 = 8;
+const NATIVE_BASE: u64 = 1 << 40;
 
 /// Returned by JIT helpers to signal "error stored in realm.jit_error".
 pub const JIT_ERR_SENTINEL: u64 = (TAG_SPECIAL << TAG_SHIFT) | 4;
@@ -157,7 +163,24 @@ impl Value {
     }
     #[inline(always)]
     pub fn native(i: u32) -> Value {
-        Value::tagged(TAG_NATIVE, i as u64)
+        Value::tagged(TAG_SPECIAL, NATIVE_BASE | i as u64)
+    }
+    /// A 32-bit integer value.
+    #[inline(always)]
+    pub const fn int(i: i32) -> Value {
+        Value((TAG_INT << TAG_SHIFT) | (i as u32 as u64))
+    }
+    /// The number `n` as an int when it has an exact i32 value (and is
+    /// not -0), else as a double. For boundaries only — natives returning
+    /// counts, rehydrated values, integral constants; arithmetic keeps
+    /// the representation its operands had.
+    #[inline(always)]
+    pub fn num(n: f64) -> Value {
+        if n.fract() == 0.0 && n >= i32::MIN as f64 && n <= i32::MAX as f64 && n.to_bits() != (-0.0f64).to_bits() {
+            Value::int(n as i32)
+        } else {
+            Value::number(n)
+        }
     }
     #[inline(always)]
     pub fn foreign(r: Ref) -> Value {
@@ -173,13 +196,32 @@ impl Value {
         self.0 & PAYLOAD_MASK
     }
 
+    /// Numeric: a double or an int.
     #[inline(always)]
     pub fn is_number(self) -> bool {
-        self.tag() < TAG_SPECIAL
+        self.tag() <= TAG_INT
     }
     #[inline(always)]
+    pub fn is_double(self) -> bool {
+        self.tag() < TAG_INT
+    }
+    #[inline(always)]
+    pub fn is_int(self) -> bool {
+        self.tag() == TAG_INT
+    }
+    /// The int payload; caller checked `is_int`.
+    #[inline(always)]
+    pub fn as_int(self) -> i32 {
+        self.0 as u32 as i32
+    }
+    /// The numeric value as f64 (ints convert); caller checked `is_number`.
+    #[inline(always)]
     pub fn as_number(self) -> f64 {
-        f64::from_bits(self.0)
+        if self.is_int() {
+            self.as_int() as f64
+        } else {
+            f64::from_bits(self.0)
+        }
     }
     #[inline(always)]
     pub fn as_closure(self) -> Option<Ref> {
@@ -203,7 +245,7 @@ impl Value {
     }
     #[inline(always)]
     pub fn as_foreign(self) -> Option<Ref> {
-        (self.tag() == TAG_SPECIAL && self.payload() >= FOREIGN_BASE)
+        (self.tag() == TAG_SPECIAL && (FOREIGN_BASE..NATIVE_BASE).contains(&self.payload()))
             .then(|| self.payload() - FOREIGN_BASE)
     }
 
@@ -222,14 +264,14 @@ impl Value {
                 // the JIT/TDZ sentinels (4..8) are opaque: no edges, and
                 // display/typeof treat them as undefined
                 p if p < FOREIGN_BASE => Kind::Undefined,
+                p if p >= NATIVE_BASE => Kind::Native((p - NATIVE_BASE) as u32),
                 _ => Kind::Foreign(p - FOREIGN_BASE),
             },
             TAG_STR => Kind::Str(p),
             TAG_OBJ => Kind::Object(p),
             TAG_ARR => Kind::Array(p),
             TAG_CLOSURE => Kind::Closure(p),
-            TAG_CELL => Kind::Cell(p),
-            _ => Kind::Native(p as u32),
+            _ => Kind::Cell(p),
         }
     }
 }
@@ -343,8 +385,16 @@ pub enum Repr {
 
 impl Repr {
     pub fn of(v: Value) -> Repr {
+        if v.is_int() {
+            return Repr::Int32;
+        }
         if !v.is_number() {
             return Repr::Any;
+        }
+        // small ints on: Int32 means int-tagged, so a typed read is a
+        // plain load; an integral double is a Number
+        if smi_on() {
+            return Repr::Number;
         }
         let n = v.as_number();
         if n.fract() == 0.0
@@ -1631,6 +1681,9 @@ pub fn hold_proto(proto: &Arc<FunctionProto>) {
 impl Value {
     #[inline(always)]
     pub fn truthy(self, heap: &Heap) -> bool {
+        if self.is_int() {
+            return self.as_int() != 0;
+        }
         if self.is_number() {
             let n = self.as_number();
             return n != 0.0 && !n.is_nan();
@@ -1772,6 +1825,10 @@ pub fn push_number(out: &mut String, n: f64) {
 /// Append a value's display form; returns false for aggregate values the
 /// caller must route through the slow path.
 pub fn display_into(out: &mut String, v: Value, heap: &Heap) -> bool {
+    if v.is_int() {
+        push_i64(out, v.as_int() as i64);
+        return true;
+    }
     if v.is_number() {
         push_number(out, v.as_number());
         return true;
@@ -1798,6 +1855,97 @@ pub fn fmt_number(n: f64) -> String {
         s
     } else {
         format!("{n}")
+    }
+}
+
+/// Small-int production switch (default on; `TSC_NO_SMI=1` disables): the interpreter makes
+/// int-tagged values from integer sources. Off, every number is a double
+/// as before. Read once; the branch predicts.
+#[inline(always)]
+pub fn smi_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // small ints are the default; `TSC_NO_SMI=1` keeps every number a double
+    *ON.get_or_init(|| std::env::var_os("TSC_NO_SMI").is_none())
+}
+
+/// ToInt32 of a numeric Value (an int is itself).
+#[inline(always)]
+pub fn to_int32_v(v: Value) -> i32 {
+    if v.is_int() {
+        v.as_int()
+    } else if v.is_number() {
+        to_int32(v.as_number())
+    } else {
+        0
+    }
+}
+
+/// JS array index of a numeric Value (see `array_index`).
+#[inline(always)]
+pub fn array_index_v(v: Value) -> Option<usize> {
+    if v.is_int() {
+        let i = v.as_int();
+        (i >= 0).then_some(i as usize)
+    } else {
+        array_index(v.as_number())
+    }
+}
+
+/// A length as a Value: an int with small ints on, else a double.
+#[inline(always)]
+pub fn len_value(n: usize) -> Value {
+    if smi_on() && n <= i32::MAX as usize {
+        Value::int(n as i32)
+    } else {
+        Value::number(n as f64)
+    }
+}
+
+/// Integer arithmetic on two ints with JS semantics: the int result when
+/// it fits, else the double the f64 operation would give.
+#[inline(always)]
+pub fn int_add(x: i32, y: i32) -> Value {
+    match x.checked_add(y) {
+        Some(r) => Value::int(r),
+        None => Value::number(x as f64 + y as f64),
+    }
+}
+#[inline(always)]
+pub fn int_sub(x: i32, y: i32) -> Value {
+    match x.checked_sub(y) {
+        Some(r) => Value::int(r),
+        None => Value::number(x as f64 - y as f64),
+    }
+}
+#[inline(always)]
+pub fn int_mul(x: i32, y: i32) -> Value {
+    match x.checked_mul(y) {
+        // a zero product with a negative factor is -0 in JS
+        Some(0) if (x | y) < 0 => Value::number(-0.0),
+        Some(r) => Value::int(r),
+        None => Value::number(x as f64 * y as f64),
+    }
+}
+#[inline(always)]
+pub fn int_mod(x: i32, y: i32) -> Value {
+    if y == 0 {
+        return Value::number(f64::NAN);
+    }
+    let r = x.wrapping_rem(y); // i32::MIN % -1 = 0
+    if r == 0 && x < 0 {
+        Value::number(-0.0)
+    } else {
+        Value::int(r)
+    }
+}
+#[inline(always)]
+pub fn int_neg(x: i32) -> Value {
+    if x == 0 {
+        Value::number(-0.0)
+    } else if x == i32::MIN {
+        Value::number(-(x as f64))
+    } else {
+        Value::int(-x)
     }
 }
 
@@ -1838,6 +1986,45 @@ mod tests {
         assert_eq!(to_int32(2147483648.0), -2147483648);
         assert_eq!(to_int32(3.9), 3);
         assert_eq!(to_int32(-3.9), -3);
+    }
+
+    #[test]
+    fn int_encoding() {
+        let h = Heap::new();
+        for i in [0, 1, -1, i32::MAX, i32::MIN, 12345] {
+            let v = Value::int(i);
+            assert!(v.is_int() && v.is_number() && !v.is_double());
+            assert_eq!(v.as_int(), i);
+            assert_eq!(v.as_number(), i as f64);
+            assert!(v.strict_eq(Value::number(i as f64), &h));
+            assert_eq!(v.display(&h), fmt_number(i as f64));
+            assert_eq!(Repr::of(v), Repr::Int32);
+        }
+        assert!(!Value::int(0).truthy(&h) && Value::int(-3).truthy(&h));
+        assert!(Value::num(3.0).is_int() && !Value::num(3.5).is_int());
+        assert!(!Value::num(-0.0).is_int() && Value::num(-0.0).is_double());
+        assert!(!Value::num(1e10).is_int());
+        assert!(Value::number(3.0).is_double() && Value::number(f64::NAN).is_double());
+        assert!(Value::native(7).kind() == Kind::Native(7));
+        assert!(Value::foreign(9).as_foreign() == Some(9) && Value::native(9).as_foreign().is_none());
+        assert!(Value::int(0).strict_eq(Value::number(-0.0), &h));
+    }
+
+    #[test]
+    fn int_arith_edges() {
+        assert!(int_add(i32::MAX, 1).is_double());
+        assert_eq!(int_add(2, 3).as_int(), 5);
+        assert!(int_mul(-3, 0).is_double() && int_mul(-3, 0).as_number().is_sign_negative());
+        assert_eq!(int_mul(-3, 2).as_int(), -6);
+        assert!(int_mod(5, 0).as_number().is_nan());
+        assert_eq!(int_mod(-7, 3).as_int(), -1);
+        assert!(int_mod(-6, 3).as_number().is_sign_negative());
+        assert_eq!(int_mod(i32::MIN, -1).as_int(), 0);
+        assert!(int_neg(0).as_number().is_sign_negative());
+        assert!(int_neg(i32::MIN).is_double());
+        assert_eq!(int_neg(5).as_int(), -5);
+        assert_eq!(array_index_v(Value::int(3)), Some(3));
+        assert_eq!(array_index_v(Value::int(-1)), None);
     }
 
     #[test]

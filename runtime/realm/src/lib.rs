@@ -441,9 +441,13 @@ impl Realm {
             // integer right-hand side straight into an inline slot, no
             // scratch String and no second copy
             if c.is_number() {
-                let n = c.as_number();
-                if n.fract() == 0.0 && n.abs() < 9e15 {
-                    let ni = n as i64;
+                let (ni, is_int) = if c.is_int() {
+                    (c.as_int() as i64, true)
+                } else {
+                    let n = c.as_number();
+                    (n as i64, n.fract() == 0.0 && n.abs() < 9e15)
+                };
+                if is_int {
                     if lb & tsr_memory::YOUNG_BIT == 0 && (0..1024).contains(&ni) {
                         let i = ((lb.wrapping_mul(0x9E37_79B1) ^ (ni as u64)) as usize) & (CONCAT_CACHE - 1);
                         let e = self.concat_cache[i];
