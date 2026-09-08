@@ -400,6 +400,17 @@ fn scan_cell(a: Ref, heap: &mut Heap, m: &mut tsr_memory::GcScratch, nur: &mut t
     }
 }
 
+/// Ceiling on consecutive untraced minors. Each one lets a generation's
+/// dead cells go unnoticed for another cycle, so this bounds both the
+/// garbage held and how late a `pretenure` back-off is seen.
+/// Ceiling on consecutive untraced minors. Each one lets a generation's
+/// dead cells go unnoticed for another cycle, so this bounds both the
+/// garbage held and how late a `pretenure` back-off is seen. Measured on
+/// gc_churn: 1 (the old behaviour) 51.1ms of GC, 3 -> 37.5, 7 -> 31.4,
+/// 15 -> 28.3, 31 -> 26.5. Past 15 the walk is memory-bandwidth bound and
+/// the extra lag buys nothing.
+const PRETENURE_RUN_MAX: u8 = 15;
+
 /// Minor collection: evacuate nursery survivors, fix every reachable
 /// edge, sweep the young logs (old-space born cells, strings, foreigns).
 pub fn collect_minor<'a>(
@@ -619,8 +630,15 @@ pub fn collect_minor<'a>(
             let swept = promoted + freed;
             if swept >= 4096 && promoted * 2 < swept {
                 heap.pretenure = 0;
+                heap.pretenure_run = 0;
             } else if swept >= 4096 && promoted * 10 >= swept * 9 {
-                heap.pretenure_skip = 1;
+                // Nothing died. Grant twice as many untraced minors as
+                // last time, so a generation that is entirely live stops
+                // paying for the trace that keeps proving it.
+                heap.pretenure_run = (heap.pretenure_run.saturating_mul(2) + 1).min(PRETENURE_RUN_MAX);
+                heap.pretenure_skip = heap.pretenure_run;
+            } else {
+                heap.pretenure_run = 0;
             }
         }
     }
@@ -657,6 +675,7 @@ pub fn collect_minor<'a>(
 /// had survived. Nothing young exists in this mode, so the remembered
 /// set has no young edge to find; its dirty bits are just cleared.
 fn bulk_promote(heap: &mut Heap, stats: &mut GcStats) {
+    let t0 = std::time::Instant::now();
     let mut promoted = 0usize;
     let mut promoted_bytes = 0usize;
     for bits in heap.born_buf.drain().collect::<Vec<_>>() {
@@ -721,7 +740,7 @@ fn bulk_promote(heap: &mut Heap, stats: &mut GcStats) {
     stats.minor_collections += 1;
     stats.last_freed = 0;
     if debug_on() {
-        eprintln!("[gc] minor-bulk promoted={promoted} old_bytes={}", heap.old.allocated_bytes());
+        eprintln!("[gc] minor-bulk us={} promoted={promoted} old_bytes={}", t0.elapsed().as_micros(), heap.old.allocated_bytes());
     }
 }
 

@@ -799,9 +799,14 @@ pub struct Heap {
     /// while allocation goes old. TSC_PRETENURE=1 pins it on.
     pub pretenure: usize,
     pub pretenure_fixed: bool,
-    /// Minors left that may age the born log without tracing. Set to 1
-    /// by a traced minor that measured >= 90% survival in pretenure mode.
+    /// Minors left that may age the born log without tracing, set by a
+    /// traced minor that measured >= 90% survival in pretenure mode.
     pub pretenure_skip: u8,
+    /// How many minors that traced minor granted. Doubles each time
+    /// nothing dies and resets the moment something does: tracing to
+    /// learn that a generation is entirely live costs about 3.6x what
+    /// ageing the born log alone costs, and answers nothing.
+    pub pretenure_run: u8,
     /// Detached string buffers harvested from dead nursery slots.
     pub pool_str_bufs: Vec<String>,
 }
@@ -841,8 +846,10 @@ impl Default for Heap {
             nursery_limit,
             nursery_on: std::env::var_os("TSC_NO_NURSERY").is_none(),
             pretenure: std::env::var_os("TSC_PRETENURE").is_some() as usize,
-            pretenure_fixed: std::env::var_os("TSC_PRETENURE").is_some(),
+            pretenure_fixed: std::env::var_os("TSC_PRETENURE").is_some()
+                || std::env::var_os("TSC_NO_PRETENURE").is_some(),
             pretenure_skip: 0,
+            pretenure_run: 0,
             pool_str_bufs: Vec::new(),
         }
     }
