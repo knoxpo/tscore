@@ -253,6 +253,17 @@ enum Stub {
         lanes: Vec<(u8, u32)>,
         itmp: Option<(u8, bool)>,
     },
+    /// A length read that was not an array: same shape as `IndexSlow`.
+    /// `int_tmp` says the fast path left the result in R_ITMP.
+    LenSlow {
+        l: Label,
+        done: Label,
+        pc: usize,
+        ins: Instr,
+        int_tmp: bool,
+        lanes: Vec<(u8, u32)>,
+        itmp: Option<(u8, bool)>,
+    },
 }
 
 impl C {
@@ -1923,6 +1934,28 @@ pub fn compile(
                 c.fetch_x(ins.c, 4);
                 c.thin_keep_arrays(c.helpers.get_index);
                 c.put_x(ins.a, 0);
+                c.a.b(done);
+                c.lanes = saved;
+                (c.itmp, c.itmp_dirty) = (si, sd);
+            }
+            Stub::LenSlow { l, done, pc, ins, int_tmp, lanes, itmp } => {
+                c.a.bind(l);
+                let saved = std::mem::replace(&mut c.lanes, lanes);
+                let (si, sd) = (c.itmp, c.itmp_dirty);
+                (c.itmp, c.itmp_dirty) = match itmp {
+                    Some((v, d)) => (Some(v), d),
+                    None => (None, false),
+                };
+                c.a.mov(0, R_REALM);
+                c.proto_into(1);
+                c.a.mov_imm64(2, pc as u64);
+                c.fetch_x(ins.b, 3);
+                c.thin_keep_arrays(c.helpers.len);
+                if int_tmp {
+                    c.a.orr_reg32(R_ITMP, 31, 0);
+                } else {
+                    c.put_x(ins.a, 0);
+                }
                 c.a.b(done);
                 c.lanes = saved;
                 (c.itmp, c.itmp_dirty) = (si, sd);
@@ -4577,19 +4610,13 @@ fn emit_op(
                     c.a.scvtf(0, 14);
                     c.put(ins.a, 0);
                 }
-                c.a.b(done);
             }
-            c.a.bind(slow);
-            c.a.mov(0, R_REALM);
-            c.proto_into(1);
-            c.a.mov_imm64(2, pc as u64);
-            c.fetch_x(ins.b, 3);
-            c.thin_keep_arrays(c.helpers.len);
-            if int_tmp {
-                c.a.orr_reg32(R_ITMP, 31, 0);
-            } else {
-                c.put_x(ins.a, 0);
-            }
+            // out of line so the fast path falls through; the helper still
+            // counts as emitted here so the cache proofs stay honest
+            let lanes = c.lanes.clone();
+            let itmp = c.itmp.map(|v| (v, c.itmp_dirty));
+            c.a.blrs += 1;
+            c.stubs.push(Stub::LenSlow { l: slow, done, pc, ins, int_tmp, lanes, itmp });
             c.a.bind(done);
             if int_tmp {
                 c.itmp = Some(ins.a);
