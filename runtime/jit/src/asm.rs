@@ -46,13 +46,23 @@ pub struct Label(pub usize);
 enum Fix {
     B26(usize, Label),
     B19(usize, Label), // b.cond / cbz / cbnz share the imm19 field position
+    /// LDR Xt, <literal>: instruction index, index into `pool`.
+    Lit(usize, usize),
 }
 
 #[derive(Default)]
 pub struct Asm {
     pub code: Vec<u32>,
     fixups: Vec<Fix>,
+    lit_fixups: Vec<(usize, usize)>,
+    /// Calls emitted so far, reachable or not. A caller that cached a
+    /// register across instructions can ask whether any call could have
+    /// clobbered it since.
+    pub blrs: usize,
     labels: Vec<Option<usize>>, // instruction index once bound
+    /// Constants too wide to build cheaply, emitted once after the code
+    /// and read with a PC-relative load. Deduplicated.
+    pool: Vec<u64>,
 }
 
 impl Asm {
@@ -99,9 +109,40 @@ impl Asm {
                     assert!((-(1 << 18)..(1 << 18)).contains(&off), "B19 out of range");
                     self.code[at] |= ((off as u32) & 0x7FFFF) << 5;
                 }
+                Fix::Lit(..) => {}
+            }
+        }
+        if !self.pool.is_empty() {
+            // 8-byte align so every entry is a single aligned doubleword
+            if self.code.len() % 2 != 0 {
+                self.code.push(0xD503_201F); // NOP
+            }
+            let base = self.code.len();
+            for v in self.pool.clone() {
+                self.code.push(v as u32);
+                self.code.push((v >> 32) as u32);
+            }
+            for fix in std::mem::take(&mut self.lit_fixups) {
+                let (at, idx) = fix;
+                let off = (base + idx * 2) as i64 - at as i64;
+                assert!((-(1 << 18)..(1 << 18)).contains(&off), "literal out of range");
+                self.code[at] |= ((off as u32) & 0x7FFFF) << 5;
             }
         }
         self.code
+    }
+
+    /// LDR Xt, <pc-relative literal> holding `v`.
+    fn ldr_lit(&mut self, rt: Reg, v: u64) {
+        let idx = match self.pool.iter().position(|&x| x == v) {
+            Some(i) => i,
+            None => {
+                self.pool.push(v);
+                self.pool.len() - 1
+            }
+        };
+        self.lit_fixups.push((self.code.len(), idx));
+        self.push(0x5800_0000 | rt);
     }
 
     // ---- moves / constants ----
@@ -119,6 +160,13 @@ impl Asm {
     /// Load an arbitrary 64-bit constant (1-4 instructions).
     pub fn mov_imm64(&mut self, rd: Reg, v: u64) {
         let chunks = [(v & 0xFFFF), (v >> 16) & 0xFFFF, (v >> 32) & 0xFFFF, (v >> 48) & 0xFFFF];
+        // Three or more movk is worse than one load out of a pool that
+        // stays hot in L1 — magic divisors and helper addresses are all
+        // this shape, and they cost 4 instructions each in a hot loop.
+        if chunks.iter().filter(|&&c| c != 0).count() >= 3 {
+            self.ldr_lit(rd, v);
+            return;
+        }
         let mut first = true;
         for (i, &c) in chunks.iter().enumerate() {
             if c != 0 || (i == 3 && first) || (first && i == 0 && v == 0) {
@@ -312,6 +360,7 @@ impl Asm {
         self.push(0xB500_0000 | rt);
     }
     pub fn blr(&mut self, rn: Reg) {
+        self.blrs += 1;
         self.push(0xD63F_0000 | rn << 5);
     }
     pub fn ret(&mut self) {
