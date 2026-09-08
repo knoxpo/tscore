@@ -1719,7 +1719,12 @@ pub fn compile(
         // R_ITMP is callee-saved, so an intermediate survives intervening
         // ops and calls; it dies only when its vreg is rewritten by
         // something other than an integer arm, or at a merge
-        if c.itmp == Some(ins.a) && !matches!(ins.op, Op::Add | Op::Sub | Op::Mul | Op::Mod | Op::GetField) {
+        if c.itmp == Some(ins.a)
+            && !matches!(
+                ins.op,
+                Op::Add | Op::Sub | Op::Mul | Op::Mod | Op::GetField | Op::Len
+            )
+        {
             // rewritten by another arm: the home is the value
             c.itmp = None;
             c.itmp_dirty = false;
@@ -2316,6 +2321,7 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
     if keep {
         c.retire_itmp(pc + 1, Some(a_reg));
     }
+    let mut deferred = false;
     if c.smi && i32::try_from(d).is_ok() {
         // small ints: the remainder is an int-tagged home (|r| < |d|
         // fits i32); only a zero remainder of a negative dividend is the
@@ -2326,7 +2332,7 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
         if keep {
             c.a.mov(R_ITMP, 13);
         }
-        mod_int_result(c, a_reg, 10, 13, pc);
+        deferred = mod_int_result(c, a_reg, 10, 13, pc);
     } else if d.unsigned_abs() <= 16 {
         if let Some(r) = c.lane_of(a_reg) {
             c.a.mov(r, 13);
@@ -2397,14 +2403,15 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
     c.a.bind(done);
     if keep {
         c.itmp = Some(a_reg);
-        c.itmp_dirty = false; // every tail wrote the home
+        c.itmp_dirty = deferred;
     }
 }
 
 /// Box the integer remainder w{r} of dividend w{n} into vreg a's home:
 /// int-tagged, except a zero remainder of a negative dividend, which
 /// is -0. Clobbers x14.
-fn mod_int_result(c: &mut C, a_reg: u8, n: u32, r: u32, pc: usize) {
+/// Returns true when it left the result in R_ITMP and deferred the home.
+fn mod_int_result(c: &mut C, a_reg: u8, n: u32, r: u32, pc: usize) -> bool {
     let ok = c.a.new_label();
     if c.lane_of(a_reg).is_some() || c.int_static {
         // a -0 has no integer form, so that case runs in the interpreter
@@ -2420,7 +2427,7 @@ fn mod_int_result(c: &mut C, a_reg: u8, n: u32, r: u32, pc: usize) {
             c.a.movk(14, tsr_memory::TAG_INT as u16, 48);
             c.put_x(a_reg, 14);
         }
-        return;
+        return false;
     }
     c.a.orr_reg32(14, 31, r);
     c.a.movk(14, tsr_memory::TAG_INT as u16, 48);
@@ -2430,6 +2437,7 @@ fn mod_int_result(c: &mut C, a_reg: u8, n: u32, r: u32, pc: usize) {
     c.a.movz(14, 0x8000, 48); // -0.0
     c.a.bind(ok);
     c.put_x(a_reg, 14);
+    false
 }
 
 /// Mod of two ints held in the low words of x{xb}/x{xc} (small ints
@@ -2451,7 +2459,7 @@ fn emit_mod_int(c: &mut C, a_reg: u8, xb: u32, xc: u32, pc: usize) {
     if keep {
         c.a.mov(R_ITMP, 13);
     }
-    mod_int_result(c, a_reg, xb, 13, pc);
+    let deferred = mod_int_result(c, a_reg, xb, 13, pc);
     c.a.b(done);
     c.a.bind(zero);
     // x % 0 = NaN, which no integer register (or an IntV-typed result)
@@ -2465,7 +2473,7 @@ fn emit_mod_int(c: &mut C, a_reg: u8, xb: u32, xc: u32, pc: usize) {
     c.a.bind(done);
     if keep {
         c.itmp = Some(a_reg);
-        c.itmp_dirty = false;
+        c.itmp_dirty = deferred;
     } else if c.itmp == Some(a_reg) {
         c.itmp = None;
         c.itmp_dirty = false;
@@ -3812,6 +3820,9 @@ fn emit_op(
             let slow = c.a.new_label();
             let done = c.a.new_label();
             let full = c.a.new_label();
+            // set when the cached load needed no guard at all: then nothing
+            // branches to the miss paths and the whole tail is dead code
+            let mut settled = false;
             if let Some(o) = c.offsets {
                 if *fcache == Some(ins.b) {
                     // CSE'd: object address in x15 (validated, 0 = cold
@@ -3859,8 +3870,16 @@ fn emit_op(
                     } else {
                         c.put_x(ins.a, 8);
                     }
-                    c.a.b(done);
+                    if proven {
+                        // fall through to `done`: no guard branched away,
+                        // so the baked stub, the generic IC path and the
+                        // helper below are all unreachable
+                        settled = true;
+                    } else {
+                        c.a.b(done);
+                    }
                 }
+                if !settled {
                 c.a.bind(full);
                 // baked monomorphic stub: the site's warmed IC gives the
                 // shape id and slot as compile-time immediates, so the
@@ -3943,9 +3962,11 @@ fn emit_op(
                     c.put_x(ins.a, 8);
                 }
                 c.a.b(done);
+                }
             } else {
                 c.a.bind(full);
             }
+            if !settled {
             c.a.bind(slow);
             c.a.mov(0, R_REALM);
             c.proto_into(1);
@@ -3957,6 +3978,12 @@ fn emit_op(
                 c.a.mov(R_ITMP, 0);
             } else {
                 c.put_x(ins.a, 0);
+            }
+            }
+            if settled {
+                // labels the dead tail would have bound
+                c.a.bind(full);
+                c.a.bind(slow);
             }
             c.a.bind(done);
             if int_tmp {
@@ -4324,6 +4351,10 @@ fn emit_op(
         Op::Len => {
             let slow = c.a.new_label();
             let done = c.a.new_label();
+            let int_tmp = smi && c.lane_on && in_lane && c.lane_of(ins.a).is_none();
+            if int_tmp {
+                c.retire_itmp(pc + 1, Some(ins.a));
+            }
             if c.offsets.is_some() {
                 let reuse = *acache == Some(ins.b) && c.int_lane;
                 let cache = c.acache_on && primary.is_none_or(|p| p == ins.b);
@@ -4332,7 +4363,9 @@ fn emit_op(
                     *acache = Some(ins.b);
                 }
                 c.arr_len(14, 10);
-                if smi {
+                if int_tmp {
+                    c.a.mov(R_ITMP, 14);
+                } else if smi {
                     c.box_int(14);
                     c.put_x(ins.a, 14);
                 } else {
@@ -4347,8 +4380,16 @@ fn emit_op(
             c.a.mov_imm64(2, pc as u64);
             c.fetch_x(ins.b, 3);
             c.thin_keep_arrays(c.helpers.len);
-            c.put_x(ins.a, 0);
+            if int_tmp {
+                c.a.orr_reg32(R_ITMP, 31, 0);
+            } else {
+                c.put_x(ins.a, 0);
+            }
             c.a.bind(done);
+            if int_tmp {
+                c.itmp = Some(ins.a);
+                c.itmp_dirty = true;
+            }
         }
         Op::ArrayPush => {
             let slow = c.a.new_label();
