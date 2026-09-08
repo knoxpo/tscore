@@ -93,11 +93,6 @@ pub struct Old {
     /// Free cells above `MAX_SMALL_WORDS`, first fit with split.
     // ponytail: linear scan; a size-ordered tree if large churn shows up
     large: Vec<Ref>,
-    /// The free block small allocations carve from, and how much is left.
-    /// Without it every allocation reaching the reuse path would rescan
-    /// `large`, which the sweep fills with coalesced runs.
-    carve: Ref,
-    carve_words: usize,
     /// Free-list bytes handed out since the last minor; bump bytes are
     /// `top - mark` (see `bytes_since_minor`).
     freelist_bytes: usize,
@@ -111,6 +106,11 @@ pub struct Old {
     pub born_from: usize,
     /// Live bytes measured by the last sweep.
     pub live_bytes: usize,
+    /// The free block small allocations carve from, and how much is left.
+    /// Without it every allocation reaching the reuse path would rescan
+    /// `large`, which the sweep fills with coalesced runs.
+    carve: Ref,
+    carve_words: usize,
 }
 
 impl Old {
@@ -184,75 +184,40 @@ impl Old {
     #[inline]
     pub fn alloc(&mut self, words: usize) -> Ref {
         debug_assert!(words >= 2);
-        let bytes = words * 8;
         if words <= MAX_SMALL_WORDS {
             let head = self.small[words];
             if head != 0 {
                 self.small[words] = word(head, 1);
                 set_meta(head, 0);
-                self.freelist_bytes += bytes;
+                self.freelist_bytes += words * 8;
                 return head;
             }
-            // Bump before reuse for small cells: this is the hot path, and
-            // putting the free-block scan in front of it cost the closures
-            // row 1.5%.
-            if self.top + bytes <= self.limit {
-                let a = self.top;
-                self.top += bytes;
-                self.sync_top();
-                return a as Ref;
+        } else {
+            for i in 0..self.large.len() {
+                let a = self.large[i];
+                let have = size_words(meta_at(a));
+                if have >= words {
+                    self.large.swap_remove(i);
+                    let rest = have - words;
+                    if rest >= 2 {
+                        self.push_free(a + (words * 8) as Ref, rest);
+                    }
+                    set_meta(a, 0);
+                    self.freelist_bytes += words * 8;
+                    return a;
+                }
             }
         }
-        self.alloc_slow(words, bytes)
-    }
-
-    /// Everything that is not a size-class pop or a bump: carving a
-    /// coalesced run, scanning the large list, taking a new chunk. Out of
-    /// line so the hot path stays small — folding it inline cost the
-    /// alloc row ~1%.
-    #[inline(never)]
-    fn alloc_slow(&mut self, words: usize, bytes: usize) -> Ref {
-        // The bump region is spent. Carve from a coalesced run rather
-        // than take another chunk: the major sweep merges neighbouring
-        // dead cells, so a run of a thousand dead closures becomes one
-        // block no size class can serve, and without this old space grew
-        // 7.4MB to 12.4MB across majors that freed 66k cells each.
-        if words <= MAX_SMALL_WORDS && self.carve_words >= words + 2 {
-            let a = self.carve;
-            self.carve = a + bytes as Ref;
-            self.carve_words -= words;
-            // the remainder stays a well-formed FREE cell: every walk
-            // over a chunk advances by `size_words`, so a headerless gap
-            // makes the collector read garbage
-            set_meta(self.carve, meta(K_FREE, self.carve_words, 0));
-            set_meta(a, 0);
-            self.freelist_bytes += bytes;
-            return a;
-        }
-        for i in 0..self.large.len() {
-            let a = self.large[i];
-            let have = size_words(meta_at(a));
-            if have >= words {
-                self.large.swap_remove(i);
-                let rest = have - words;
-                if rest >= 2 {
-                    if words <= MAX_SMALL_WORDS && rest > MAX_SMALL_WORDS {
-                        // hold the remainder for the small allocations that
-                        // follow instead of filing and rescanning it
-                        self.retire_carve();
-                        self.carve = a + bytes as Ref;
-                        self.carve_words = rest;
-                        set_meta(self.carve, meta(K_FREE, rest, 0));
-                    } else {
-                        self.push_free(a + bytes as Ref, rest);
-                    }
-                }
-                set_meta(a, 0);
-                self.freelist_bytes += bytes;
+        let bytes = words * 8;
+        if self.top + bytes > self.limit {
+            // Bump region spent. Before taking another chunk, reuse what
+            // the sweep coalesced. This is the only place that pays for
+            // it: putting the scan on the fast path cost closures 1.5%
+            // and gc_churn 4%, and both of those bump far more often
+            // than they exhaust a chunk.
+            if let Some(a) = self.reuse_coalesced(words, bytes) {
                 return a;
             }
-        }
-        if self.top + bytes > self.limit {
             self.sync_top();
             self.new_chunk(bytes);
         }
@@ -261,6 +226,48 @@ impl Old {
         self.sync_top();
         a as Ref
     }
+
+    /// A small cell out of a run the major sweep merged. The sweep
+    /// coalesces neighbouring dead cells, so a run of a thousand dead
+    /// 3-word closures becomes one block no size class can serve, and
+    /// without this old space grew 7.4MB to 12.4MB across majors that
+    /// freed 66k cells each. `carve` holds the remainder so the
+    /// allocations that follow do not rescan `large`.
+    #[inline(never)]
+    fn reuse_coalesced(&mut self, words: usize, bytes: usize) -> Option<Ref> {
+        if words > MAX_SMALL_WORDS {
+            return None;
+        }
+        if self.carve_words >= words + 2 {
+            let a = self.carve;
+            self.carve = a + bytes as Ref;
+            self.carve_words -= words;
+            // the remainder stays a well-formed FREE cell: every walk over
+            // a chunk advances by `size_words`, so a headerless gap makes
+            // the collector read garbage
+            set_meta(self.carve, meta(K_FREE, self.carve_words, 0));
+            set_meta(a, 0);
+            self.freelist_bytes += bytes;
+            return Some(a);
+        }
+        for i in 0..self.large.len() {
+            let a = self.large[i];
+            let have = size_words(meta_at(a));
+            if have < words + 2 {
+                continue;
+            }
+            self.large.swap_remove(i);
+            self.retire_carve();
+            self.carve = a + bytes as Ref;
+            self.carve_words = have - words;
+            set_meta(self.carve, meta(K_FREE, self.carve_words, 0));
+            set_meta(a, 0);
+            self.freelist_bytes += bytes;
+            return Some(a);
+        }
+        None
+    }
+
 
     /// File whatever is left of the carve block back on a free list.
     fn retire_carve(&mut self) {
