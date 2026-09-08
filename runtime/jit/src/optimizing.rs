@@ -4040,6 +4040,9 @@ fn emit_op(
             // set when the cached load needed no guard at all: then nothing
             // branches to the miss paths and the whole tail is dead code
             let mut settled = false;
+            // set when the baked stub is the only reachable path: `full`
+            // is bound but the generic IC path and the helper are not
+            let mut baked_only = false;
             if let Some(o) = c.offsets {
                 if *fcache == Some(ins.b) {
                     // CSE'd: object address in x15 (validated, 0 = cold
@@ -4097,6 +4100,7 @@ fn emit_op(
                     }
                 }
                 if !settled {
+                'tail: {
                 c.a.bind(full);
                 // baked monomorphic stub: the site's warmed IC gives the
                 // shape id and slot as compile-time immediates, so the
@@ -4117,7 +4121,9 @@ fn emit_op(
                     // relies on the type. Deopt and let the interpreter
                     // re-run it; ten of those re-tier the function.
                     let typed = facts.field_repr.get(pc).copied().unwrap_or(2) != 2;
-                    let miss = if typed { c.a.new_label() } else { generic };
+                    // branch straight at the deopt stub: with no miss block
+                    // in between, the success path falls through to `done`
+                    let miss = if typed { c.deopt_stub(pc) } else { generic };
                     c.fetch_x(ins.b, 8);
                     c.a.lsr_imm(10, 8, 48);
                     c.a.movz(11, tsr_memory::TAG_OBJ as u16, 0); // TAG_OBJ
@@ -4140,11 +4146,15 @@ fn emit_op(
                     } else {
                         c.put_x(ins.a, 8);
                     }
-                    c.a.b(done);
                     if typed {
-                        c.a.bind(miss);
-                        c.deopt_at(pc);
+                        // every miss deopts, so the generic IC path and the
+                        // helper below cannot be reached: fall through to
+                        // `done` instead of jumping over dead code
+                        baked_only = true;
+                        c.a.bind(generic);
+                        break 'tail;
                     }
+                    c.a.b(done);
                     c.a.bind(generic);
                 }
                 // inline IC'd property load (reads only, no GC)
@@ -4180,10 +4190,11 @@ fn emit_op(
                 }
                 c.a.b(done);
                 }
+                }
             } else {
                 c.a.bind(full);
             }
-            if !settled {
+            if !settled && !baked_only {
             c.a.bind(slow);
             c.a.mov(0, R_REALM);
             c.proto_into(1);
@@ -4200,6 +4211,8 @@ fn emit_op(
             if settled {
                 // labels the dead tail would have bound
                 c.a.bind(full);
+                c.a.bind(slow);
+            } else if baked_only {
                 c.a.bind(slow);
             }
             c.a.bind(done);
