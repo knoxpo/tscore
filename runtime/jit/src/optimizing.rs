@@ -3832,9 +3832,14 @@ fn emit_op(
                         c.a.ldr_imm(8, 17, o.obj_inline);
                     }
                     if int_tmp {
+                        // the intermediate register is the value; its home is
+                        // written only where something reads it (the same lazy
+                        // write-back `int_dst_w` uses). objects wrote three homes
+                        // an iteration that nothing ever read.
                         c.a.mov(R_ITMP, 8);
+                    } else {
+                        c.put_x(ins.a, 8);
                     }
-                    c.put_x(ins.a, 8);
                     c.a.b(done);
                 }
                 c.a.bind(full);
@@ -3872,9 +3877,14 @@ fn emit_op(
                     c.a.mov(16, 12); //            + shape id
                     c.a.ldr_imm(8, 10, o.obj_inline + slot * 8);
                     if int_tmp {
+                        // the intermediate register is the value; its home is
+                        // written only where something reads it (the same lazy
+                        // write-back `int_dst_w` uses). objects wrote three homes
+                        // an iteration that nothing ever read.
                         c.a.mov(R_ITMP, 8);
+                    } else {
+                        c.put_x(ins.a, 8);
                     }
-                    c.put_x(ins.a, 8);
                     c.a.b(done);
                     if typed {
                         c.a.bind(miss);
@@ -3905,9 +3915,14 @@ fn emit_op(
                 c.index_addr(17, 10, 13, 8);
                 c.a.ldr_imm(8, 17, o.obj_inline);
                 if int_tmp {
+                    // the intermediate register is the value; its home is
+                    // written only where something reads it (the same lazy
+                    // write-back `int_dst_w` uses). objects wrote three homes
+                    // an iteration that nothing ever read.
                     c.a.mov(R_ITMP, 8);
+                } else {
+                    c.put_x(ins.a, 8);
                 }
-                c.put_x(ins.a, 8);
                 c.a.b(done);
             } else {
                 c.a.bind(full);
@@ -3921,12 +3936,13 @@ fn emit_op(
             c.thin_keep_arrays(c.helpers.get_field);
             if int_tmp {
                 c.a.mov(R_ITMP, 0);
+            } else {
+                c.put_x(ins.a, 0);
             }
-            c.put_x(ins.a, 0);
             c.a.bind(done);
             if int_tmp {
                 c.itmp = Some(ins.a);
-                c.itmp_dirty = false;
+                c.itmp_dirty = true;
             } else if c.itmp == Some(ins.a) {
                 c.itmp = None;
                 c.itmp_dirty = false;
