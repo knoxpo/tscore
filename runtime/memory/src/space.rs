@@ -106,11 +106,6 @@ pub struct Old {
     pub born_from: usize,
     /// Live bytes measured by the last sweep.
     pub live_bytes: usize,
-    /// The free block small allocations carve from, and how much is left.
-    /// Without it every allocation reaching the reuse path would rescan
-    /// `large`, which the sweep fills with coalesced runs.
-    carve: Ref,
-    carve_words: usize,
 }
 
 impl Old {
@@ -121,8 +116,6 @@ impl Old {
             chunks: Vec::new(),
             small: [0; MAX_SMALL_WORDS + 1],
             large: Vec::new(),
-            carve: 0,
-            carve_words: 0,
             freelist_bytes: 0,
             mark: 0,
             born_chunk: 0,
@@ -181,7 +174,6 @@ impl Old {
 
     /// Allocate `words` (>= 2). The cell comes back with a zeroed meta
     /// word; the caller writes the real one.
-    #[inline]
     pub fn alloc(&mut self, words: usize) -> Ref {
         debug_assert!(words >= 2);
         if words <= MAX_SMALL_WORDS {
@@ -210,14 +202,6 @@ impl Old {
         }
         let bytes = words * 8;
         if self.top + bytes > self.limit {
-            // Bump region spent. Before taking another chunk, reuse what
-            // the sweep coalesced. This is the only place that pays for
-            // it: putting the scan on the fast path cost closures 1.5%
-            // and gc_churn 4%, and both of those bump far more often
-            // than they exhaust a chunk.
-            if let Some(a) = self.reuse_coalesced(words, bytes) {
-                return a;
-            }
             self.sync_top();
             self.new_chunk(bytes);
         }
@@ -225,58 +209,6 @@ impl Old {
         self.top += bytes;
         self.sync_top();
         a as Ref
-    }
-
-    /// A small cell out of a run the major sweep merged. The sweep
-    /// coalesces neighbouring dead cells, so a run of a thousand dead
-    /// 3-word closures becomes one block no size class can serve, and
-    /// without this old space grew 7.4MB to 12.4MB across majors that
-    /// freed 66k cells each. `carve` holds the remainder so the
-    /// allocations that follow do not rescan `large`.
-    #[inline(never)]
-    fn reuse_coalesced(&mut self, words: usize, bytes: usize) -> Option<Ref> {
-        if words > MAX_SMALL_WORDS {
-            return None;
-        }
-        if self.carve_words >= words + 2 {
-            let a = self.carve;
-            self.carve = a + bytes as Ref;
-            self.carve_words -= words;
-            // the remainder stays a well-formed FREE cell: every walk over
-            // a chunk advances by `size_words`, so a headerless gap makes
-            // the collector read garbage
-            set_meta(self.carve, meta(K_FREE, self.carve_words, 0));
-            set_meta(a, 0);
-            self.freelist_bytes += bytes;
-            return Some(a);
-        }
-        for i in 0..self.large.len() {
-            let a = self.large[i];
-            let have = size_words(meta_at(a));
-            if have < words + 2 {
-                continue;
-            }
-            self.large.swap_remove(i);
-            self.retire_carve();
-            self.carve = a + bytes as Ref;
-            self.carve_words = have - words;
-            set_meta(self.carve, meta(K_FREE, self.carve_words, 0));
-            set_meta(a, 0);
-            self.freelist_bytes += bytes;
-            return Some(a);
-        }
-        None
-    }
-
-
-    /// File whatever is left of the carve block back on a free list.
-    fn retire_carve(&mut self) {
-        if self.carve_words >= 2 {
-            let (a, w) = (self.carve, self.carve_words);
-            self.push_free(a, w);
-        }
-        self.carve = 0;
-        self.carve_words = 0;
     }
 
     /// Register a free cell of `words` (writes its FREE header).
@@ -293,9 +225,6 @@ impl Old {
     pub fn clear_free_lists(&mut self) {
         self.small.iter_mut().for_each(|h| *h = 0);
         self.large.clear();
-        // the sweep rebuilds every list, the carve block included
-        self.carve = 0;
-        self.carve_words = 0;
     }
 
     pub fn allocated_bytes(&self) -> usize {
@@ -360,21 +289,6 @@ mod tests {
         assert_eq!(y.used(), 72);
         y.reset();
         assert_eq!(y.used(), 0);
-    }
-
-    #[test]
-    fn small_request_carves_a_coalesced_run() {
-        // what the major sweep leaves behind: neighbouring dead cells
-        // merged into one block too big for any size class
-        let mut o = Old::new();
-        let mut store = vec![0u64; 128].into_boxed_slice();
-        let big = store.as_mut_ptr() as Ref;
-        o.push_free(big, 64);
-        assert_eq!(o.small[3], 0, "the run is on the large list, not a size class");
-        // bump region empty, so a small request must reuse
-        assert_eq!(o.alloc(3), big, "a small request carves the run");
-        assert_eq!(o.alloc(3), big + 24, "and the remainder stays available");
-        std::mem::forget(store);
     }
 
     #[test]
