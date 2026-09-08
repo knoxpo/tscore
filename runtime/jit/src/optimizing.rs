@@ -191,6 +191,11 @@ struct C {
     /// every later access to the same object in the same run needs no
     /// guard at all — `p.x + p.y + p.z` guarded its shape three times.
     fproven: Option<u32>,
+    /// `(array vreg, length vreg)` — a `Len` established this and nothing
+    /// since could have changed that array's length. The bounds check can
+    /// then reuse the length the loop compare already loaded instead of
+    /// reading the meta word a second time.
+    alen: Option<(u8, u8)>,
     /// `a.blrs` when `fproven` was published. Any call emitted since —
     /// reachable or not — may have zeroed x15 on its return path, so the
     /// proof lapses.
@@ -1372,7 +1377,7 @@ pub fn compile(
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, fuse: None, skip_next: false }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, fuse: None, skip_next: false }
     };
     let out = c.a.new_label();
 
@@ -1609,6 +1614,7 @@ pub fn compile(
         if jump_targets[pc] {
             fcache = None;
             c.fproven = None;
+            c.alen = None;
             // The array cache may survive a loop header when the loop's
             // every array op is on the cached vreg and nothing rewrites
             // it: then the back edge arrives with the same base, and the
@@ -1770,6 +1776,32 @@ pub fn compile(
             // the register holding the array was overwritten — including
             // by the op that just cached it, as in `a = a[0]`
             acache = None;
+        }
+        // The known length survives only ops that cannot change an array's
+        // length and cannot run arbitrary code, and dies when either vreg
+        // it names is written.
+        let keeps_len = matches!(
+            ins.op,
+            Op::Len | Op::GetIndex | Op::GetField | Op::Move
+                | Op::LoadInt | Op::LoadConst | Op::LoadBool | Op::LoadNull | Op::LoadUndef
+                | Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow | Op::Neg
+                | Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr
+                | Op::BitNot | Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge
+                | Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip
+                | Op::GeSkip | Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue
+        );
+        match c.alen {
+            // `Len` writes the very vreg it just registered, so it is not
+            // a clobber; a later `Len` re-establishes the pair anyway
+            Some((arr, len))
+                if !keeps_len
+                    || (writes_a_op(ins.op)
+                        && ins.op != Op::Len
+                        && (ins.a == arr || ins.a == len)) =>
+            {
+                c.alen = None
+            }
+            _ => {}
         }
         if !preserves {
             fcache = None;
@@ -4272,8 +4304,15 @@ fn emit_op(
                 if ek != EK_ANY {
                     c.arr_kind_guard(10, ek, slow);
                 }
-                c.arr_len(14, 10);
-                c.a.cmp_reg(13, 14);
+                // the loop compare just read this array's length into a
+                // register and nothing since could have changed it
+                match c.alen.filter(|&(a, _)| a == ins.b).and_then(|(_, l)| c.tmp_reg(l)) {
+                    Some(r) => c.a.cmp_reg(13, r),
+                    None => {
+                        c.arr_len(14, 10);
+                        c.a.cmp_reg(13, 14);
+                    }
+                }
                 c.a.b_cond(Cond::Hs, slow);
                 c.arr_vals(16, 10, &o);
                 c.a.ldr_reg_lsl3(8, 16, 13);
@@ -4406,6 +4445,7 @@ fn emit_op(
                     // straight into the intermediate: nothing else wants
                     // the length in a scratch register
                     c.arr_len(R_ITMP, 10);
+                    c.alen = Some((ins.b, ins.a));
                 } else if smi {
                     c.arr_len(14, 10);
                     c.box_int(14);
