@@ -568,6 +568,11 @@ impl C {
             self.a.mov(home, src);
         }
         if home != R_ITMP {
+            // The lane is this vreg's value now. Whatever the intermediate
+            // was holding is a different vreg and still owes its home a
+            // write — dropping it here loses it, and only shows up once
+            // some producer defers that write.
+            self.retire_itmp(pc + 1, None);
             self.itmp = None;
             return; // laned: the register is the value until a sync point
         }
@@ -596,6 +601,11 @@ impl C {
         }
         self.a.mov(home, src);
         if home != R_ITMP {
+            // The lane is this vreg's value now. Whatever the intermediate
+            // was holding is a different vreg and still owes its home a
+            // write — dropping it here loses it, and only shows up once
+            // some producer defers that write.
+            self.retire_itmp(pc + 1, None);
             self.itmp = None;
             return; // laned: the register is the value until a sync point
         }
