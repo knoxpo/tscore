@@ -4402,13 +4402,16 @@ fn emit_op(
                 if cache {
                     *acache = Some(ins.b);
                 }
-                c.arr_len(14, 10);
                 if int_tmp {
-                    c.a.mov(R_ITMP, 14);
+                    // straight into the intermediate: nothing else wants
+                    // the length in a scratch register
+                    c.arr_len(R_ITMP, 10);
                 } else if smi {
+                    c.arr_len(14, 10);
                     c.box_int(14);
                     c.put_x(ins.a, 14);
                 } else {
+                    c.arr_len(14, 10);
                     c.a.scvtf(0, 14);
                     c.put(ins.a, 0);
                 }
