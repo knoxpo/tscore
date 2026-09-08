@@ -254,6 +254,11 @@ impl C {
         }
         self.itmp_dirty = false;
     }
+    /// A register already holding vreg `v` as an integer: its lane, or
+    /// the intermediate.
+    fn tmp_reg(&self, v: u8) -> Option<u32> {
+        self.lane_of(v).or_else(|| (self.itmp == Some(v)).then_some(R_ITMP))
+    }
     /// Drop the intermediate at a point control may leave the block
     /// (a merge, a loop end): its home first, if still needed.
     fn clear_itmp(&mut self, pc: usize) {
@@ -506,8 +511,8 @@ impl C {
         if let Some(r) = self.lane_of(v) {
             return r;
         }
-        if self.itmp == Some(v) {
-            return R_ITMP;
+        if let Some(r) = self.tmp_reg(v) {
+            return r;
         }
         if self.smi {
             // an int-tagged home: the lane guard and every int producer
@@ -1214,8 +1219,8 @@ fn load_int(c: &mut C, cls: Cls, v: u8, x: u32) -> u32 {
             if let Some(r) = c.lane_of(v) {
                 return r;
             }
-            if c.itmp == Some(v) {
-                return R_ITMP;
+            if let Some(r) = c.tmp_reg(v) {
+                return r;
             }
             c.fetch_x(v, x);
             x
@@ -2905,7 +2910,7 @@ fn emit_op(
             // an operand the lane machinery holds as an integer: in the
             // lane / intermediate register, or an int_ok home
             let laned = |c: &C, v: u8| {
-                c.lane_on && in_lane && (c.lane_of(v).is_some() || c.itmp == Some(v) || c.int_ok.contains(&v))
+                c.lane_on && in_lane && (c.tmp_reg(v).is_some() || c.int_ok.contains(&v))
             };
             if smi && facts.int_static && !withdrawn && (is_int(cb) || laned(c, ins.b)) && (is_int(cc) || laned(c, ins.c)) {
                 // proven ints: 32-bit flag-setting op straight off the
@@ -2993,8 +2998,7 @@ fn emit_op(
             // mean a conversion out and another back in, and both would
             // sit in the middle of the dependency chain.
             let known_int = |c: &C, v: u8, side: usize| {
-                c.lane_of(v).is_some()
-                    || c.itmp == Some(v)
+                c.tmp_reg(v).is_some()
                     || c.int_ok.contains(&v)
                     || facts.const_ops.get(pc).and_then(|o| o[side]).is_some()
             };
@@ -3002,10 +3006,7 @@ fn emit_op(
                 && num_bc
                 && c.lane_on
                 && in_lane
-                && (c.lane_of(ins.b).is_some()
-                    || c.itmp == Some(ins.b)
-                    || c.lane_of(ins.c).is_some()
-                    || c.itmp == Some(ins.c))
+                && (c.tmp_reg(ins.b).is_some() || c.tmp_reg(ins.c).is_some())
                 && known_int(c, ins.b, 0)
                 && known_int(c, ins.c, 1)
             {
@@ -3150,7 +3151,7 @@ fn emit_op(
             let const_div = facts.const_ops.get(pc).and_then(|o| o[1]);
             if num_bc {
                 let cb = cls_of(facts, pc, 0, smi);
-                let int_b = (c.lane_on && in_lane && (c.lane_of(ins.b).is_some() || c.itmp == Some(ins.b)))
+                let int_b = (c.lane_on && in_lane && c.tmp_reg(ins.b).is_some())
                     || (facts.int_facts.get(pc).is_some_and(|f| f[1]) && (smi || const_div.is_some()));
                 let cc = cls_of(facts, pc, 1, smi);
                 if smi && const_div.is_none() && int_b && matches!(cc, Cls::Int | Cls::IntK(_)) {
@@ -3470,7 +3471,7 @@ fn emit_op(
             let is_dbl = |x: Cls| matches!(x, Cls::Dbl | Cls::IntK(_));
             // an operand the lane machinery holds as an integer
             let laned = |c: &C, v: u8| {
-                c.lane_on && in_lane && (c.lane_of(v).is_some() || c.itmp == Some(v) || c.int_ok.contains(&v))
+                c.lane_on && in_lane && (c.tmp_reg(v).is_some() || c.int_ok.contains(&v))
             };
             if smi && cb == Cls::Num && laned(c, ins.b) {
                 cb = Cls::Int;
@@ -3771,7 +3772,20 @@ fn emit_op(
             // inside a laned loop the int also lands in the intermediate
             // register: its consumer reads that instead of round-tripping
             // the value through the d-home (objects: three reads a pass)
-            let int_tmp = typed_pc && c.lane_on && in_lane && c.lane_of(ins.a).is_none();
+            let mut int_tmp = typed_pc && c.lane_on && in_lane && c.lane_of(ins.a).is_none();
+            // Take a free lane register instead of R_ITMP when R_ITMP is
+            // holding a live arithmetic result: `acc + p.x + p.y + p.z`
+            // has three integers live at once, and evicting the partial
+            // sum boxed it to its home and reloaded it on the next read.
+            // R_ITMP holds a sum something still reads: evicting it for
+            // this field costs a box plus a reload on the loop-carried
+            // chain, more than the one move keeping the field there would
+            // save. Leave the field in its home and keep the sum.
+            // `acc + p.x + p.y + p.z` evicted a partial sum on each of
+            // its last two reads and ran 2.4x slower than node for it.
+            if int_tmp && c.itmp != Some(ins.a) && c.itmp_live_at(pc + 1).is_some() {
+                int_tmp = false;
+            }
             if int_tmp {
                 c.retire_itmp(pc + 1, Some(ins.a));
             }
