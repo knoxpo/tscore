@@ -2441,6 +2441,18 @@ fn emit_mod_const(c: &mut C, a_reg: u8, db: u32, d: i64, fmod_addr: usize, int_i
             c.a.mov(R_ITMP, 13);
         }
         deferred = mod_int_result(c, a_reg, 10, 13, pc);
+        // An integer dividend never branches to `slow`, and this arm
+        // excludes the other two, so the fmod fallback below is dead code
+        // the fast path would only have to jump over.
+        if int_in.is_some() {
+            c.a.bind(slow);
+            c.a.bind(done);
+            if keep {
+                c.itmp = Some(a_reg);
+                c.itmp_dirty = deferred;
+            }
+            return;
+        }
     } else if d.unsigned_abs() <= 16 {
         if let Some(r) = c.lane_of(a_reg) {
             c.a.mov(r, 13);
