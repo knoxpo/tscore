@@ -1719,7 +1719,12 @@ pub fn compile(
         // R_ITMP is callee-saved, so an intermediate survives intervening
         // ops and calls; it dies only when its vreg is rewritten by
         // something other than an integer arm, or at a merge
+        // Only a write to the vreg retires the intermediate. `ins.a` is a
+        // *source* for stores, branches, skips and Return, and dropping a
+        // dirty register there loses the value: the home was never
+        // written, so every later read sees a stale slot.
         if c.itmp == Some(ins.a)
+            && writes_a_op(ins.op)
             && !matches!(
                 ins.op,
                 Op::Add | Op::Sub | Op::Mul | Op::Mod | Op::GetField | Op::Len
