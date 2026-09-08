@@ -46,6 +46,7 @@ pub struct Label(pub usize);
 enum Fix {
     B26(usize, Label),
     B19(usize, Label), // b.cond / cbz / cbnz share the imm19 field position
+    B14(usize, Label), // tbz / tbnz
 }
 
 #[derive(Default)]
@@ -106,6 +107,12 @@ impl Asm {
                     let off = target as i64 - at as i64;
                     assert!((-(1 << 18)..(1 << 18)).contains(&off), "B19 out of range");
                     self.code[at] |= ((off as u32) & 0x7FFFF) << 5;
+                }
+                Fix::B14(at, l) => {
+                    let target = self.labels[l.0].expect("unbound label");
+                    let off = target as i64 - at as i64;
+                    assert!((-(1 << 13)..(1 << 13)).contains(&off), "B14 out of range");
+                    self.code[at] |= ((off as u32) & 0x3FFF) << 5;
                 }
             }
         }
@@ -429,6 +436,13 @@ impl Asm {
     pub fn cbnz32(&mut self, rt: Reg, l: Label) {
         self.fixups.push(Fix::B19(self.code.len(), l));
         self.push(0x3500_0000 | rt);
+    }
+    /// TBNZ Wt, #bit, label — branch when the bit is set. `bit` < 32, so
+    /// b5 stays clear and the register is read as a W.
+    pub fn tbnz32(&mut self, rt: Reg, bit: u32, l: Label) {
+        debug_assert!(bit < 32);
+        self.fixups.push(Fix::B14(self.code.len(), l));
+        self.push(0x3700_0000 | (bit & 0x1F) << 19 | rt);
     }
 
     // ---- floating point (double) ----

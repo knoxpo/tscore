@@ -2526,9 +2526,12 @@ fn mod_int_result(c: &mut C, a_reg: u8, n: u32, r: u32, pc: usize) -> bool {
         // (a laned register is the value; otherwise the home takes the
         // int — the analysis typed this result IntV)
         let bad = c.deopt_stub(pc);
-        c.a.cmp_imm32(n, 0);
-        c.a.b_cond(Cond::Ge, ok);
-        c.a.cbz32(r, bad);
+        // `x % k` is -0 only for a zero remainder of a negative dividend.
+        // A nonzero remainder settles it whatever the sign, and that is
+        // the common case, so test it first and read the sign bit
+        // directly rather than comparing against zero.
+        c.a.cbnz32(r, ok);
+        c.a.tbnz32(n, 31, bad);
         c.a.bind(ok);
         if c.lane_of(a_reg).is_none() {
             // the caller already put the remainder in R_ITMP when it is
