@@ -196,6 +196,11 @@ struct C {
     /// then reuse the length the loop compare already loaded instead of
     /// reading the meta word a second time.
     alen: Option<(u8, u8)>,
+    /// `(index vreg, length vreg)` — a fused `LtSkip` proved `i < len` on
+    /// the edge we are emitting on, and nothing since has written either.
+    ibound: Option<(u8, u8)>,
+    /// per vreg: provably never negative (see `nonneg_vregs`)
+    nonneg: Vec<bool>,
     /// `a.blrs` when `fproven` was published. Any call emitted since —
     /// reachable or not — may have zeroed x15 on its return path, so the
     /// proof lapses.
@@ -1377,7 +1382,7 @@ pub fn compile(
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, fuse: None, skip_next: false }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, ibound: None, nonneg: nonneg_vregs(pbody, proto.arity as usize, facts), fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, fuse: None, skip_next: false }
     };
     let out = c.a.new_label();
 
@@ -1615,6 +1620,7 @@ pub fn compile(
             fcache = None;
             c.fproven = None;
             c.alen = None;
+            c.ibound = None;
             // The array cache may survive a loop header when the loop's
             // every array op is on the cached vreg and nothing rewrites
             // it: then the back edge arrives with the same base, and the
@@ -1790,6 +1796,11 @@ pub fn compile(
                 | Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip
                 | Op::GeSkip | Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue
         );
+        if let Some((idx, len)) = c.ibound {
+            if writes_a_op(ins.op) && (ins.a == idx || ins.a == len) {
+                c.ibound = None;
+            }
+        }
         match c.alen {
             // `Len` writes the very vreg it just registered, so it is not
             // a clobber; a later `Len` re-establishes the pair anyway
@@ -2162,6 +2173,56 @@ fn emit_lane_guard(c: &mut C, vs: &[u8], laned: &[(u8, u32)], fail: Label) {
 /// than sharing x23 and reading the inner counter after the inner loop
 /// exits (which is what happened once array loops became eligible).
 /// Does `op` write its `a` operand (as opposed to reading it)?
+/// Vregs that can only ever hold a non-negative integer: every write to
+/// them in this function is a non-negative `LoadInt`, or an increment of
+/// themselves by a positive constant. Compiled integer arithmetic deopts
+/// on overflow, so such a vreg cannot wrap negative, and a parameter is
+/// excluded because its value comes from the caller.
+///
+/// This is what lets a bounds check go: the loop compare proves `i < len`
+/// and this proves `i >= 0`, which together are the unsigned test.
+fn nonneg_vregs(body: &tsc_ir::ProtoBody, arity: usize, facts: &Facts) -> Vec<bool> {
+    let n = body.n_regs as usize + 1;
+    let mut ok = vec![false; n.max(256)];
+    let mut seen = vec![false; n.max(256)];
+    for (pc, i) in body.code.iter().enumerate() {
+        if !writes_a_op(i.op) {
+            continue;
+        }
+        let v = i.a as usize;
+        let k = |slot: usize| facts.const_ops.get(pc).and_then(|o| o[slot]);
+        let good = match i.op {
+            Op::LoadInt => i.sbx() >= 0,
+            // vregs are reused across live ranges, so a later constant
+            // load into the same slot must not poison the fact
+            Op::LoadConst => {
+                matches!(body.consts.get(i.bx() as usize), Some(Const::Number(x)) if *x >= 0.0)
+            }
+            // i = i + k, either operand order
+            Op::Add => {
+                (i.b == i.a && k(1).is_some_and(|x| x > 0))
+                    || (i.c == i.a && k(0).is_some_and(|x| x > 0))
+            }
+            _ => false,
+        };
+        if !seen[v] {
+            seen[v] = true;
+            ok[v] = good;
+        } else if !good {
+            ok[v] = false;
+        }
+    }
+    for v in 0..arity.min(ok.len()) {
+        ok[v] = false; // comes from the caller
+    }
+    for v in 0..ok.len() {
+        if !seen[v] {
+            ok[v] = false; // never written here: nothing proven
+        }
+    }
+    ok
+}
+
 fn writes_a_op(op: Op) -> bool {
     !matches!(
         op,
@@ -3584,6 +3645,12 @@ fn emit_op(
                 let ic = load_int(c, cc, ins.c, 11);
                 c.a.cmp_reg32(ib, ic);
                 skip(c, int_cond(ins.op));
+                // Fused, this branches away when the test fails, so falling
+                // through means `b < c` as signed i32. Only the fused form:
+                // an unfused Skip jumps over one instruction instead.
+                if ins.op == Op::LtSkip && fuse.is_some() {
+                    c.ibound = Some((ins.b, ins.c));
+                }
             } else if dbl_bc || (smi && is_dbl(cb) && is_dbl(cc)) {
                 let db = load_dbl(c, cb, ins.b, 0);
                 let dc = load_dbl(c, cc, ins.c, 1);
@@ -4304,16 +4371,23 @@ fn emit_op(
                 if ek != EK_ANY {
                     c.arr_kind_guard(10, ek, slow);
                 }
-                // the loop compare just read this array's length into a
-                // register and nothing since could have changed it
-                match c.alen.filter(|&(a, _)| a == ins.b).and_then(|(_, l)| c.tmp_reg(l)) {
-                    Some(r) => c.a.cmp_reg(13, r),
-                    None => {
-                        c.arr_len(14, 10);
-                        c.a.cmp_reg(13, 14);
+                // `i < len` from the loop compare plus `i >= 0` from the
+                // analysis is exactly the unsigned bounds test, so the
+                // check itself goes; otherwise reuse the length the
+                // compare already loaded, or read it again.
+                let known_len = c.alen.filter(|&(a, _)| a == ins.b).map(|(_, l)| l);
+                let bounded = known_len.is_some_and(|l| c.ibound == Some((ins.c, l)))
+                    && c.nonneg.get(ins.c as usize).copied().unwrap_or(false);
+                if !bounded {
+                    match known_len.and_then(|l| c.tmp_reg(l)) {
+                        Some(r) => c.a.cmp_reg(13, r),
+                        None => {
+                            c.arr_len(14, 10);
+                            c.a.cmp_reg(13, 14);
+                        }
                     }
+                    c.a.b_cond(Cond::Hs, slow);
                 }
-                c.a.b_cond(Cond::Hs, slow);
                 c.arr_vals(16, 10, &o);
                 c.a.ldr_reg_lsl3(8, 16, 13);
                 c.put_x(ins.a, 8);
