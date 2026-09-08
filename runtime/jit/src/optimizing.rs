@@ -2438,6 +2438,12 @@ fn mod_int_result(c: &mut C, a_reg: u8, n: u32, r: u32, pc: usize) -> bool {
         c.a.cbz32(r, bad);
         c.a.bind(ok);
         if c.lane_of(a_reg).is_none() {
+            // the caller already put the remainder in R_ITMP when it is
+            // keeping one, so boxing it into the home is a second write of
+            // the same value that liveness usually says nothing reads
+            if !c.lanes.is_empty() {
+                return true;
+            }
             c.a.orr_reg32(14, 31, r);
             c.a.movk(14, tsr_memory::TAG_INT as u16, 48);
             c.put_x(a_reg, 14);
@@ -2624,6 +2630,17 @@ fn emit_inline_call(
 ) {
     let w = ins.a + 1; // window base vreg
     let map = |r: u8| w + r;
+    // The spliced body writes the caller's window vregs directly and does
+    // not maintain `itmp`, so a value living only in the intermediate
+    // register has to reach its home first — otherwise the claim outlives
+    // the vreg the callee overwrote.
+    if c.itmp_dirty {
+        if let Some(v) = c.itmp {
+            c.sync_itmp(v);
+        }
+    }
+    c.itmp = None;
+    c.itmp_dirty = false;
     // stack must already cover the callee temps (high-water usually does)
     c.a.ldr_imm(9, R_REALM, o.realm_stack_len);
     c.a.lsr_imm(10, R_BASE, 3);
@@ -2749,7 +2766,15 @@ fn emit_inline_call(
                         // raw home: the constant path dispatches on the tag
                         let db = c.fetch(map(cins.b), 0);
                         emit_mod_const(c, map(cins.a), db, d, fmod_addr, None, pc);
-                        c.itmp = None; // window vreg: not an intermediate for the caller
+                        // A window vreg is not the caller's intermediate, so
+                        // the claim goes — but if the mod deferred the home
+                        // write, R_ITMP is the only copy and dropping it
+                        // here loses the value. Caller liveness says nothing
+                        // about a window vreg, so write it back outright.
+                        if c.itmp == Some(map(cins.a)) && c.itmp_dirty {
+                            c.sync_itmp(map(cins.a));
+                        }
+                        c.itmp = None;
                         c.itmp_dirty = false;
                     }
                     None => {
