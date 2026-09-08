@@ -1628,7 +1628,7 @@ fn compile_optimizing(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> 
         .collect();
     // direct-call inlining: warmup filled CallIcs; a tiny eligible callee
     // gets spliced into the caller at compile time
-    let inlines: Vec<Option<(u64, Arc<FunctionProto>, Vec<(u64, u32)>)>> = proto
+    let inlines: Vec<Option<(u64, Arc<FunctionProto>, Vec<(u64, u32, u64)>)>> = proto
         .body()
         .code
         .iter()
@@ -1660,19 +1660,45 @@ fn compile_optimizing(proto: &FunctionProto, for_osr: bool) -> Option<Vec<u32>> 
                 Arc::increment_strong_count(p);
                 Arc::from_raw(p)
             };
-            // the callee's own literal shapes, by callee pc
-            let lits: Vec<(u64, u32)> = callee
+            // The callee's own literals, by callee pc: object shapes as
+            // before, and now the element kind of an array literal. The
+            // inliner used to type every spliced literal as the widest
+            // kind because it had no facts, which cost the element-kind
+            // work its whole point inside an inlined body.
+            // only worth analysing a callee that has an array literal to
+            // type — every other inline target would pay the pass for
+            // nothing, which showed up as ~1.4ms on the alloc row
+            let ctyped = callee
+                .body()
+                .code
+                .iter()
+                .any(|ci| ci.op == Op::NewArrayLit)
+                .then(|| {
+                    tsc_types::analyze(callee, &[], smi, callee.jit.no_int_vregs.load(Relaxed))
+                });
+            let lits: Vec<(u64, u32, u64)> = callee
                 .body()
                 .code
                 .iter()
                 .enumerate()
-                .map(|(cpc, ci)| {
-                    if ci.op == Op::NewObjectLit {
+                .map(|(cpc, ci)| match ci.op {
+                    Op::NewObjectLit => {
                         let s = lit_shape(callee, cpc, ci.c as usize);
-                        (s as *const _ as u64, s.fields.len() as u32)
-                    } else {
-                        (0, 0)
+                        (s as *const _ as u64, s.fields.len() as u32, 0)
                     }
+                    Op::NewArrayLit => {
+                        let kind = ctyped
+                            .as_ref()
+                            .filter(|t| t.opt_ok)
+                            .map(|t| {
+                                let cls =
+                                    t.lit_vals.get(cpc).map(|v| v.as_slice()).unwrap_or(&[]);
+                                tsr_jit::optimizing::lit_arr_kind(cls, ci.c as usize)
+                            })
+                            .unwrap_or(0);
+                        (0, 0, kind)
+                    }
+                    _ => (0, 0, 0),
                 })
                 .collect();
             Some((ic.proto_word, arc, lits))

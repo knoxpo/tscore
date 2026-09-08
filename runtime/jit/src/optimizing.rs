@@ -1122,7 +1122,7 @@ impl C {
 /// The array kind a literal's value classes give it (`lit_vals`: 0 int,
 /// 1 number, 2 anything). Unknown classes make the widest kind, which
 /// admits every later store.
-fn lit_arr_kind(classes: &[u8], n: usize) -> u64 {
+pub fn lit_arr_kind(classes: &[u8], n: usize) -> u64 {
     use tsr_memory::cells::{K_ARR, K_ARR_I32, K_ARR_NUM};
     if classes.len() < n {
         return K_ARR;
@@ -1255,7 +1255,7 @@ pub fn compile(
     ics_base: u64,
     tics_base: u64,
     lit_shapes: &[(u64, u32)],
-    inlines: &[Option<(u64, std::sync::Arc<FunctionProto>, Vec<(u64, u32)>)>],
+    inlines: &[Option<(u64, std::sync::Arc<FunctionProto>, Vec<(u64, u32, u64)>)>],
 ) -> Option<Vec<u32>> {
     let pbody = proto.body();
     if pbody.code.len() > crate::baseline::MAX_CODE {
@@ -2580,7 +2580,7 @@ fn emit_inline_call(
     ins: Instr,
     proto_word: u64,
     callee: &FunctionProto,
-    callee_lits: &[(u64, u32)],
+    callee_lits: &[(u64, u32, u64)],
     o: &HeapOffsets,
     fmod_addr: usize,
     generic: Label,
@@ -2630,13 +2630,20 @@ fn emit_inline_call(
     for (cpc, cins) in callee.body().code.iter().enumerate() {
         match cins.op {
             Op::NewArrayLit => {
-                // no facts for an inlined callee: its literal takes the
-                // widest kind, which every later store admits
-                c.emit_arr_lit(map(cins.a), map(cins.b), cins.c as usize, tsr_memory::cells::K_ARR);
+                // the callee's own analysis, run when the inline target
+                // was chosen, says what this literal holds; K_ARR when it
+                // could not be typed, which every later store admits
+                let kind = callee_lits
+                    .get(cpc)
+                    .map(|&(_, _, k)| k)
+                    .filter(|&k| k != 0)
+                    .unwrap_or(tsr_memory::cells::K_ARR);
+                c.emit_arr_lit(map(cins.a), map(cins.b), cins.c as usize, kind);
                 c.a.movz(14, 0, 0); // closure addr clobbered; GetUpval reloads
             }
             Op::NewObjectLit => {
-                let Some(&(shape_ptr, sn)) = callee_lits.get(cpc).filter(|&&(sp, _)| sp != 0) else {
+                let Some(&(shape_ptr, sn, _)) = callee_lits.get(cpc).filter(|&&(sp, _, _)| sp != 0)
+                else {
                     c.a.b(generic);
                     continue;
                 };
@@ -2838,7 +2845,7 @@ fn emit_op(
     fmod_addr: usize,
     pow_addr: usize,
     lit_shapes: &[(u64, u32)],
-    inlines: &[Option<(u64, std::sync::Arc<FunctionProto>, Vec<(u64, u32)>)>],
+    inlines: &[Option<(u64, std::sync::Arc<FunctionProto>, Vec<(u64, u32, u64)>)>],
     fcache: &mut Option<u8>,
     acache: &mut Option<u8>,
     in_lane: bool,
