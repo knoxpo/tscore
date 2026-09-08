@@ -1985,8 +1985,14 @@ fn live_at(code: &[Instr], start: usize, v: u8) -> bool {
             Op::Call => v == i.a || (v > i.a && v as usize <= i.a as usize + i.b as usize),
             Op::NewArrayLit => v >= i.b && (v as usize) < i.b as usize + i.c as usize,
             Op::NewObjectLit | Op::Concat | Op::Closure => true,
-            Op::SetField | Op::SetIndex | Op::ArrayPush | Op::StoreCell | Op::SetUpval
-            | Op::NewCell => i.a == v || i.b == v || i.c == v,
+            // `c` is a constant name index here, not a vreg — counting it
+            // kept whichever vreg shared that number artificially live
+            Op::GetField => i.b == v,
+            // and `b` is the name index on the store side
+            Op::SetField => i.a == v || i.c == v,
+            Op::SetIndex | Op::ArrayPush | Op::StoreCell | Op::SetUpval | Op::NewCell => {
+                i.a == v || i.b == v || i.c == v
+            }
             _ => i.b == v || i.c == v,
         }
     };
