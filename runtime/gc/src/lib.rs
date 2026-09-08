@@ -396,7 +396,24 @@ fn scan_cell(a: Ref, heap: &mut Heap, m: &mut tsr_memory::GcScratch, nur: &mut t
             let v = *heap.cell(a);
             *heap.cell_mut(a) = forward(v, heap, m, nur);
         }
-        k => unreachable!("scan of cell kind {k}"),
+        // Reached from a root or a remembered container, so something
+        // live points here. Say enough to tell the two causes apart: a
+        // cell freed while still reachable (K_FREE, and usually marked
+        // by this very trace) versus a walk that lost cell alignment.
+        k => {
+            let chunk = heap.old.chunks.iter().position(|c| (c.base..c.end).contains(&(a as usize)));
+            panic!(
+                "scan of cell kind {k} at {a:#x} meta={mt:#x} size={} aged={} dirty={} mark={} \
+                 in_born={} chunk={chunk:?} born_chunk={} born_from={:#x}",
+                size_words(mt),
+                mt & M_AGED != 0,
+                mt & M_DIRTY != 0,
+                mt & M_MARK != 0,
+                heap.old.in_born_range(a),
+                heap.old.born_chunk,
+                heap.old.born_from
+            )
+        }
     }
 }
 
