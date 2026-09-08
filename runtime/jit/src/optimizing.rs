@@ -201,6 +201,13 @@ struct C {
     ibound: Option<(u8, u8)>,
     /// per vreg: provably never negative (see `nonneg_vregs`)
     nonneg: Vec<bool>,
+    /// A vreg whose raw bits are still sitting in a GP register. Valid
+    /// only while `a.here()` equals `xtmp_at`, i.e. nothing at all has
+    /// been emitted since — so only the producer, which controls every
+    /// edge reaching that point, may publish it. The home is written
+    /// either way, so ignoring this is never wrong.
+    xtmp: Option<(u8, u32)>,
+    xtmp_at: usize,
     /// `a.blrs` when `fproven` was published. Any call emitted since —
     /// reachable or not — may have zeroed x15 on its return path, so the
     /// proof lapses.
@@ -414,6 +421,9 @@ impl C {
 
     /// vreg bits into a GP register (a laned vreg from its register).
     fn fetch_x(&mut self, v: u8, x: u32) {
+        if self.xtmp == Some((v, x)) && self.a.here() == self.xtmp_at {
+            return; // already in that very register
+        }
         if self.itmp == Some(v) {
             self.box_lane(x, R_ITMP);
             return;
@@ -1274,6 +1284,11 @@ fn load_int(c: &mut C, cls: Cls, v: u8, x: u32) -> u32 {
             if let Some(r) = c.tmp_reg(v) {
                 return r;
             }
+            if let Some((xv, xr)) = c.xtmp {
+                if xv == v && c.a.here() == c.xtmp_at {
+                    return xr; // the raw bits are still there
+                }
+            }
             c.fetch_x(v, x);
             x
         }
@@ -1404,7 +1419,7 @@ pub fn compile(
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, ibound: None, nonneg: nonneg_vregs(pbody, proto.arity as usize, facts), fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, fuse: None, skip_next: false }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, ibound: None, xtmp: None, xtmp_at: usize::MAX, nonneg: nonneg_vregs(pbody, proto.arity as usize, facts), fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, fuse: None, skip_next: false }
     };
     let out = c.a.new_label();
 
@@ -1643,6 +1658,7 @@ pub fn compile(
             c.fproven = None;
             c.alen = None;
             c.ibound = None;
+            c.xtmp = None;
             // The array cache may survive a loop header when the loop's
             // every array op is on the cached vreg and nothing rewrites
             // it: then the back edge arrives with the same base, and the
@@ -1933,7 +1949,8 @@ pub fn compile(
                 c.fetch_x(ins.b, 3);
                 c.fetch_x(ins.c, 4);
                 c.thin_keep_arrays(c.helpers.get_index);
-                c.put_x(ins.a, 0);
+                c.a.mov(8, 0); // match the fast path: the value is in x8
+                c.put_x(ins.a, 8);
                 c.a.b(done);
                 c.lanes = saved;
                 (c.itmp, c.itmp_dirty) = (si, sd);
@@ -4211,7 +4228,8 @@ fn emit_op(
             if int_tmp {
                 c.a.mov(R_ITMP, 0);
             } else {
-                c.put_x(ins.a, 0);
+                c.a.mov(8, 0); // match every other edge: the value is in x8
+                c.put_x(ins.a, 8);
             }
             }
             if settled {
@@ -4222,6 +4240,11 @@ fn emit_op(
                 c.a.bind(slow);
             }
             c.a.bind(done);
+            if !int_tmp && c.offsets.is_some() {
+                // every edge left the field value in x8
+                c.xtmp = Some((ins.a, 8));
+                c.xtmp_at = c.a.here();
+            }
             if int_tmp {
                 c.itmp = Some(ins.a);
                 c.itmp_dirty = true;
@@ -4506,6 +4529,11 @@ fn emit_op(
                 c.stubs.push(Stub::IndexSlow { l: slow, done, pc, ins, lanes, itmp });
             }
             c.a.bind(done);
+            if c.offsets.is_some() {
+                // fast path and out-of-line helper both leave it in x8
+                c.xtmp = Some((ins.a, 8));
+                c.xtmp_at = c.a.here();
+            }
         }
         Op::SetIndex => {
             let slow = c.a.new_label();
