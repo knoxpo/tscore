@@ -185,6 +185,16 @@ struct C {
     /// deferred until the vreg is still live where the register is
     /// reassigned, cleared, spilled or branched away from
     itmp_dirty: bool,
+    /// The shape id x16 is *proven* to hold, with x15 proven non-zero,
+    /// for whichever vreg `fcache` names. A typed field site deopts on a
+    /// miss rather than joining a helper, so once its guard has passed
+    /// every later access to the same object in the same run needs no
+    /// guard at all — `p.x + p.y + p.z` guarded its shape three times.
+    fproven: Option<u32>,
+    /// `a.blrs` when `fproven` was published. Any call emitted since —
+    /// reachable or not — may have zeroed x15 on its return path, so the
+    /// proof lapses.
+    fproven_at: usize,
     /// the bytecode (for liveness at those points)
     code: Vec<Instr>,
     /// x22 is the array-base cache in this function.
@@ -1352,7 +1362,7 @@ pub fn compile(
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, fuse: None, skip_next: false }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, fuse: None, skip_next: false }
     };
     let out = c.a.new_label();
 
@@ -1588,6 +1598,7 @@ pub fn compile(
     for (pc, ins) in pbody.code.iter().enumerate() {
         if jump_targets[pc] {
             fcache = None;
+            c.fproven = None;
             // The array cache may survive a loop header when the loop's
             // every array op is on the cached vreg and nothing rewrites
             // it: then the back edge arrives with the same base, and the
@@ -1742,6 +1753,7 @@ pub fn compile(
         }
         if !preserves {
             fcache = None;
+            c.fproven = None;
         } else if let Some(v) = fcache {
             // an op that overwrites the cached vreg's register drops it
             let writes_a = !matches!(
@@ -1753,6 +1765,7 @@ pub fn compile(
             );
             if writes_a && ins.a == v {
                 fcache = None;
+                c.fproven = None;
             }
         }
     }
@@ -3814,10 +3827,16 @@ fn emit_op(
                         .copied()
                         .flatten()
                         .filter(|&(_, slot)| (slot as usize) < o.obj_inline_n as usize);
-                    c.a.cbz(15, full);
+                    let proven = c.a.blrs == c.fproven_at
+                        && matches!((baked, c.fproven), (Some((s, _)), Some(p)) if s == p);
+                    if !proven {
+                        c.a.cbz(15, full);
+                    }
                     if let Some((sid, slot)) = baked {
-                        c.cmp_sid(16, sid);
-                        c.a.b_cond(Cond::Ne, full);
+                        if !proven {
+                            c.cmp_sid(16, sid);
+                            c.a.b_cond(Cond::Ne, full);
+                        }
                         c.a.ldr_imm(8, 15, o.obj_inline + slot * 8);
                     } else {
                         c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
@@ -3949,8 +3968,26 @@ fn emit_op(
             }
             if c.offsets.is_some() && ins.a != ins.b {
                 *fcache = Some(ins.b);
+                // A baked, typed site sends every miss to a deopt, so the
+                // only way to reach here is through the guard that just
+                // passed: x15 is non-zero and x16 is this shape.
+                // must be the *baked stub* that ran: an overflow slot or
+                // an untyped repr falls into the generic path, whose miss
+                // joins the helper and can leave x15 zero.
+                c.fproven = c.offsets.and_then(|o| {
+                    facts
+                        .ic_baked
+                        .get(pc)
+                        .copied()
+                        .flatten()
+                        .filter(|&(_, slot)| (slot as usize) < o.obj_inline_n as usize)
+                        .filter(|_| facts.field_repr.get(pc).copied().unwrap_or(2) != 2)
+                        .map(|(sid, _)| sid)
+                });
+                c.fproven_at = c.a.blrs;
             } else {
                 *fcache = None;
+                c.fproven = None;
             }
         }
         Op::SetField => {
@@ -3987,7 +4024,11 @@ fn emit_op(
                         .copied()
                         .flatten()
                         .filter(|&(_, slot)| (slot as usize) < o.obj_inline_n as usize);
-                    c.a.cbz(15, full);
+                    let store_proven = c.a.blrs == c.fproven_at
+                        && matches!((baked.map(|(s, _)| s), c.fproven), (Some(s), Some(p)) if s == p);
+                    if !store_proven {
+                        c.a.cbz(15, full);
+                    }
                     c.fetch_x(ins.c, 9);
                     if !val_int {
                         if ref_ok {
@@ -4090,6 +4131,9 @@ fn emit_op(
             if c.offsets.is_some() {
                 *fcache = Some(ins.a);
             }
+            // a store's miss joins the helper rather than deopting, so
+            // x15 may be zero past here and nothing is proven any more
+            c.fproven = None;
         }
         Op::GetIndex => {
             let slow = c.a.new_label();
