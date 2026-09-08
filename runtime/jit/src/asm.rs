@@ -46,8 +46,6 @@ pub struct Label(pub usize);
 enum Fix {
     B26(usize, Label),
     B19(usize, Label), // b.cond / cbz / cbnz share the imm19 field position
-    /// LDR Xt, <literal>: instruction index, index into `pool`.
-    Lit(usize, usize),
 }
 
 #[derive(Default)]
@@ -109,7 +107,6 @@ impl Asm {
                     assert!((-(1 << 18)..(1 << 18)).contains(&off), "B19 out of range");
                     self.code[at] |= ((off as u32) & 0x7FFFF) << 5;
                 }
-                Fix::Lit(..) => {}
             }
         }
         if !self.pool.is_empty() {
