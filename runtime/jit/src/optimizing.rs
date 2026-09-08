@@ -242,6 +242,17 @@ enum Stub {
     /// a zero product owes -0 when either factor is negative: deopt
     /// then, else back to `ok`
     MulZero { l: Label, ib: u32, ic: u32, ok: Label, deopt: Label },
+    /// An index read that missed its guards: call the helper out of line
+    /// so the fast path falls through instead of jumping over it.
+    /// `lanes`/`itmp` are the register state at the branch, as for Deopt.
+    IndexSlow {
+        l: Label,
+        done: Label,
+        pc: usize,
+        ins: Instr,
+        lanes: Vec<(u8, u32)>,
+        itmp: Option<(u8, bool)>,
+    },
 }
 
 impl C {
@@ -1896,6 +1907,25 @@ pub fn compile(
                     c.sync_lane(v, r);
                 }
                 c.a.b(target);
+            }
+            Stub::IndexSlow { l, done, pc, ins, lanes, itmp } => {
+                c.a.bind(l);
+                let saved = std::mem::replace(&mut c.lanes, lanes);
+                let (si, sd) = (c.itmp, c.itmp_dirty);
+                (c.itmp, c.itmp_dirty) = match itmp {
+                    Some((v, d)) => (Some(v), d),
+                    None => (None, false),
+                };
+                c.a.mov(0, R_REALM);
+                c.proto_into(1);
+                c.a.mov_imm64(2, pc as u64);
+                c.fetch_x(ins.b, 3);
+                c.fetch_x(ins.c, 4);
+                c.thin_keep_arrays(c.helpers.get_index);
+                c.put_x(ins.a, 0);
+                c.a.b(done);
+                c.lanes = saved;
+                (c.itmp, c.itmp_dirty) = (si, sd);
             }
             Stub::MulZero { l, ib, ic, ok, deopt } => {
                 c.a.bind(l);
@@ -4406,19 +4436,22 @@ fn emit_op(
                 c.arr_vals(16, 10, &o);
                 c.a.ldr_reg_lsl3(8, 16, 13);
                 c.put_x(ins.a, 8);
-                c.a.b(done);
+                if ek != EK_ANY {
+                    c.a.b(done);
+                }
             }
-            c.a.bind(slow);
             if ek != EK_ANY {
+                c.a.bind(slow);
                 c.deopt_at(pc);
             } else {
-                c.a.mov(0, R_REALM);
-                c.proto_into(1);
-                c.a.mov_imm64(2, pc as u64);
-                c.fetch_x(ins.b, 3);
-                c.fetch_x(ins.c, 4);
-                c.thin_keep_arrays(c.helpers.get_index);
-                c.put_x(ins.a, 0);
+                // out of line: the fast path falls straight through to
+                // `done`. The helper still counts as emitted here, or the
+                // guard proofs would treat x15/x22 as surviving a call
+                // that can zero them on its way back.
+                let lanes = c.lanes.clone();
+                let itmp = c.itmp.map(|v| (v, c.itmp_dirty));
+                c.a.blrs += 1;
+                c.stubs.push(Stub::IndexSlow { l: slow, done, pc, ins, lanes, itmp });
             }
             c.a.bind(done);
         }
