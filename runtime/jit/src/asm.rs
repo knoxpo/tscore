@@ -339,6 +339,12 @@ impl Asm {
         let imm7 = ((imm / 8) as u32) & 0x7F;
         self.push(0xA980_0000 | imm7 << 15 | rt2 << 10 | rn << 5 | rt);
     }
+    /// STP Xt1, Xt2, [Xn, #imm] (signed offset, imm a multiple of 8).
+    pub fn stp_imm(&mut self, rt: Reg, rt2: Reg, rn: Reg, imm: i32) {
+        debug_assert!(imm % 8 == 0 && (-512..512).contains(&imm));
+        let imm7 = ((imm / 8) as u32) & 0x7F;
+        self.push(0xA900_0000 | imm7 << 15 | rt2 << 10 | rn << 5 | rt);
+    }
     /// LDP Xt1, Xt2, [SP], #16 (post-index pop).
     pub fn ldp_post(&mut self, rt: Reg, rt2: Reg, rn: Reg, imm: i32) {
         let imm7 = ((imm / 8) as u32) & 0x7F;
@@ -541,6 +547,8 @@ mod tests {
             ({ let mut a = Asm::new(); a.ldr_d_imm(0, 21, 24); a.code[0] }, "ldr d0, [x21, #24]"),
             ({ let mut a = Asm::new(); a.str_d_imm(8, 21, 8); a.code[0] }, "str d8, [x21, #8]"),
             ({ let mut a = Asm::new(); a.stp_pre(29, 30, SP, -16); a.code[0] }, "stp x29, x30, [sp, #-16]!"),
+            ({ let mut a = Asm::new(); a.stp_imm(14, 9, 13, 0); a.code[0] }, "stp x14, x9, [x13]"),
+            ({ let mut a = Asm::new(); a.stp_imm(9, 12, 13, 16); a.code[0] }, "stp x9, x12, [x13, #16]"),
             ({ let mut a = Asm::new(); a.ldp_post(29, 30, SP, 16); a.code[0] }, "ldp x29, x30, [sp], #16"),
             ({ let mut a = Asm::new(); a.blr(8); a.code[0] }, "blr x8"),
             ({ let mut a = Asm::new(); a.ret(); a.code[0] }, "ret"),

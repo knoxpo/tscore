@@ -909,6 +909,35 @@ impl C {
         self.a.b_cond(Cond::Hi, slow);
         self.a.str_imm(14, R_REALM, top);
     }
+    /// An object literal's slot value in x{x}, proven against what the
+    /// field's representation admits.
+    fn obj_slot(&mut self, v: u8, x: u32, cls: u8, slow: Label) {
+        self.fetch_x(v, x);
+        if cls == 2 || cls == 3 {
+            // a number: with small ints on, an int-tagged value is one
+            self.a.lsr_imm(11, x, 48);
+            self.a.cmp_reg(11, R_TAGLIM);
+            self.a.b_cond(if self.smi { Cond::Hi } else { Cond::Hs }, slow);
+        }
+        if cls == 1 || cls == 2 {
+            self.int32_check(x, slow);
+        }
+    }
+
+    /// Store x{a} at `[rn, off_a]` and x{b} at `[rn, off_b]`, as one
+    /// `stp` when the two words are adjacent. Every cell header is a
+    /// run of adjacent words, and a paired store is one instruction and
+    /// one store-queue entry instead of two.
+    fn pair_or_two(&mut self, a: u32, b: u32, rn: u32, off_a: u32, off_b: u32) {
+        let paired = off_b == off_a + 8 && off_a % 8 == 0 && off_a < 504;
+        if paired && std::env::var_os("TSC_NO_STP").is_none() {
+            self.a.stp_imm(a, b, rn, off_a as i32);
+        } else {
+            self.a.str_imm(a, rn, off_a);
+            self.a.str_imm(b, rn, off_b);
+        }
+    }
+
     /// Box the cell address in x13 with `tag` into x{dst}.
     fn tag_addr(&mut self, dst: u32, tag: u64) {
         self.a.mov_imm64(9, tag << 48);
@@ -941,9 +970,9 @@ impl C {
             tsr_memory::hold_proto(child);
             self.bump_old(2 + n as u32, tsr_memory::TAG_CLOSURE, &o, slow); // TAG_CLOSURE
             self.a.mov_imm64(14, tsr_memory::cells::meta(tsr_memory::cells::K_CLOSURE, 2 + n, n));
-            self.a.str_imm(14, 13, 0);
-            self.a.mov_imm64(14, std::sync::Arc::as_ptr(child) as u64);
-            self.a.str_imm(14, 13, o.closure_proto);
+            self.a.mov_imm64(9, std::sync::Arc::as_ptr(child) as u64);
+            // meta and proto are adjacent words: one store, not two
+            self.pair_or_two(14, 9, 13, 0, o.closure_proto);
             for (i, u) in child.upvals.iter().enumerate() {
                 match *u {
                     tsc_ir::UpvalSrc::ParentLocal(r) => {
@@ -1075,14 +1104,32 @@ impl C {
             let words = 2 + 1 + cap;
             c.bump(words as u32, &o, slow);
             c.a.mov_imm64(14, meta(kind, 2, n));
-            c.a.str_imm(14, 13, 0);
-            c.a.add_imm(14, 13, 16);
-            c.a.str_imm(14, 13, o.arr_elems);
+            c.a.add_imm(9, 13, 16);
+            c.pair_or_two(14, 9, 13, 0, o.arr_elems);
             c.a.mov_imm64(14, meta(K_ELEMS, 1 + cap, cap));
-            c.a.str_imm(14, 13, 16);
-            for i in 0..n {
-                c.fetch_x(first + i as u8, 9);
-                c.a.str_imm(9, 13, 16 + o.elems_vals + i as u32 * 8);
+            // the chunk's own header runs straight into its values, so
+            // it pairs with the first one, and the values pair with
+            // each other after that
+            let vbase = 16 + o.elems_vals;
+            let mut i = 0usize;
+            if n > 0 {
+                c.fetch_x(first, 9);
+                c.pair_or_two(14, 9, 13, 16, vbase);
+                i = 1;
+            } else {
+                c.a.str_imm(14, 13, 16);
+            }
+            while i < n {
+                if i + 1 < n {
+                    c.fetch_x(first + i as u8, 9);
+                    c.fetch_x(first + i as u8 + 1, 12);
+                    c.pair_or_two(9, 12, 13, vbase + i as u32 * 8, vbase + (i as u32 + 1) * 8);
+                    i += 2;
+                } else {
+                    c.fetch_x(first + i as u8, 9);
+                    c.a.str_imm(9, 13, vbase + i as u32 * 8);
+                    i += 1;
+                }
             }
             // slack past `n` is never read
             c.tag_addr(0, tsr_memory::TAG_ARR); // TAG_ARR
@@ -1118,22 +1165,29 @@ impl C {
             use tsr_memory::cells::{meta, K_OBJ};
             c.bump(o.obj_words, &o, slow);
             c.a.mov_imm64(14, meta(K_OBJ, o.obj_words as usize, sn as usize));
-            c.a.str_imm(14, 13, 0);
-            c.a.mov_imm64(14, shape_ptr);
-            c.a.str_imm(14, 13, o.obj_shape);
-            for i in 0..sn {
-                c.fetch_x(first + i, 9);
-                let cls = checks.get(i as usize).copied().unwrap_or(0);
-                if cls == 2 || cls == 3 {
-                    // a number: with small ints on, an int-tagged value is one
-                    c.a.lsr_imm(11, 9, 48);
-                    c.a.cmp_reg(11, R_TAGLIM);
-                    c.a.b_cond(if c.smi { Cond::Hi } else { Cond::Hs }, slow);
+            c.a.mov_imm64(9, shape_ptr);
+            c.pair_or_two(14, 9, 13, 0, o.obj_shape);
+            // Inline slots are adjacent words, so they go two at a time.
+            // A guard that fails now leaves one more slot unwritten than
+            // it used to; the slow path rebuilds the object from the
+            // homes either way and the half-filled cell is abandoned.
+            let mut i = 0u8;
+            while i < sn {
+                c.obj_slot(first + i, 9, checks.get(i as usize).copied().unwrap_or(0), slow);
+                if i + 1 < sn {
+                    c.obj_slot(
+                        first + i + 1,
+                        12,
+                        checks.get(i as usize + 1).copied().unwrap_or(0),
+                        slow,
+                    );
+                    let off = o.obj_inline + i as u32 * 8;
+                    c.pair_or_two(9, 12, 13, off, off + 8);
+                    i += 2;
+                } else {
+                    c.a.str_imm(9, 13, o.obj_inline + i as u32 * 8);
+                    i += 1;
                 }
-                if cls == 1 || cls == 2 {
-                    c.int32_check(9, slow);
-                }
-                c.a.str_imm(9, 13, o.obj_inline + i as u32 * 8);
             }
             c.a.str_imm(31, 13, o.obj_spill); // xzr: no spill
             c.tag_addr(0, tsr_memory::TAG_OBJ); // TAG_OBJ
