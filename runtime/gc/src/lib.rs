@@ -93,9 +93,11 @@ pub fn collect<'a>(
     globals: impl Iterator<Item = &'a Value>,
     stats: &mut GcStats,
 ) {
-    debug_assert!(
+    assert!(
         heap.young.used() == 0 && heap.nursery.strs.is_empty(),
-        "major GC with a non-empty nursery: evacuate first"
+        "major GC with a non-empty nursery: evacuate first (young={} strs={})",
+        heap.young.used(),
+        heap.nursery.strs.len()
     );
     let t0 = std::time::Instant::now();
     heap.old.sync_top();
@@ -107,6 +109,9 @@ pub fn collect<'a>(
     work.clear();
     work.extend_from_slice(stack);
     work.extend(globals.copied());
+    let verify_roots: Vec<Value> = if verify_on() { work.clone() } else { Vec::new() };
+    // before the sweep: did this major inherit the corruption?
+    verify_reachable(heap, &verify_roots, "pre-major");
 
     while let Some(v) = work.pop() {
         match v.kind() {
@@ -140,6 +145,7 @@ pub fn collect<'a>(
         }
     }
 
+    verify_marked(heap, &verify_roots);
     // sweep the old chunks: live cells lose their mark and dirty bits and
     // become aged; dead runs coalesce into free cells
     let (mut live_cells, mut freed, mut live_bytes) = (0usize, 0usize, 0usize);
@@ -233,6 +239,7 @@ pub fn collect<'a>(
         });
 
     stats.major_collections += 1;
+    verify_reachable(heap, &verify_roots, "major");
     stats.last_freed = freed;
     stats.last_live = live_cells;
     stats.last_live_bytes = live_bytes;
@@ -674,6 +681,11 @@ pub fn collect_minor<'a>(
     heap.gc_scratch = m;
     stats.minor_collections += 1;
     stats.last_freed = freed;
+    if verify_on() {
+        let mut roots: Vec<Value> = stack.to_vec();
+        roots.extend_from_slice(extra);
+        verify_reachable(heap, &roots, "post-minor");
+    }
     if debug_on() {
         eprintln!(
             "[gc] minor us={} roots={} scan={} sweep={} tail={} young_used={young_used} freed={freed} promoted={promoted} evac_strs={evacuated} old_bytes={}",
@@ -702,7 +714,12 @@ fn bulk_promote(heap: &mut Heap, stats: &mut GcStats) {
     for v in &born {
         if let Kind::Object(a) | Kind::Array(a) | Kind::Closure(a) | Kind::Cell(a) = v.kind() {
             let mt = meta_at(a);
-            set_meta(a, mt | M_AGED);
+            // clear the mark: a minor's `forward_cell` sets it on a
+            // not-yet-aged old cell, and ageing without clearing leaves
+            // it set for good. The next major then reads the stale mark
+            // as "already visited", never traces the cell, and sweeps
+            // everything reachable only through it.
+            set_meta(a, (mt & !M_MARK) | M_AGED);
             promoted += 1;
             promoted_bytes += size_words(mt) * 8;
         }
@@ -721,7 +738,7 @@ fn bulk_promote(heap: &mut Heap, stats: &mut GcStats) {
         while a < top {
             let mt = meta_at(a as Ref);
             if mt & M_AGED == 0 && kind_of(mt) != K_FREE {
-                set_meta(a as Ref, mt | M_AGED);
+                set_meta(a as Ref, (mt & !M_MARK) | M_AGED);
                 promoted += 1;
                 promoted_bytes += size_words(mt) * 8;
             }
@@ -801,6 +818,101 @@ fn sweep_born_range(heap: &mut Heap, promoted: &mut usize, promoted_bytes: &mut 
         set_meta(a, (mt & !M_MARK) | M_AGED);
         size_words(mt) * 8
     }, promoted, promoted_bytes);
+}
+
+/// `TSC_GC_VERIFY=1`: after a collection, walk everything reachable
+/// from the roots and check that none of it is FREE. This is the exact
+/// invariant the major's tracer asserts, checked at the collection that
+/// broke it rather than at the one that trips over it later.
+fn verify_reachable(heap: &Heap, roots: &[Value], phase: &str) {
+    if !verify_on() {
+        return;
+    }
+    let mut seen: std::collections::HashSet<Ref> = std::collections::HashSet::new();
+    let mut work: Vec<Value> = roots.to_vec();
+    let mut bad = 0usize;
+    while let Some(v) = work.pop() {
+        let a = match v.kind() {
+            Kind::Object(a) | Kind::Array(a) | Kind::Closure(a) | Kind::Cell(a) => a,
+            _ => continue,
+        };
+        if !seen.insert(a) {
+            continue;
+        }
+        let mt = meta_at(a);
+        if kind_of(mt) == K_FREE {
+            eprintln!(
+                "[verify/{phase}] reachable FREE cell {a:#x} size={} words, reached as {:?}",
+                size_words(mt),
+                v.kind()
+            );
+            bad += 1;
+            if bad > 3 {
+                std::process::abort();
+            }
+            continue;
+        }
+        if matches!(kind_of(mt), K_OBJ | K_ARR | K_ARR_NUM | K_ARR_I32 | K_CLOSURE | K_CELL) {
+            trace_cell(heap, a, &mut work);
+        }
+    }
+    if bad > 0 {
+        std::process::abort();
+    }
+}
+
+/// After the major's mark phase: everything reachable must carry
+/// M_MARK, or the sweep frees it.
+fn verify_marked(heap: &Heap, roots: &[Value]) {
+    if !verify_on() {
+        return;
+    }
+    let mut seen: std::collections::HashSet<Ref> = std::collections::HashSet::new();
+    let mut work: Vec<(Ref, Value)> = roots.iter().map(|v| (0u64, *v)).collect();
+    let mut bad = 0usize;
+    while let Some((parent, v)) = work.pop() {
+        let a = match v.kind() {
+            Kind::Object(a) | Kind::Array(a) | Kind::Closure(a) | Kind::Cell(a) => a,
+            _ => continue,
+        };
+        if !seen.insert(a) {
+            continue;
+        }
+        let mt = meta_at(a);
+        if mt & M_MARK == 0 {
+            let pm = if parent == 0 { 0 } else { meta_at(parent) };
+            eprintln!(
+                "[verify/mark] UNMARKED {a:#x} kind={} size={} aged={} in_born={} \
+                 <- parent {parent:#x} kind={} marked={} aged={} dirty={} in_born={}",
+                kind_of(mt),
+                size_words(mt),
+                mt & M_AGED != 0,
+                heap.old.in_born_range(a),
+                if parent == 0 { 99 } else { kind_of(pm) },
+                pm & M_MARK != 0,
+                pm & M_AGED != 0,
+                pm & M_DIRTY != 0,
+                if parent == 0 { false } else { heap.old.in_born_range(parent) }
+            );
+            bad += 1;
+            if bad > 3 {
+                std::process::abort();
+            }
+        }
+        if matches!(kind_of(mt), K_OBJ | K_ARR | K_ARR_NUM | K_ARR_I32 | K_CLOSURE | K_CELL) {
+            let mut kids: Vec<Value> = Vec::new();
+            trace_cell(heap, a, &mut kids);
+            work.extend(kids.into_iter().map(|k| (a, k)));
+        }
+    }
+    if bad > 0 {
+        std::process::abort();
+    }
+}
+
+fn verify_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TSC_GC_VERIFY").is_some())
 }
 
 fn mark(bits: &mut [bool], r: Ref) -> bool {

@@ -826,7 +826,13 @@ impl Default for Heap {
             free_strs: Vec::new(),
             free_foreigns: Vec::new(),
             allocs_since_gc: 0,
-            gc_threshold: 1 << 18, // 256k allocations between collections
+            // TSC_GC_THRESHOLD pins collections to an allocation count,
+            // so instrumentation cannot move where they land — the only
+            // way to chase a cadence-sensitive GC bug.
+            gc_threshold: std::env::var("TSC_GC_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1 << 18), // 256k allocations between collections
             gen_strs: GenState::default(),
             gen_foreigns: GenState::default(),
             young: Young::new(nursery_limit),
