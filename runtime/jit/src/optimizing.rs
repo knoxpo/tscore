@@ -2352,11 +2352,17 @@ fn emit_dbl_guard(c: &mut C, vs: &[u8], fail: Label) {
     }
 }
 
-/// `+ - *` on two numeric operands of unknown representation (small
-/// ints on): both int-tagged -> 32-bit op, overflow or a -0 product
-/// -> doubles; any other mix -> doubles. Result to vreg `va`'s home.
-/// Callers must have proven both operands numeric.
-fn emit_arith_dyn(c: &mut C, op: Op, vb: u8, vc: u8, va: u8) {
+/// `+ - *` on two operands of unknown representation (small ints on):
+/// both int-tagged -> 32-bit op, overflow or a -0 product -> doubles;
+/// any other mix -> doubles. Result to vreg `va`'s home.
+///
+/// `notnum` is where a non-numeric operand goes. Pass it when the caller
+/// has *not* proven the operands numeric: the check then rides on the
+/// tag this function already derives, instead of a guard ahead of it
+/// that loaded both homes and shifted both tags a second time (the
+/// inlined `a * 3 + b` paid 16 instructions for what takes 10). Pass
+/// `None` where the analysis proved both numeric.
+fn emit_arith_dyn(c: &mut C, op: Op, vb: u8, vc: u8, va: u8, notnum: Option<Label>) {
     let as_dbl = c.a.new_label();
     let done = c.a.new_label();
     let nz = c.a.new_label();
@@ -2384,19 +2390,35 @@ fn emit_arith_dyn(c: &mut C, op: Op, vb: u8, vc: u8, va: u8) {
         }
         c.put(va, 0);
         c.a.b(done);
+        // both doubles already went straight through, so anything here
+        // is an int or not a number at all
         c.a.bind(mixed);
         c.a.cmp_reg(10, R_TAGLIM);
+        if let Some(g) = notnum {
+            c.a.b_cond(Cond::Hi, g);
+        }
         c.a.b_cond(Cond::Ne, as_dbl);
         c.a.cmp_reg(11, R_TAGLIM);
+        if let Some(g) = notnum {
+            c.a.b_cond(Cond::Hi, g);
+        }
         c.a.b_cond(Cond::Ne, as_dbl);
     } else {
         c.fetch_x(vb, 8);
         c.fetch_x(vc, 9);
         c.a.lsr_imm(10, 8, 48);
         c.a.lsr_imm(11, 9, 48);
+        // one compare answers both questions: above the limit is not a
+        // number, equal to it is an int, below it is a double
         c.a.cmp_reg(10, R_TAGLIM);
+        if let Some(g) = notnum {
+            c.a.b_cond(Cond::Hi, g);
+        }
         c.a.b_cond(Cond::Ne, as_dbl);
         c.a.cmp_reg(11, R_TAGLIM);
+        if let Some(g) = notnum {
+            c.a.b_cond(Cond::Hi, g);
+        }
         c.a.b_cond(Cond::Ne, as_dbl);
     }
     match op {
@@ -3159,12 +3181,21 @@ fn emit_inline_call(
                 c.put(map(cins.a), src);
             }
             Op::Add | Op::Sub | Op::Mul | Op::Div => {
-                guard(c, map(cins.b), generic);
-                guard(c, map(cins.c), generic);
                 if c.smi && cins.op != Op::Div {
-                    emit_arith_dyn(c, cins.op, map(cins.b), map(cins.c), map(cins.a));
+                    // the arm proves both operands itself, off the tags
+                    // it has to derive anyway
+                    emit_arith_dyn(
+                        c,
+                        cins.op,
+                        map(cins.b),
+                        map(cins.c),
+                        map(cins.a),
+                        Some(generic),
+                    );
                     continue;
                 }
+                guard(c, map(cins.b), generic);
+                guard(c, map(cins.c), generic);
                 let db = dfetch(c, map(cins.b), 0);
                 let dc = dfetch(c, map(cins.c), 1);
                 let dst = if map(cins.a) < LOW { (8 + map(cins.a)) as u32 } else { 2 };
@@ -3578,7 +3609,7 @@ fn emit_op(
                 c.fix_int_write(ins.a, pc);
             } else if smi && cb != Cls::Other && cc != Cls::Other {
                 // numeric, representation unknown: dispatch on the tags
-                emit_arith_dyn(c, ins.op, ins.b, ins.c, ins.a);
+                emit_arith_dyn(c, ins.op, ins.b, ins.c, ins.a, None);
                 c.fix_int_write(ins.a, pc);
             } else {
                 // guarded: numbers inline, anything else (concat, errors)
