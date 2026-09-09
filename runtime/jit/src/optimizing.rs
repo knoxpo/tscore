@@ -233,6 +233,11 @@ struct C {
     /// integer speculation on: an int `%` yields an int or deopts (-0,
     /// x % 0), which is what lets the analysis type it IntV
     int_static: bool,
+    /// Emitting a loop's preheader: a deopt from a hoisted instruction
+    /// must resume at the loop header, not at the instruction's own pc.
+    /// The body between the two has not run yet, so its homes are the
+    /// loop's entry state and only the header is a consistent resume.
+    resume: Option<usize>,
     /// `Skip; Jump` fusion: the Jump at pc+1 is a forward jump nobody
     /// else targets, so the skip branches on the inverted condition to
     /// its target and the Jump itself is not emitted.
@@ -598,7 +603,7 @@ impl C {
         self.a.b_cond(Cond::Eq, ok);
         self.spill_low();
         self.a.movz(0, 2, 0);
-        self.a.mov_imm64(1, pc as u64);
+        self.a.mov_imm64(1, self.resume.unwrap_or(pc) as u64);
         self.a.b(self.deopt_exit);
         self.a.bind(ok);
 
@@ -969,6 +974,7 @@ impl C {
     /// Deopt to the interpreter at `pc`, which re-runs the instruction
     /// from the (still intact) register homes.
     fn deopt_at(&mut self, pc: usize) {
+        let pc = self.resume.unwrap_or(pc);
         self.spill_low();
         self.a.movz(0, 2, 0);
         self.a.mov_imm64(1, pc as u64);
@@ -977,6 +983,7 @@ impl C {
     /// A label that deopts to `pc`, emitted out of line: branch to it
     /// on the rare condition and the fast path stays straight.
     fn deopt_stub(&mut self, pc: usize) -> Label {
+        let pc = self.resume.unwrap_or(pc);
         let l = self.a.new_label();
         let lanes = self.lanes.clone();
         let itmp = self.itmp.map(|v| (v, self.itmp_dirty));
@@ -1328,6 +1335,16 @@ pub fn compile(
     if pbody.code.len() > crate::baseline::MAX_CODE {
         return None;
     }
+    // TSC_BC_DUMP=1: the bytecode this compile sees, for loop analysis
+    if std::env::var_os("TSC_BC_DUMP").is_some() {
+        eprintln!("== {} (osr={for_osr}) n_regs={}", proto.name, pbody.n_regs);
+        for (pc, i) in pbody.code.iter().enumerate() {
+            eprintln!(
+                "{pc:4} {:?} a={} b={} c={} bx={} sbx={}",
+                i.op, i.a, i.b, i.c, i.bx(), i.sbx()
+            );
+        }
+    }
     let heap_op = |op: Op| {
         matches!(
             op,
@@ -1419,7 +1436,7 @@ pub fn compile(
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, ibound: None, xtmp: None, xtmp_at: usize::MAX, nonneg: nonneg_vregs(pbody, proto.arity as usize, facts), fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, fuse: None, skip_next: false }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, ibound: None, xtmp: None, xtmp_at: usize::MAX, nonneg: nonneg_vregs(pbody, proto.arity as usize, facts), fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, resume: None, fuse: None, skip_next: false }
     };
     let out = c.a.new_label();
 
@@ -1602,6 +1619,26 @@ pub fn compile(
             _ => {}
         }
     }
+    // LICM: what each loop's preheader runs instead of its body
+    let preheader = hoist_map(&pbody.code, &pbody.consts, facts, &loops, &jump_targets);
+    let mut hoisted = vec![false; pbody.code.len()];
+    for hs in &preheader {
+        for &p in hs {
+            hoisted[p] = true;
+            // The body no longer writes this vreg, so liveness must stop
+            // seeing a kill here: a fall-through no-op. Reading the
+            // hoisted instruction's own write as a kill let `clear_itmp`
+            // drop a deferred home write as dead (zeroTrip returned 13).
+            c.code[p] = Instr::asbx(Op::Jump, 0, 0);
+        }
+    }
+    if std::env::var_os("TSC_BC_DUMP").is_some() {
+        for (h, hs) in preheader.iter().enumerate() {
+            if !hs.is_empty() {
+                eprintln!("  hoist to header {h}: {hs:?}");
+            }
+        }
+    }
     let in_lane: Vec<bool> = lanes_at.iter().map(|l| !l.is_empty()).collect();
     c.lanes_at = lanes_at.clone();
     let mut fcache: Option<u8> = None;
@@ -1747,6 +1784,25 @@ pub fn compile(
             c.a.b(c.deopt_exit);
             c.a.bind(pass);
         }
+        // The preheader sits between the header's guards and the header
+        // label, so the fall-in edge runs it and every back edge jumps
+        // past it. Its deopts resume at the header (see `hoist_map`).
+        if !preheader[pc].is_empty() {
+            c.resume = Some(pc);
+            for i in 0..preheader[pc].len() {
+                let hp = preheader[pc][i];
+                c.fuse = None;
+                emit_op(&mut c, proto, hp, pbody.code[hp], facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache, in_lane[hp], primary_at[hp]);
+            }
+            c.resume = None;
+            // a back edge arrives with none of this in registers
+            c.clear_itmp(pc);
+            fcache = None;
+            c.fproven = None;
+            c.alen = None;
+            c.ibound = None;
+            c.xtmp = None;
+        }
         let l = c.pc_labels[pc];
         c.a.bind(l);
         if c.skip_next {
@@ -1755,13 +1811,16 @@ pub fn compile(
             continue;
         }
         c.fuse = match pbody.code.get(pc + 1) {
-            Some(j) if j.op == Op::Jump && j.sbx() >= 0 && !jump_targets[pc + 1] => {
+            Some(j) if j.op == Op::Jump && j.sbx() >= 0 && !jump_targets[pc + 1] && !hoisted[pc] => {
                 let target = (pc as i64 + 1 + j.sbx() as i64 + 1) as usize;
                 Some(c.exit_label(pc, target))
             }
             _ => None,
         };
-        emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache, in_lane[pc], primary_at[pc]);
+        // hoisted: the preheader already computed this into its home
+        if !hoisted[pc] {
+            emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache, in_lane[pc], primary_at[pc]);
+        }
         // ops with only cold-path blrs (which zero x15) preserve the cache;
         // everything else — calls, allocation, heap ops that clobber
         // x15/x16 outright — kills it at compile time
@@ -1993,26 +2052,29 @@ pub fn compile(
 /// Does anything from `start` on read vreg `v` before rewriting it?
 /// A DFS over the bytecode's forward and backward edges; operand sets
 /// are exact for the plain ops and conservative (read) for the rest.
-fn live_at(code: &[Instr], start: usize, v: u8) -> bool {
-    let reads = |i: &Instr| -> bool {
-        match i.op {
-            Op::LoadConst | Op::LoadInt | Op::LoadBool | Op::LoadNull | Op::LoadUndef
-            | Op::Jump | Op::GetGlobal | Op::Halt => false,
-            Op::Return | Op::JumpIfFalse | Op::JumpIfTrue | Op::Await => i.a == v,
-            Op::Call => v == i.a || (v > i.a && v as usize <= i.a as usize + i.b as usize),
-            Op::NewArrayLit => v >= i.b && (v as usize) < i.b as usize + i.c as usize,
-            Op::NewObjectLit | Op::Concat | Op::Closure => true,
-            // `c` is a constant name index here, not a vreg — counting it
-            // kept whichever vreg shared that number artificially live
-            Op::GetField => i.b == v,
-            // and `b` is the name index on the store side
-            Op::SetField => i.a == v || i.c == v,
-            Op::SetIndex | Op::ArrayPush | Op::StoreCell | Op::SetUpval | Op::NewCell => {
-                i.a == v || i.b == v || i.c == v
-            }
-            _ => i.b == v || i.c == v,
+/// Does `i` read vreg `v`?
+fn reads_vreg(i: &Instr, v: u8) -> bool {
+    match i.op {
+        Op::LoadConst | Op::LoadInt | Op::LoadBool | Op::LoadNull | Op::LoadUndef
+        | Op::Jump | Op::GetGlobal | Op::Halt => false,
+        Op::Return | Op::JumpIfFalse | Op::JumpIfTrue | Op::Await => i.a == v,
+        Op::Call => v == i.a || (v > i.a && v as usize <= i.a as usize + i.b as usize),
+        Op::NewArrayLit => v >= i.b && (v as usize) < i.b as usize + i.c as usize,
+        Op::NewObjectLit | Op::Concat | Op::Closure => true,
+        // `c` is a constant name index here, not a vreg — counting it
+        // kept whichever vreg shared that number artificially live
+        Op::GetField => i.b == v,
+        // and `b` is the name index on the store side
+        Op::SetField => i.a == v || i.c == v,
+        Op::SetIndex | Op::ArrayPush | Op::StoreCell | Op::SetUpval | Op::NewCell => {
+            i.a == v || i.b == v || i.c == v
         }
-    };
+        _ => i.b == v || i.c == v,
+    }
+}
+
+fn live_at(code: &[Instr], start: usize, v: u8) -> bool {
+    let reads = |i: &Instr| -> bool { reads_vreg(i, v) };
     let mut seen = vec![false; code.len() + 2];
     let mut stack = vec![start];
     while let Some(pc) = stack.pop() {
@@ -2042,6 +2104,177 @@ fn live_at(code: &[Instr], start: usize, v: u8) -> bool {
         }
     }
     false
+}
+
+/// Loop-invariant code motion. Returns, per loop header pc, the body
+/// instructions its preheader should run instead — the fall-in edge
+/// computes them once and the body emits nothing.
+///
+/// Correctness rests on three things, all checked here:
+///   * the instruction is on the loop's *spine* — reached by fall-through
+///     from the header on every trip — so an OSR entry at the header
+///     inherits a home the interpreter already wrote;
+///   * its destination is dead on every loop exit and written exactly
+///     once in the loop, so running it on a zero-trip loop is invisible;
+///   * it cannot run user code or throw, so a zero-trip loop cannot
+///     observe an effect. What it *can* do is deopt, and a hoisted deopt
+///     resumes at the loop header rather than at its own pc — the
+///     interpreter then re-tests and either exits or re-runs the whole
+///     iteration, both from homes that are still the loop's entry state.
+fn hoist_map(
+    code: &[Instr],
+    consts: &[Const],
+    facts: &Facts,
+    loops: &[(usize, usize)],
+    jump_targets: &[bool],
+) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = vec![Vec::new(); code.len() + 2];
+    if std::env::var_os("TSC_NO_LICM").is_some() {
+        return out;
+    }
+    let mut claimed = vec![false; code.len()];
+    let is_skip = |op: Op| {
+        matches!(
+            op,
+            Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip | Op::GeSkip
+        )
+    };
+    // outermost first: a value that is invariant in an enclosing loop
+    // belongs in that loop's preheader, not the inner one's
+    let mut order: Vec<(usize, usize)> = loops.to_vec();
+    order.sort_by_key(|&(h, e)| std::cmp::Reverse(e - h));
+    for &(h, end) in &order {
+        if end >= code.len() {
+            continue;
+        }
+        // The preheader sits above the header label, so only the
+        // fall-through edge runs it. A jump into the header from outside
+        // the loop would enter with nothing computed.
+        let jumped_into = code.iter().enumerate().any(|(p, i)| {
+            (p < h || p > end)
+                && matches!(i.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue)
+                && (p as i64 + i.sbx() as i64 + 1) as usize == h
+        });
+        if jumped_into {
+            continue;
+        }
+        // vregs the loop writes, and the single writer when there is one
+        let mut defs = [0u16; 256];
+        let mut def_at = [usize::MAX; 256];
+        for (p, i) in code.iter().enumerate().take(end + 1).skip(h) {
+            if writes_a_op(i.op) {
+                defs[i.a as usize] += 1;
+                def_at[i.a as usize] = p;
+            }
+            // A call frames the callee at `a + 1`, so every vreg above
+            // the call window is the callee's scratch and comes back
+            // holding whatever it left. Hoisting one of those above the
+            // call reads the previous iteration's callee frame.
+            if i.op == Op::Call {
+                for v in (i.a as usize + 1)..256 {
+                    defs[v] += 1;
+                    def_at[v] = p;
+                }
+            }
+        }
+        // the spine: pcs the loop runs unconditionally on every trip
+        let mut spine: Vec<usize> = Vec::new();
+        let mut pc = h;
+        while pc < end {
+            if pc != h && jump_targets[pc] {
+                break;
+            }
+            let i = &code[pc];
+            if is_skip(i.op) {
+                // the loop test is `Skip; Jump exit`: still being in the
+                // loop means the Jump was skipped and pc+2 runs
+                match code.get(pc + 1) {
+                    Some(j) if j.op == Op::Jump && j.sbx() >= 0 => {
+                        pc += 2;
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+            match i.op {
+                Op::Jump if i.sbx() >= 0 => {
+                    pc = (pc as i64 + i.sbx() as i64 + 1) as usize;
+                    if pc <= h || pc > end {
+                        break;
+                    }
+                    continue;
+                }
+                // an await leaves and re-enters the frame; keep the
+                // spine to the part that cannot have been suspended
+                Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue | Op::Return | Op::Halt
+                | Op::Await => break,
+                _ => {}
+            }
+            spine.push(pc);
+            pc += 1;
+        }
+        // dead on every exit: the loop leaves only by a jump out of its
+        // range (the back edge is unconditional), and a Return reads `a`
+        let dead_outside = |v: u8| -> bool {
+            for (p, i) in code.iter().enumerate().take(end + 1).skip(h) {
+                let t = match i.op {
+                    Op::Return => return i.a != v,
+                    Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue => {
+                        (p as i64 + i.sbx() as i64 + 1) as usize
+                    }
+                    op if is_skip(op) => p + 2,
+                    _ => continue,
+                };
+                if (t < h || t > end) && live_at(code, t, v) {
+                    return false;
+                }
+            }
+            true
+        };
+        let mut taken: Vec<usize> = Vec::new();
+        for &p in &spine {
+            if claimed[p] {
+                continue;
+            }
+            let i = code[p];
+            // effect-free: nothing here can run user code or throw. The
+            // arithmetic arms only qualify with both operands statically
+            // numeric — otherwise the miss path steps the interpreter.
+            let numeric = facts.num[p][1] && facts.num[p][2];
+            let ok_op = match i.op {
+                Op::LoadInt | Op::Move => true,
+                Op::LoadConst => {
+                    matches!(consts.get(i.bx() as usize), Some(Const::Number(_)))
+                }
+                Op::Mod | Op::Div | Op::Add | Op::Sub | Op::Mul => numeric,
+                _ => false,
+            };
+            if !ok_op {
+                continue;
+            }
+            let srcs: &[u8] = match i.op {
+                Op::LoadInt | Op::LoadConst => &[],
+                Op::Move => std::slice::from_ref(&i.b),
+                _ => &[i.b, i.c][..],
+            };
+            let invariant = srcs.iter().all(|&v| {
+                defs[v as usize] == 0
+                    || (defs[v as usize] == 1 && taken.contains(&def_at[v as usize]))
+            });
+            let dst = i.a;
+            // one writer, nothing in the loop reads the destination
+            // before it, and nothing after the loop reads it at all
+            let single = defs[dst as usize] == 1 && def_at[dst as usize] == p;
+            let unread_before =
+                !code[h..p].iter().any(|j| reads_vreg(j, dst));
+            if invariant && single && unread_before && dead_outside(dst) {
+                taken.push(p);
+                claimed[p] = true;
+            }
+        }
+        out[h] = taken;
+    }
+    out
 }
 
 /// Magic-number constants for signed division by a fixed divisor:
