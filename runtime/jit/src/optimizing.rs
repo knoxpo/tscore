@@ -77,6 +77,9 @@ const LANE_REGS: [u32; 3] = [23, 26, 27];
 /// takes whichever of the two it can use, never both.
 const R_ITMP: u32 = 21;
 const R_SLOTS: u32 = 25;
+/// Native-frame slots a function will spend on LICM (see `Hoist`). Each
+/// is 8 bytes of stack and buys back a recomputation per loop trip.
+const MAX_SHADOW: u32 = 4;
 const R_SENTINEL: u32 = 27;
 const R_TAGLIM: u32 = 28;
 /// Element kinds a GetIndex site can be specialized to. Mirrors
@@ -233,6 +236,9 @@ struct C {
     /// integer speculation on: an int `%` yields an int or deopts (-0,
     /// x % 0), which is what lets the analysis type it IntV
     int_static: bool,
+    /// Byte offset of shadow slot 0 in the native frame. The depth and
+    /// proto pair sits below it when the integer lane took x23/x26.
+    shadow_base: u32,
     /// Emitting a loop's preheader: a deopt from a hoisted instruction
     /// must resume at the loop header, not at the instruction's own pc.
     /// The body between the two has not run yet, so its homes are the
@@ -281,6 +287,9 @@ enum Stub {
 impl C {
     fn slot(i: u8) -> u32 {
         i as u32 * 8
+    }
+    fn shadow_off(&self, k: u32) -> u32 {
+        self.shadow_base + k * 8
     }
 
     /// R_ITMP's vreg, when its home is stale and the vreg is read again
@@ -1418,6 +1427,47 @@ pub fn compile(
         lane_assign.push((h, picks));
     }
 
+    // field-access CSE: compile-time single-entry cache of which vreg's
+    // validated object address/shape sit in x15/x16. Merge points kill it.
+    let mut jump_targets = vec![false; pbody.code.len() + 2];
+    for (pc, ins) in pbody.code.iter().enumerate() {
+        match ins.op {
+            Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue => {
+                let t = (pc as i64 + ins.sbx() as i64 + 1) as usize;
+                jump_targets[t] = true;
+            }
+            Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip
+            | Op::GeSkip => {
+                // A skip's landing pc is only a merge if the instruction
+                // it skips over can also fall through to it. In the loop
+                // idiom the emitter produces — `LtSkip; Jump <exit>` —
+                // that instruction is an unconditional jump, so the
+                // landing pc has exactly one predecessor and the caches
+                // survive. Marking it regardless invalidated the array
+                // base immediately after `Len` had computed it, so every
+                // `a[i]` in a counted loop re-derived the whole thing.
+                let falls_through = !matches!(
+                    pbody.code.get(pc + 1).map(|i| i.op),
+                    Some(Op::Jump) | Some(Op::Return) | Some(Op::Halt) | None
+                );
+                if falls_through {
+                    jump_targets[pc + 2] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // LICM: what each loop's preheader runs, and how (see `hoist_map`).
+    // Computed before the prologue because the shadow slots it asks for
+    // are part of the native frame.
+    let preheader = hoist_map(&pbody.code, &pbody.consts, facts, &loops, &jump_targets, MAX_SHADOW);
+    let n_shadow = preheader
+        .iter()
+        .flatten()
+        .filter(|(_, m)| matches!(m, Hoist::Shadow(_)))
+        .count() as u32;
+
     let n_low = pbody.n_regs.min(LOW);
     let mut c = {
         let mut a = Asm::new();
@@ -1436,9 +1486,12 @@ pub fn compile(
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, ibound: None, xtmp: None, xtmp_at: usize::MAX, nonneg: nonneg_vregs(pbody, proto.arity as usize, facts), fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, resume: None, fuse: None, skip_next: false }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, ibound: None, xtmp: None, xtmp_at: usize::MAX, nonneg: nonneg_vregs(pbody, proto.arity as usize, facts), fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, shadow_base: if int_lane { 32 } else { 0 }, resume: None, fuse: None, skip_next: false }
     };
     let out = c.a.new_label();
+    // where a loop's preheader starts: the OSR dispatch enters here so a
+    // mid-loop entry fills the shadows the body reloads
+    let pre_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| c.a.new_label()).collect();
 
     // prologue: baseline frame + only the d-pairs this fn actually uses as
     // vreg homes (small leaf functions push/pop far less)
@@ -1453,6 +1506,13 @@ pub fn compile(
         // stp d(8+2i), d(9+2i), [sp, #-16]!
         let rt = 8 + 2 * i;
         c.a.raw(0x6DBF_0000 | ((rt + 1) << 10) | (31 << 5) | rt);
+    }
+    // LICM shadows, below the depth/proto pair so its offsets do not
+    // move. A callee frames itself on the value stack, never here, so
+    // this is the one home a loop-invariant value survives a call in.
+    let shadow_bytes = 16 * n_shadow.div_ceil(2);
+    if shadow_bytes > 0 {
+        c.a.sub_imm(SP, SP, shadow_bytes);
     }
     // depth to its frame slot when x23 is wanted elsewhere; SP does not
     // move again, so the offset stays valid for the whole body (the pair
@@ -1573,7 +1633,7 @@ pub fn compile(
                         emit_lane_guard(&mut c, vs, laned, fail);
                     }
                 }
-                let l = c.pc_labels[h];
+                let l = pre_labels[h];
                 c.a.b(l);
                 c.a.bind(fail);
                 c.spill_low();
@@ -1582,60 +1642,39 @@ pub fn compile(
                 c.a.b(c.deopt_exit);
                 c.a.bind(next);
             } else {
-                let l = c.pc_labels[h];
+                let l = pre_labels[h];
                 c.a.b_cond(Cond::Eq, l);
             }
         }
         c.a.bind(normal);
     }
 
-    // field-access CSE: compile-time single-entry cache of which vreg's
-    // validated object address/shape sit in x15/x16. Merge points kill it.
-    let mut jump_targets = vec![false; pbody.code.len() + 2];
-    for (pc, ins) in pbody.code.iter().enumerate() {
-        match ins.op {
-            Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue => {
-                let t = (pc as i64 + ins.sbx() as i64 + 1) as usize;
-                jump_targets[t] = true;
-            }
-            Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip
-            | Op::GeSkip => {
-                // A skip's landing pc is only a merge if the instruction
-                // it skips over can also fall through to it. In the loop
-                // idiom the emitter produces — `LtSkip; Jump <exit>` —
-                // that instruction is an unconditional jump, so the
-                // landing pc has exactly one predecessor and the caches
-                // survive. Marking it regardless invalidated the array
-                // base immediately after `Len` had computed it, so every
-                // `a[i]` in a counted loop re-derived the whole thing.
-                let falls_through = !matches!(
-                    pbody.code.get(pc + 1).map(|i| i.op),
-                    Some(Op::Jump) | Some(Op::Return) | Some(Op::Halt) | None
-                );
-                if falls_through {
-                    jump_targets[pc + 2] = true;
-                }
-            }
-            _ => {}
-        }
-    }
-    // LICM: what each loop's preheader runs instead of its body
-    let preheader = hoist_map(&pbody.code, &pbody.consts, facts, &loops, &jump_targets);
-    let mut hoisted = vec![false; pbody.code.len()];
+    // Per pc: how the preheader runs it, when it does at all.
+    let mut hoisted: Vec<Option<Hoist>> = vec![None; pbody.code.len()];
     for hs in &preheader {
-        for &p in hs {
-            hoisted[p] = true;
-            // The body no longer writes this vreg, so liveness must stop
-            // seeing a kill here: a fall-through no-op. Reading the
-            // hoisted instruction's own write as a kill let `clear_itmp`
-            // drop a deferred home write as dead (zeroTrip returned 13).
-            c.code[p] = Instr::asbx(Op::Jump, 0, 0);
+        for &(p, m) in hs {
+            hoisted[p] = Some(m);
+            if matches!(m, Hoist::Home | Hoist::DepDead) {
+                // The body no longer writes this vreg, so liveness must
+                // stop seeing a kill here: a fall-through no-op. Reading
+                // the hoisted instruction's own write as a kill let
+                // `clear_itmp` drop a deferred home write as dead
+                // (zeroTrip returned 13). A `Shadow` still writes the
+                // home in the body, so its kill stands.
+                c.code[p] = Instr::asbx(Op::Jump, 0, 0);
+            }
         }
     }
     if std::env::var_os("TSC_BC_DUMP").is_some() {
         for (h, hs) in preheader.iter().enumerate() {
-            if !hs.is_empty() {
-                eprintln!("  hoist to header {h}: {hs:?}");
+            for &(p, m) in hs {
+                let m = match m {
+                    Hoist::Home => "home".to_string(),
+                    Hoist::Shadow(k) => format!("shadow{k}"),
+                    Hoist::Dep => "dep".to_string(),
+                    Hoist::DepDead => "dep(dead)".to_string(),
+                };
+                eprintln!("  hoist {p} to header {h}: {m}");
             }
         }
     }
@@ -1785,14 +1824,27 @@ pub fn compile(
             c.a.bind(pass);
         }
         // The preheader sits between the header's guards and the header
-        // label, so the fall-in edge runs it and every back edge jumps
-        // past it. Its deopts resume at the header (see `hoist_map`).
+        // label, so the fall-in edge and the OSR dispatch run it and
+        // every back edge jumps past it. Its deopts resume at the header
+        // (see `hoist_map`).
+        c.a.bind(pre_labels[pc]);
         if !preheader[pc].is_empty() {
             c.resume = Some(pc);
             for i in 0..preheader[pc].len() {
-                let hp = preheader[pc][i];
+                let (hp, mode) = preheader[pc][i];
                 c.fuse = None;
                 emit_op(&mut c, proto, hp, pbody.code[hp], facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache, in_lane[hp], primary_at[hp]);
+                if let Hoist::Shadow(k) = mode {
+                    // the arm may still owe the home a write, and the
+                    // shadow is a copy of that home
+                    let v = pbody.code[hp].a;
+                    if c.itmp == Some(v) && c.itmp_dirty {
+                        c.sync_itmp(v);
+                    }
+                    let off = c.shadow_off(k);
+                    c.home_x(v, 8);
+                    c.a.str_imm(8, SP, off);
+                }
             }
             c.resume = None;
             // a back edge arrives with none of this in registers
@@ -1811,15 +1863,34 @@ pub fn compile(
             continue;
         }
         c.fuse = match pbody.code.get(pc + 1) {
-            Some(j) if j.op == Op::Jump && j.sbx() >= 0 && !jump_targets[pc + 1] && !hoisted[pc] => {
+            Some(j)
+                if j.op == Op::Jump
+                    && j.sbx() >= 0
+                    && !jump_targets[pc + 1]
+                    && !matches!(hoisted[pc], Some(Hoist::Home) | Some(Hoist::DepDead)) =>
+            {
                 let target = (pc as i64 + 1 + j.sbx() as i64 + 1) as usize;
                 Some(c.exit_label(pc, target))
             }
             _ => None,
         };
-        // hoisted: the preheader already computed this into its home
-        if !hoisted[pc] {
-            emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache, in_lane[pc], primary_at[pc]);
+        match hoisted[pc] {
+            // the preheader already computed this into its home, or its
+            // only reader went there and the body's store is dead
+            Some(Hoist::Home) | Some(Hoist::DepDead) => {}
+            // reload the shadow the preheader filled: two instructions
+            // in place of whatever the op costs
+            Some(Hoist::Shadow(k)) => {
+                let off = c.shadow_off(k);
+                c.retire_itmp(pc + 1, Some(ins.a));
+                c.a.ldr_imm(8, SP, off);
+                c.put_x(ins.a, 8);
+                if c.itmp == Some(ins.a) {
+                    c.itmp = None;
+                    c.itmp_dirty = false;
+                }
+            }
+            _ => emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache, in_lane[pc], primary_at[pc]),
         }
         // ops with only cold-path blrs (which zero x15) preserve the cache;
         // everything else — calls, allocation, heap ops that clobber
@@ -1956,8 +2027,9 @@ pub fn compile(
     c.a.bind(await_exit);
     c.a.movz(0, 3, 0); // suspend: info stashed in realm.jit_await
     c.a.bind(out);
-    if c.int_lane {
-        c.a.add_imm(SP, SP, 32); // discard the proto and depth slots
+    let drop_bytes = if c.int_lane { 32 } else { 0 } + shadow_bytes;
+    if drop_bytes > 0 {
+        c.a.add_imm(SP, SP, drop_bytes); // proto, depth and LICM shadows
     }
     for i in (0..d_pairs).rev() {
         // ldp d(8+2i), d(9+2i), [sp], #16
@@ -2106,38 +2178,72 @@ fn live_at(code: &[Instr], start: usize, v: u8) -> bool {
     false
 }
 
+/// How a loop's preheader runs one of its body instructions.
+#[derive(Clone, Copy, PartialEq)]
+enum Hoist {
+    /// the preheader computes it and the body emits nothing: the home it
+    /// wrote is still the value on every iteration
+    Home,
+    /// the preheader computes it into a JIT-private native-stack slot and
+    /// the body reloads that slot into the home. For a value a call
+    /// clobbers — every vreg above the call window — this is the only
+    /// place it can live, and two instructions a trip still beats
+    /// recomputing a magic division.
+    Shadow(u32),
+    /// a constant load a `Shadow` above depends on: the preheader needs
+    /// it, and the body keeps emitting it as before
+    Dep,
+    /// the same, where the `Shadow` was the only thing that read it — so
+    /// the body's copy is now a dead store and goes
+    DepDead,
+}
+
 /// Loop-invariant code motion. Returns, per loop header pc, the body
-/// instructions its preheader should run instead — the fall-in edge
-/// computes them once and the body emits nothing.
+/// instructions its preheader runs and how.
 ///
-/// Correctness rests on three things, all checked here:
+/// Correctness rests on four things, all checked here:
 ///   * the instruction is on the loop's *spine* — reached by fall-through
-///     from the header on every trip — so an OSR entry at the header
-///     inherits a home the interpreter already wrote;
-///   * its destination is dead on every loop exit and written exactly
-///     once in the loop, so running it on a zero-trip loop is invisible;
+///     from the header on every trip;
+///   * its destination is dead on every loop exit and unread earlier in
+///     the loop, so running it on a zero-trip loop is invisible;
 ///   * it cannot run user code or throw, so a zero-trip loop cannot
 ///     observe an effect. What it *can* do is deopt, and a hoisted deopt
 ///     resumes at the loop header rather than at its own pc — the
 ///     interpreter then re-tests and either exits or re-runs the whole
-///     iteration, both from homes that are still the loop's entry state.
+///     iteration, both from homes that are still the loop's entry state;
+///   * `Home` additionally needs a single writer that no call clobbers,
+///     which `Shadow` does not: the body rewrites the home from the
+///     shadow every trip.
 fn hoist_map(
     code: &[Instr],
     consts: &[Const],
     facts: &Facts,
     loops: &[(usize, usize)],
     jump_targets: &[bool],
-) -> Vec<Vec<usize>> {
-    let mut out: Vec<Vec<usize>> = vec![Vec::new(); code.len() + 2];
+    max_shadow: u32,
+) -> Vec<Vec<(usize, Hoist)>> {
+    let mut out: Vec<Vec<(usize, Hoist)>> = vec![Vec::new(); code.len() + 2];
     if std::env::var_os("TSC_NO_LICM").is_some() {
         return out;
     }
+    let mut shadows = 0u32;
     let mut claimed = vec![false; code.len()];
     let is_skip = |op: Op| {
         matches!(
             op,
             Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip | Op::GeSkip
         )
+    };
+    // a constant load's value, for the dependency check
+    let const_of = |i: &Instr| -> Option<i64> {
+        match i.op {
+            Op::LoadInt => Some(i.sbx() as i64),
+            Op::LoadConst => match consts.get(i.bx() as usize) {
+                Some(Const::Number(n)) => Some(n.to_bits() as i64),
+                _ => None,
+            },
+            _ => None,
+        }
     };
     // outermost first: a value that is invariant in an enclosing loop
     // belongs in that loop's preheader, not the inner one's
@@ -2148,8 +2254,8 @@ fn hoist_map(
             continue;
         }
         // The preheader sits above the header label, so only the
-        // fall-through edge runs it. A jump into the header from outside
-        // the loop would enter with nothing computed.
+        // fall-through edge and the OSR dispatch run it. A jump into the
+        // header from outside the loop would enter with nothing computed.
         let jumped_into = code.iter().enumerate().any(|(p, i)| {
             (p < h || p > end)
                 && matches!(i.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue)
@@ -2161,19 +2267,19 @@ fn hoist_map(
         // vregs the loop writes, and the single writer when there is one
         let mut defs = [0u16; 256];
         let mut def_at = [usize::MAX; 256];
+        // A call frames the callee at `a + 1`, so every vreg above the
+        // call window is the callee's scratch and comes back holding
+        // whatever it left. A value there cannot live in its home across
+        // an iteration — only in a shadow.
+        let mut clobbered = [false; 256];
         for (p, i) in code.iter().enumerate().take(end + 1).skip(h) {
             if writes_a_op(i.op) {
                 defs[i.a as usize] += 1;
                 def_at[i.a as usize] = p;
             }
-            // A call frames the callee at `a + 1`, so every vreg above
-            // the call window is the callee's scratch and comes back
-            // holding whatever it left. Hoisting one of those above the
-            // call reads the previous iteration's callee frame.
             if i.op == Op::Call {
                 for v in (i.a as usize + 1)..256 {
-                    defs[v] += 1;
-                    def_at[v] = p;
+                    clobbered[v] = true;
                 }
             }
         }
@@ -2231,7 +2337,11 @@ fn hoist_map(
             }
             true
         };
-        let mut taken: Vec<usize> = Vec::new();
+        // nothing earlier in the loop reads it, so the first iteration
+        // cannot see the preheader's write where it wanted the loop's
+        // entry value
+        let unread_before = |v: u8, p: usize| !code[h..p].iter().any(|j| reads_vreg(j, v));
+        let mut taken: Vec<(usize, Hoist)> = Vec::new();
         for &p in &spine {
             if claimed[p] {
                 continue;
@@ -2243,10 +2353,8 @@ fn hoist_map(
             let numeric = facts.num[p][1] && facts.num[p][2];
             let ok_op = match i.op {
                 Op::LoadInt | Op::Move => true,
-                Op::LoadConst => {
-                    matches!(consts.get(i.bx() as usize), Some(Const::Number(_)))
-                }
-                Op::Mod | Op::Div | Op::Add | Op::Sub | Op::Mul => numeric,
+                Op::LoadConst => const_of(&i).is_some(),
+                Op::Mod | Op::Div | Op::Add | Op::Sub | Op::Mul | Op::Pow => numeric,
                 _ => false,
             };
             if !ok_op {
@@ -2257,21 +2365,71 @@ fn hoist_map(
                 Op::Move => std::slice::from_ref(&i.b),
                 _ => &[i.b, i.c][..],
             };
-            let invariant = srcs.iter().all(|&v| {
-                defs[v as usize] == 0
-                    || (defs[v as usize] == 1 && taken.contains(&def_at[v as usize]))
-            });
             let dst = i.a;
-            // one writer, nothing in the loop reads the destination
-            // before it, and nothing after the loop reads it at all
-            let single = defs[dst as usize] == 1 && def_at[dst as usize] == p;
-            let unread_before =
-                !code[h..p].iter().any(|j| reads_vreg(j, dst));
-            if invariant && single && unread_before && dead_outside(dst) {
-                taken.push(p);
-                claimed[p] = true;
+            if !unread_before(dst, p) || !dead_outside(dst) {
+                continue;
             }
+            // a source is invariant when the loop never writes it, or
+            // when the preheader already computed it
+            let plain = |v: u8, taken: &Vec<(usize, Hoist)>| {
+                (defs[v as usize] == 0 && !clobbered[v as usize])
+                    || (defs[v as usize] == 1
+                        && taken.iter().any(|&(q, m)| q == def_at[v as usize] && m != Hoist::Dep))
+            };
+            if srcs.iter().all(|&v| plain(v, &taken))
+                && defs[dst as usize] == 1
+                && def_at[dst as usize] == p
+                && !clobbered[dst as usize]
+            {
+                taken.push((p, Hoist::Home));
+                claimed[p] = true;
+                continue;
+            }
+            // Otherwise a shadow, which only pays for an instruction
+            // worth more than the reload it costs. A division is; a
+            // constant load is not.
+            if !matches!(i.op, Op::Mod | Op::Div | Op::Pow) || shadows >= max_shadow {
+                continue;
+            }
+            // a source the loop reloads with the same constant every trip
+            // is invariant too, as long as the preheader loads it first
+            let mut deps: Vec<(usize, bool)> = Vec::new();
+            let ok = srcs.iter().all(|&v| {
+                if plain(v, &taken) {
+                    return true;
+                }
+                let d = def_at[v as usize];
+                defs[v as usize] == 1
+                    && d < p
+                    && spine.contains(&d)
+                    && const_of(&code[d]).is_some()
+                    && unread_before(v, d)
+                    && dead_outside(v)
+                    && {
+                        // this hoist takes away the only read of `v` in
+                        // the loop, so the body's own load of it becomes
+                        // a dead store
+                        let only_reader = !code[h..=end]
+                            .iter()
+                            .enumerate()
+                            .any(|(k, j)| h + k != p && reads_vreg(j, v));
+                        deps.push((d, only_reader));
+                        true
+                    }
+            });
+            if !ok {
+                continue;
+            }
+            for (d, dead) in deps {
+                if !taken.iter().any(|&(q, _)| q == d) {
+                    taken.push((d, if dead { Hoist::DepDead } else { Hoist::Dep }));
+                }
+            }
+            taken.push((p, Hoist::Shadow(shadows)));
+            shadows += 1;
+            claimed[p] = true;
         }
+        taken.sort_by_key(|&(p, _)| p);
         out[h] = taken;
     }
     out

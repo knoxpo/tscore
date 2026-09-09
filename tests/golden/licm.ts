@@ -58,6 +58,47 @@ function pushLoop(n) {
     return s;
 }
 
+// 6. The shadow-slot path: an invariant modulo used as a call argument,
+// so the callee frame clobbers its home on every iteration. The array
+// push is what lets a loop with a call reach the optimizing tier.
+function addTwo(a, b) {
+    return a + b;
+}
+function calls(outer, inner) {
+    let acc = 0;
+    for (let r = 0; r < outer; r++) {
+        const got = [];
+        for (let i = 0; i < inner; i++) got.push(addTwo(i, r % 7));
+        for (let i = 0; i < got.length; i++) acc = acc + got[i];
+    }
+    return acc;
+}
+
+// 7. The hoisted modulo's dividend stops being an integer, so the
+// preheader's magic-division path has to give way mid-run.
+function shadowDrift(n) {
+    let k = 9;
+    let acc = 0;
+    for (let r = 0; r < n; r++) {
+        const got = [];
+        for (let i = 0; i < 4; i++) got.push(addTwo(i, k % 7));
+        for (let i = 0; i < got.length; i++) acc = acc + got[i];
+        k = k + 1.25;
+    }
+    return acc;
+}
+
+// 8. Zero trips: nothing the preheader computes may escape the loop.
+function zeroCalls(outer, inner) {
+    let seen = -5;
+    for (let r = 0; r < outer; r++) {
+        const got = [];
+        for (let i = 0; i < inner; i++) got.push(addTwo(i, r % 7));
+        seen = seen + got.length;
+    }
+    return seen;
+}
+
 let out = 0;
 for (let r = 0; r < 2000; r++) {
     out = out + zeroTrip(0);
@@ -66,6 +107,11 @@ for (let r = 0; r < 2000; r++) {
     out = out + drift(6);
     out = out + early(20);
     out = out + pushLoop(12);
+    out = out + calls(9, 3);
+    out = out + shadowDrift(5);
+    out = out + zeroCalls(4, 0);
+    out = out + zeroCalls(3, 2);
 }
 console.log(out);
 console.log(zeroTrip(0), zeroTrip(1), nested(3, 3), drift(4), early(2), pushLoop(7));
+console.log(calls(4, 2), shadowDrift(3), zeroCalls(3, 0), zeroCalls(2, 2));
