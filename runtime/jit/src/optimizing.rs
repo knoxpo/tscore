@@ -433,6 +433,21 @@ impl C {
         }
     }
 
+    /// The register `v`'s bits are already in, or `scratch` after a
+    /// fetch. Saves the caller a load where a producer just published
+    /// the value somewhere else (`fetch_x` only recognises its own
+    /// register, so a copy through the home paid a store-to-load
+    /// forward for nothing).
+    fn fetch_x_any(&mut self, v: u8, scratch: u32) -> u32 {
+        if let Some((xv, xr)) = self.xtmp {
+            if xv == v && self.a.here() == self.xtmp_at {
+                return xr;
+            }
+        }
+        self.fetch_x(v, scratch);
+        scratch
+    }
+
     /// vreg bits into a GP register (a laned vreg from its register).
     fn fetch_x(&mut self, v: u8, x: u32) {
         if self.xtmp == Some((v, x)) && self.a.here() == self.xtmp_at {
@@ -3318,7 +3333,9 @@ fn emit_inline_call(
                     })
                     .collect();
                 c.emit_obj_lit(map(cins.a), map(cins.b), sn as u8, shape_ptr, &checks);
-                c.a.movz(14, 0, 0);
+                c.a.movz(14, 0, 0); // closure addr cache; leaves x0
+                c.xtmp = Some((map(cins.a), 0));
+                c.xtmp_at = c.a.here();
             }
             Op::LoadInt => c.put_bits(map(cins.a), if c.smi { Value::int(cins.sbx()) } else { Value::number(cins.sbx() as f64) }.bits()),
             Op::LoadUndef => c.put_bits(map(cins.a), Value::UNDEFINED.bits()),
@@ -3423,7 +3440,9 @@ fn emit_inline_call(
                     w as u32 * 8,
                     Some(*o),
                 );
-                c.a.movz(14, 0, 0);
+                c.a.movz(14, 0, 0); // closure addr cache; leaves x0
+                c.xtmp = Some((map(cins.a), 0));
+                c.xtmp_at = c.a.here();
             }
             Op::Neg => {
                 guard(c, map(cins.b), generic);
@@ -3499,8 +3518,8 @@ fn emit_inline_call(
                 c.put_x(map(cins.a), 8);
             }
             Op::Return => {
-                c.fetch_x(map(cins.a), 8);
-                c.put_x(ins.a, 8);
+                let r = c.fetch_x_any(map(cins.a), 8);
+                c.put_x(ins.a, r);
                 c.a.b(done);
                 return;
             }
