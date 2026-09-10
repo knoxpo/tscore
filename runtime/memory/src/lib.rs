@@ -1360,9 +1360,9 @@ impl Heap {
     #[inline(always)]
     fn alloc_old_cell(&mut self, kind: u64, words: usize, len: usize) -> Ref {
         self.allocs_since_gc += 1;
-        let a = self.old.alloc(words);
+        let (a, bumped) = self.old.alloc(words);
         set_meta(a, meta(kind, words, len));
-        if !self.old.in_born_range(a) {
+        if !bumped {
             if kind == K_ELEMS {
                 self.born_elems.push(a);
             } else {

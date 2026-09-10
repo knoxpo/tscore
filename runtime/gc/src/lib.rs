@@ -321,10 +321,18 @@ fn forward_cell(a: Ref, heap: &mut Heap, m: &mut tsr_memory::GcScratch) -> Ref {
             return mt & !7;
         }
         let words = size_words(mt);
-        let na = heap.old.alloc(words);
+        let (na, _) = heap.old.alloc(words);
         // SAFETY: both cells are `words` long and do not overlap.
         unsafe { std::ptr::copy_nonoverlapping(a as *const u64, na as *mut u64, words) };
-        set_meta(na, mt | M_AGED);
+        // The copy inherits the source's flag bits, so strip them: an
+        // inherited M_MARK would make the next major skip the cell, and
+        // an inherited M_DIRTY would tell `ref_store_check` the cell is
+        // already remembered and suppress the barrier on it. Neither is
+        // reachable today -- young cells are never marked or dirtied --
+        // but this is the third bug in this family, so the promotion
+        // stops depending on that.
+        debug_young_flags(mt, "cell");
+        set_meta(na, (mt & !(M_MARK | M_DIRTY)) | M_AGED);
         set_meta(a, na | M_FWD);
         heap.promoted_bytes_since_major += words * 8;
         heap.promoted_since_major += 1;
@@ -348,9 +356,10 @@ fn forward_elems(e: Ref, heap: &mut Heap) -> Ref {
             return mt & !7;
         }
         let words = size_words(mt);
-        let ne = heap.old.alloc(words);
+        let (ne, _) = heap.old.alloc(words);
         unsafe { std::ptr::copy_nonoverlapping(e as *const u64, ne as *mut u64, words) };
-        set_meta(ne, mt | M_AGED);
+        debug_young_flags(mt, "elems");
+        set_meta(ne, (mt & !(M_MARK | M_DIRTY)) | M_AGED);
         set_meta(e, ne | M_FWD);
         heap.promoted_bytes_since_major += words * 8;
         return ne;
@@ -682,6 +691,7 @@ pub fn collect_minor<'a>(
     heap.gc_scratch = m;
     stats.minor_collections += 1;
     stats.last_freed = freed;
+    verify_no_stale_marks(heap, "post-full-minor");
     if verify_on() {
         let mut roots: Vec<Value> = stack.to_vec();
         roots.extend_from_slice(extra);
@@ -774,6 +784,7 @@ fn bulk_promote(heap: &mut Heap, stats: &mut GcStats) {
     heap.promoted_bytes_since_major += promoted_bytes;
     heap.old.end_minor();
     heap.allocs_since_gc = 0;
+    verify_no_stale_marks(heap, "post-bulk-promote");
     stats.minor_collections += 1;
     stats.last_freed = 0;
     if debug_on() {
@@ -932,7 +943,10 @@ fn verify_no_stale_marks(heap: &Heap, phase: &str) {
             }
             if mt & M_MARK != 0 && kind_of(mt) != K_ELEMS {
                 eprintln!(
-                    "[verify/{phase}] STALE MARK {a:#x} kind={} size={} aged={} dirty={} in_born={}",
+                    "[verify/{phase}] chunk{ci} base={base:#x} top={top:#x} born_chunk={} born_from={:#x} nchunks={} | STALE MARK {a:#x} kind={} size={} aged={} dirty={} in_born={}",
+                    heap.old.born_chunk,
+                    heap.old.born_from,
+                    heap.old.chunks.len(),
                     kind_of(mt),
                     words,
                     mt & M_AGED != 0,
@@ -949,6 +963,20 @@ fn verify_no_stale_marks(heap: &Heap, phase: &str) {
     }
     if bad > 0 {
         std::process::abort();
+    }
+}
+
+/// A young cell should never carry a mark or a dirty bit; under
+/// TSC_GC_VERIFY say so loudly if one ever does, since promotion used
+/// to copy those bits straight into the old generation.
+#[inline]
+fn debug_young_flags(mt: u64, what: &str) {
+    if verify_on() && mt & (M_MARK | M_DIRTY) != 0 {
+        eprintln!(
+            "[verify/promote] young {what} carried flags: mark={} dirty={}",
+            mt & M_MARK != 0,
+            mt & M_DIRTY != 0
+        );
     }
 }
 

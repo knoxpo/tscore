@@ -131,10 +131,17 @@ impl Old {
     /// Is `a` a bump-allocated cell of the current born range (and so
     /// needs no log entry)?
     #[inline(always)]
+    /// Diagnostics only. Chunks come from the system allocator and are
+    /// *not* address-ordered, so this has to find the owning chunk
+    /// rather than compare against the last one: doing the latter
+    /// reported cells in an early chunk as born whenever that chunk sat
+    /// at a higher address, and those cells then went in no sweep list
+    /// at all.
     pub fn in_born_range(&self, a: Ref) -> bool {
         let a = a as usize;
-        match self.chunks.last() {
-            Some(c) if a >= c.base => self.chunks.len() - 1 > self.born_chunk || a >= self.born_from,
+        match self.chunks.iter().position(|c| a >= c.base && a < c.end) {
+            Some(i) if i > self.born_chunk => true,
+            Some(i) if i == self.born_chunk => a >= self.born_from,
             _ => false,
         }
     }
@@ -173,8 +180,12 @@ impl Old {
     }
 
     /// Allocate `words` (>= 2). The cell comes back with a zeroed meta
-    /// word; the caller writes the real one.
-    pub fn alloc(&mut self, words: usize) -> Ref {
+    /// word; the caller writes the real one. The flag says the cell came
+    /// off the bump region, so it lies in the born range and needs no
+    /// log entry — the allocator knows this outright, where deciding it
+    /// from the address needs chunks to be address-ordered, and they are
+    /// not (see `in_born_range`).
+    pub fn alloc(&mut self, words: usize) -> (Ref, bool) {
         debug_assert!(words >= 2);
         if words <= MAX_SMALL_WORDS {
             let head = self.small[words];
@@ -182,7 +193,7 @@ impl Old {
                 self.small[words] = word(head, 1);
                 set_meta(head, 0);
                 self.freelist_bytes += words * 8;
-                return head;
+                return (head, false);
             }
         } else {
             for i in 0..self.large.len() {
@@ -196,7 +207,7 @@ impl Old {
                     }
                     set_meta(a, 0);
                     self.freelist_bytes += words * 8;
-                    return a;
+                    return (a, false);
                 }
             }
         }
@@ -208,7 +219,7 @@ impl Old {
         let a = self.top;
         self.top += bytes;
         self.sync_top();
-        a as Ref
+        (a as Ref, true)
     }
 
     /// Register a free cell of `words` (writes its FREE header).
@@ -294,17 +305,21 @@ mod tests {
     #[test]
     fn old_reuses_freed_cells_and_splits_large() {
         let mut o = Old::new();
-        let a = o.alloc(7);
+        let (a, bumped_a) = o.alloc(7);
+        assert!(bumped_a, "first cell of a fresh chunk comes off the bump");
         set_meta(a, meta(K_OBJ, 7, 0));
-        let b = o.alloc(7);
+        let (b, _) = o.alloc(7);
         o.push_free(a, 7);
-        assert_eq!(o.alloc(7), a, "exact-size free list reused");
-        assert_ne!(o.alloc(7), b);
-        let big = o.alloc(100);
+        let (reused, bumped) = o.alloc(7);
+        assert_eq!(reused, a, "exact-size free list reused");
+        assert!(!bumped, "a free-list cell is not in the born range");
+        assert_ne!(o.alloc(7).0, b);
+        let (big, _) = o.alloc(100);
         o.push_free(big, 100);
-        let part = o.alloc(40);
+        let (part, split_bumped) = o.alloc(40);
         assert_eq!(part, big);
-        let rest = o.alloc(50);
+        assert!(!split_bumped, "a split large cell is not in the born range either");
+        let (rest, _) = o.alloc(50);
         assert_eq!(rest, big + 40 * 8);
     }
 }
