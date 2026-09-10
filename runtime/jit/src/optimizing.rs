@@ -1951,13 +1951,18 @@ pub fn compile(
                 }
             }
             c.resume = None;
-            // a back edge arrives with none of this in registers
+            // a back edge arrives with none of this in registers, and it
+            // bypasses the preheader entirely -- so nothing the preheader
+            // proved about a register may be carried into the body. x22
+            // in particular: the back edge runs a safepoint that can zero
+            // it, and the `cbnz` is what notices.
             c.clear_itmp(pc);
             fcache = None;
             c.fproven = None;
             c.alen = None;
             c.ibound = None;
             c.xtmp = None;
+            c.acache_nz = false;
         }
         let l = c.pc_labels[pc];
         c.a.bind(l);
