@@ -99,6 +99,19 @@ function zeroCalls(outer, inner) {
     return seen;
 }
 
+// 9. `if (c) x;` in the body compiles to the same `Skip; Jump` pair as
+// the loop test. Its jump lands inside the loop, so the guarded arm is
+// not on the spine and must not be hoisted — it ran from iteration 0.
+function guarded(n) {
+    let acc = 0;
+    let f = 1;
+    for (let i = 0; i < n; i++) {
+        if (i === 3) f = 10;
+        acc = acc + f;
+    }
+    return acc;
+}
+
 let out = 0;
 for (let r = 0; r < 2000; r++) {
     out = out + zeroTrip(0);
@@ -111,7 +124,9 @@ for (let r = 0; r < 2000; r++) {
     out = out + shadowDrift(5);
     out = out + zeroCalls(4, 0);
     out = out + zeroCalls(3, 2);
+    out = out + guarded(8);
 }
 console.log(out);
 console.log(zeroTrip(0), zeroTrip(1), nested(3, 3), drift(4), early(2), pushLoop(7));
 console.log(calls(4, 2), shadowDrift(3), zeroCalls(3, 0), zeroCalls(2, 2));
+console.log(guarded(0), guarded(3), guarded(4), guarded(8));

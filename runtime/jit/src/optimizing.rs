@@ -2403,11 +2403,21 @@ fn hoist_map(
             let i = &code[pc];
             if is_skip(i.op) {
                 // the loop test is `Skip; Jump exit`: still being in the
-                // loop means the Jump was skipped and pc+2 runs
+                // loop means the Jump was skipped and pc+2 runs. That
+                // holds only while the Jump leaves the loop — `if (c) x;`
+                // compiles to the same two instructions with the Jump
+                // landing further down the body, and there pc+2 is the
+                // guarded arm, which does not run on every trip. Taking
+                // it hoisted the assignment out of an `if` and ran it
+                // from the first iteration.
                 match code.get(pc + 1) {
                     Some(j) if j.op == Op::Jump && j.sbx() >= 0 => {
-                        pc += 2;
-                        continue;
+                        let t = (pc as i64 + 1 + j.sbx() as i64 + 1) as usize;
+                        if t <= h || t > end {
+                            pc += 2;
+                            continue;
+                        }
+                        break;
                     }
                     _ => break,
                 }
