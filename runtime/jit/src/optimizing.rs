@@ -2640,7 +2640,26 @@ fn emit_dbl_guard(c: &mut C, vs: &[u8], fail: Label) {
 /// that loaded both homes and shifted both tags a second time (the
 /// inlined `a * 3 + b` paid 16 instructions for what takes 10). Pass
 /// `None` where the analysis proved both numeric.
-fn emit_arith_dyn(c: &mut C, op: Op, vb: u8, vc: u8, va: u8, notnum: Option<Label>) {
+fn emit_arith_dyn(
+    c: &mut C,
+    op: Op,
+    vb: u8,
+    vc: u8,
+    va: u8,
+    notnum: Option<Label>,
+    kb: Option<u64>,
+    kc: Option<u64>,
+) {
+    // A known int-tagged constant needs no home, no tag shift and no tag
+    // branch: one `mov`, and its class is settled at compile time.
+    let load_b = |c: &mut C| match kb {
+        Some(k) => c.a.mov_imm64(8, k),
+        None => c.fetch_x(vb, 8),
+    };
+    let load_c = |c: &mut C| match kc {
+        Some(k) => c.a.mov_imm64(9, k),
+        None => c.fetch_x(vc, 9),
+    };
     let as_dbl = c.a.new_label();
     let done = c.a.new_label();
     let nz = c.a.new_label();
@@ -2650,8 +2669,8 @@ fn emit_arith_dyn(c: &mut C, op: Op, vb: u8, vc: u8, va: u8, notnum: Option<Labe
         // outgrew i32, so doubles are the common case — test for two
         // doubles first and run them straight from the homes
         let mixed = c.a.new_label();
-        c.fetch_x(vb, 8);
-        c.fetch_x(vc, 9);
+        load_b(c);
+        load_c(c);
         c.a.lsr_imm(10, 8, 48);
         c.a.cmp_reg(10, R_TAGLIM);
         c.a.b_cond(Cond::Hs, mixed);
@@ -2682,22 +2701,27 @@ fn emit_arith_dyn(c: &mut C, op: Op, vb: u8, vc: u8, va: u8, notnum: Option<Labe
         }
         c.a.b_cond(Cond::Ne, as_dbl);
     } else {
-        c.fetch_x(vb, 8);
-        c.fetch_x(vc, 9);
-        c.a.lsr_imm(10, 8, 48);
-        c.a.lsr_imm(11, 9, 48);
+        load_b(c);
+        load_c(c);
         // one compare answers both questions: above the limit is not a
-        // number, equal to it is an int, below it is a double
-        c.a.cmp_reg(10, R_TAGLIM);
-        if let Some(g) = notnum {
-            c.a.b_cond(Cond::Hi, g);
+        // number, equal to it is an int, below it is a double. A known
+        // int constant has already answered both.
+        if kb.is_none() {
+            c.a.lsr_imm(10, 8, 48);
+            c.a.cmp_reg(10, R_TAGLIM);
+            if let Some(g) = notnum {
+                c.a.b_cond(Cond::Hi, g);
+            }
+            c.a.b_cond(Cond::Ne, as_dbl);
         }
-        c.a.b_cond(Cond::Ne, as_dbl);
-        c.a.cmp_reg(11, R_TAGLIM);
-        if let Some(g) = notnum {
-            c.a.b_cond(Cond::Hi, g);
+        if kc.is_none() {
+            c.a.lsr_imm(11, 9, 48);
+            c.a.cmp_reg(11, R_TAGLIM);
+            if let Some(g) = notnum {
+                c.a.b_cond(Cond::Hi, g);
+            }
+            c.a.b_cond(Cond::Ne, as_dbl);
         }
-        c.a.b_cond(Cond::Ne, as_dbl);
     }
     match op {
         Op::Add => {
@@ -3357,6 +3381,32 @@ fn emit_inline_call(
 ) {
     let w = ins.a + 1; // window base vreg
     let map = |r: u8| w + r;
+    let body = callee.body();
+    // `reads_vreg` has to say "everything" for a Closure, because in
+    // general it cannot see which parent registers the child captures.
+    // Here it can: the child proto lists them.
+    let reads_callee = |i: &Instr, r: u8| -> bool {
+        match i.op {
+            Op::Closure => match body.protos.get(i.bx() as usize) {
+                Some(ch) => ch.upvals.iter().any(|u| {
+                    matches!(*u, tsc_ir::UpvalSrc::ParentLocal(x)
+                                | tsc_ir::UpvalSrc::ParentLocalValue(x) if x == r)
+                }),
+                None => true,
+            },
+            _ => reads_vreg(i, r),
+        }
+    };
+    // A callee constant every reader takes as an arithmetic immediate
+    // never needs a window slot: the store and the reload both go, and
+    // so do the tag branches on a value whose tag is known.
+    let arith_only = |r: u8| -> bool {
+        body.code.iter().all(|i| match i.op {
+            Op::Add | Op::Sub | Op::Mul => true,
+            _ => !reads_callee(i, r),
+        })
+    };
+    let mut kconst: Vec<Option<u64>> = vec![None; 256];
     // The spliced body writes the caller's window vregs directly and does
     // not maintain `itmp`, so a value living only in the intermediate
     // register has to reach its home first — otherwise the claim outlives
@@ -3442,7 +3492,19 @@ fn emit_inline_call(
                 c.xtmp = Some((map(cins.a), 0));
                 c.xtmp_at = c.a.here();
             }
-            Op::LoadInt => c.put_bits(map(cins.a), if c.smi { Value::int(cins.sbx()) } else { Value::number(cins.sbx() as f64) }.bits()),
+            Op::LoadInt => {
+                let bits =
+                    if c.smi { Value::int(cins.sbx()) } else { Value::number(cins.sbx() as f64) }
+                        .bits();
+                // only an int carries a tag the arm may assume
+                let known = c.smi
+                    && body.code.iter().filter(|i| writes_a_op(i.op) && i.a == cins.a).count() == 1
+                    && arith_only(cins.a);
+                kconst[map(cins.a) as usize] = known.then_some(bits);
+                if !known {
+                    c.put_bits(map(cins.a), bits);
+                }
+            }
             Op::LoadUndef => c.put_bits(map(cins.a), Value::UNDEFINED.bits()),
             Op::LoadNull => c.put_bits(map(cins.a), Value::NULL.bits()),
             Op::LoadBool => c.put_bits(
@@ -3461,6 +3523,7 @@ fn emit_inline_call(
                 c.put(map(cins.a), src);
             }
             Op::Add | Op::Sub | Op::Mul | Op::Div => {
+                kconst[map(cins.a) as usize] = None; // a result, not that constant
                 if c.smi && cins.op != Op::Div {
                     // the arm proves both operands itself, off the tags
                     // it has to derive anyway
@@ -3471,6 +3534,8 @@ fn emit_inline_call(
                         map(cins.c),
                         map(cins.a),
                         Some(generic),
+                        kconst[map(cins.b) as usize],
+                        kconst[map(cins.c) as usize],
                     );
                     continue;
                 }
@@ -3893,7 +3958,7 @@ fn emit_op(
                 c.fix_int_write(ins.a, pc);
             } else if smi && cb != Cls::Other && cc != Cls::Other {
                 // numeric, representation unknown: dispatch on the tags
-                emit_arith_dyn(c, ins.op, ins.b, ins.c, ins.a, None);
+                emit_arith_dyn(c, ins.op, ins.b, ins.c, ins.a, None, None, None);
                 c.fix_int_write(ins.a, pc);
             } else {
                 // guarded: numbers inline, anything else (concat, errors)
