@@ -220,6 +220,15 @@ struct C {
     code: Vec<Instr>,
     /// x22 is the array-base cache in this function.
     acache_on: bool,
+    /// x22 is *known* to hold a base here, so a second array op on the
+    /// same straight line needs no `cbnz` to find that out.
+    ///
+    /// Only three things put a zero in x22: the prologue, a loop header
+    /// seeding it for the fall-in edge, and `zero_cache`. A
+    /// `thin_keep_arrays` helper does not -- keeping the array arena put
+    /// is exactly what that call promises -- so this must NOT be tied to
+    /// the call counter the way `fproven` is, or it never fires.
+    acache_nz: bool,
     /// x22 is the integer lane's intermediate in this function.
     lane_on: bool,
     /// currently emitting inside a loop that took the lane, so x22 holds
@@ -767,6 +776,10 @@ impl C {
     fn array_base(&mut self, dst: u32, v: u8, slow: Label, reuse: bool, cache: bool) {
         let derived = self.a.new_label();
         let cached = self.a.new_label();
+        if reuse && self.acache_nz {
+            self.a.mov(dst, R_ACACHE); // already derived on this path
+            return;
+        }
         if reuse {
             self.a.cbnz(R_ACACHE, cached);
         }
@@ -784,6 +797,9 @@ impl C {
             self.a.bind(cached);
             self.a.mov(dst, R_ACACHE);
             self.a.bind(derived);
+        }
+        if cache {
+            self.acache_nz = true;
         }
     }
     /// The array cell at x{arr} must have the element kind this site
@@ -1216,6 +1232,7 @@ impl C {
         self.a.movz(15, 0, 0);
         if self.acache_on {
             self.a.movz(R_ACACHE, 0, 0);
+            self.acache_nz = false;
         }
     }
 
@@ -1556,7 +1573,7 @@ pub fn compile(
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, ibound: None, xtmp: None, xtmp_at: usize::MAX, nonneg: nonneg_vregs(pbody, proto.arity as usize, facts), fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), int_static: facts.int_static, shadow_base: if int_lane { 32 } else { 0 }, resume: None, fuse: None, skip_next: false }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, ibound: None, xtmp: None, xtmp_at: usize::MAX, nonneg: nonneg_vregs(pbody, proto.arity as usize, facts), fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), acache_nz: false, int_static: facts.int_static, shadow_base: if int_lane { 32 } else { 0 }, resume: None, fuse: None, skip_next: false }
     };
     let out = c.a.new_label();
     // where a loop's preheader starts: the OSR dispatch enters here so a
@@ -1821,6 +1838,7 @@ pub fn compile(
             c.alen = None;
             c.ibound = None;
             c.xtmp = None;
+            c.acache_nz = false; // a merge cannot know what x22 holds
             // The array cache may survive a loop header when the loop's
             // every array op is on the cached vreg and nothing rewrites
             // it: then the back edge arrives with the same base, and the
@@ -2041,10 +2059,12 @@ pub fn compile(
         };
         if !apreserves {
             acache = None;
+            c.acache_nz = false;
         } else if acache == Some(ins.a) && !matches!(ins.op, Op::Jump) {
             // the register holding the array was overwritten — including
             // by the op that just cached it, as in `a = a[0]`
             acache = None;
+            c.acache_nz = false;
         }
         // The known length survives only ops that cannot change an array's
         // length and cannot run arbitrary code, and dies when either vreg
