@@ -2288,6 +2288,51 @@ fn live_at(code: &[Instr], start: usize, v: u8) -> bool {
     false
 }
 
+/// Does everything that reads vreg `v` from `start` on read it through a
+/// ToInt32? Every bitwise op converts its operands that way, so a result
+/// only they consume is indistinguishable from the same value wrapped to
+/// i32 — and the arithmetic that produced it needs no overflow check.
+/// This is the ordinary JS wrapping-integer idiom (`h = (h * 31 + c) | 0`
+/// in every hash and PRNG): the overflow is what the code was written to
+/// do, and deopting on it withdrew the whole function's integer lane and
+/// cost 3.5x for the rest of the run.
+fn wraps_to_i32(code: &[Instr], start: usize, v: u8) -> bool {
+    let mut seen = vec![false; code.len() + 2];
+    let mut stack = vec![start];
+    while let Some(pc) = stack.pop() {
+        if pc >= code.len() || seen[pc] {
+            continue;
+        }
+        seen[pc] = true;
+        let i = &code[pc];
+        if reads_vreg(i, v)
+            && !matches!(
+                i.op,
+                Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr | Op::BitNot
+            )
+        {
+            return false;
+        }
+        if writes_a_op(i.op) && i.a == v {
+            continue; // rewritten on this path
+        }
+        match i.op {
+            Op::Jump => stack.push((pc as i64 + i.sbx() as i64 + 1) as usize),
+            Op::JumpIfFalse | Op::JumpIfTrue => {
+                stack.push(pc + 1);
+                stack.push((pc as i64 + i.sbx() as i64 + 1) as usize);
+            }
+            Op::EqSkip | Op::NeSkip | Op::LtSkip | Op::LeSkip | Op::GtSkip | Op::GeSkip => {
+                stack.push(pc + 1);
+                stack.push(pc + 2);
+            }
+            Op::Return | Op::Halt => {}
+            _ => stack.push(pc + 1),
+        }
+    }
+    true
+}
+
 /// How a loop's preheader runs one of its body instructions.
 #[derive(Clone, Copy, PartialEq)]
 enum Hoist {
@@ -3777,7 +3822,13 @@ fn emit_op(
         Op::Add | Op::Sub | Op::Mul => {
             let (cb, cc) = (cls_of(facts, pc, 0, smi), cls_of(facts, pc, 1, smi));
             // this destination already overflowed i32 at run time
-            let withdrawn = (facts.no_int >> (ins.a as u32).min(63)) & 1 == 1;
+            let mut withdrawn = (facts.no_int >> (ins.a as u32).min(63)) & 1 == 1;
+            // Nothing can see the high bits: wrap instead of checking, and
+            // ignore a withdrawal the check itself caused.
+            let wraps = smi && wraps_to_i32(&c.code, pc + 1, ins.a);
+            if wraps {
+                withdrawn = false;
+            }
             let is_int = |x: Cls| matches!(x, Cls::Int | Cls::IntK(_));
             let is_dbl = |x: Cls| matches!(x, Cls::Dbl | Cls::IntK(_));
             // an operand the lane machinery holds as an integer: in the
@@ -3817,33 +3868,36 @@ fn emit_op(
                 match (ins.op, imm) {
                     (Op::Add, Some((k, neg))) => {
                         if neg { c.a.subs_imm32(14, ib, k) } else { c.a.adds_imm32(14, ib, k) }
-                        c.a.b_cond(Cond::Vs, bad);
+                        if !wraps { c.a.b_cond(Cond::Vs, bad) }
                     }
                     (Op::Sub, Some((k, neg))) => {
                         if neg { c.a.adds_imm32(14, ib, k) } else { c.a.subs_imm32(14, ib, k) }
-                        c.a.b_cond(Cond::Vs, bad);
+                        if !wraps { c.a.b_cond(Cond::Vs, bad) }
                     }
                     (Op::Add, None) => {
                         let ic = opnd(c, cc, ins.c, 11);
                         c.a.adds_reg32(14, ib, ic);
-                        c.a.b_cond(Cond::Vs, bad);
+                        if !wraps { c.a.b_cond(Cond::Vs, bad) }
                     }
                     (Op::Sub, None) => {
                         let ic = opnd(c, cc, ins.c, 11);
                         c.a.subs_reg32(14, ib, ic);
-                        c.a.b_cond(Cond::Vs, bad);
+                        if !wraps { c.a.b_cond(Cond::Vs, bad) }
                     }
                     (Op::Mul, _) => {
                         let ic = opnd(c, cc, ins.c, 11);
                         c.a.smull(14, ib, ic);
-                        c.a.cmp_ext_sxtw(14, 14); // fits i32?
-                        c.a.b_cond(Cond::Ne, bad);
+                        if !wraps {
+                            c.a.cmp_ext_sxtw(14, 14); // fits i32?
+                            c.a.b_cond(Cond::Ne, bad);
+                        }
                         // A zero product owes -0 only when a factor is
                         // negative; a positive constant factor rules that
                         // out (0 * k is +0), so the check goes entirely.
+                        // A wrapped result ToInt32s -0 to 0 regardless.
                         let pos_k = matches!(cb, Cls::IntK(k) if k > 0)
                             || matches!(cc, Cls::IntK(k) if k > 0);
-                        if !pos_k {
+                        if !pos_k && !wraps {
                             let ok = c.a.new_label();
                             let z = c.a.new_label();
                             c.a.cbz32(14, z);
