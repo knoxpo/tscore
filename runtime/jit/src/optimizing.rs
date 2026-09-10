@@ -189,6 +189,9 @@ struct C {
     /// deferred until the vreg is still live where the register is
     /// reassigned, cleared, spilled or branched away from
     itmp_dirty: bool,
+    /// this pc's own arm just took R_ITMP for its destination: the claim
+    /// is the fresh value, not a stale one the arm wrote past
+    itmp_fresh: bool,
     /// The shape id x16 is *proven* to hold, with x15 proven non-zero,
     /// for whichever vreg `fcache` names. A typed field site deopts on a
     /// miss rather than joining a helper, so once its guard has passed
@@ -694,6 +697,7 @@ impl C {
         // something will read it (liveness at the reassignment)
         self.itmp = Some(v);
         self.itmp_dirty = true;
+        self.itmp_fresh = true;
     }
 
     /// After an arm wrote vreg `v`'s home without keeping its integer
@@ -1441,31 +1445,6 @@ pub fn compile(
             );
         }
     }
-    let heap_op = |op: Op| {
-        matches!(
-            op,
-            Op::SetField
-                | Op::SetIndex
-                | Op::ArrayPush
-                | Op::NewObject
-                | Op::NewArray
-                | Op::NewObjectLit
-                | Op::NewArrayLit
-                | Op::Closure
-                | Op::Concat
-        )
-    };
-    let fn_mutates = pbody.code.iter().any(|i| heap_op(i.op));
-    for (pc, ins) in pbody.code.iter().enumerate() {
-        if ins.op == Op::Jump && ins.sbx() < 0 {
-            let target = (pc as i64 + ins.sbx() as i64 + 1) as usize;
-            let body = &pbody.code[target..pc];
-            if body.iter().any(|i| i.op == Op::Call) && !(for_osr && fn_mutates) {
-                return None;
-            }
-        }
-    }
-
     // Integer lanes. Loops outer-first; each takes its picks into the
     // lane registers its enclosing loops left free, so a nest keeps the
     // outer counter live through the inner loop. Per pc: the lanes and
@@ -1573,7 +1552,7 @@ pub fn compile(
         let deopt_exit = a.new_label();
         let ret = a.new_label();
         let pc_labels: Vec<Label> = (0..pbody.code.len() + 2).map(|_| a.new_label()).collect();
-        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, fproven: None, alen: None, ibound: None, xtmp: None, xtmp_at: usize::MAX, nonneg: nonneg_vregs(pbody, proto.arity as usize, facts), fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), acache_nz: false, int_static: facts.int_static, shadow_base: if int_lane { 32 } else { 0 }, resume: None, fuse: None, skip_next: false }
+        C { a, pc_labels, bail, await_exit, deopt_exit, ret, helpers, offsets, smi: tsr_memory::smi_on(), ics_base, tics_base, n_low, int_lane, lanes: Vec::new(), itmp: None, itmp_dirty: false, itmp_fresh: false, fproven: None, alen: None, ibound: None, xtmp: None, xtmp_at: usize::MAX, nonneg: nonneg_vregs(pbody, proto.arity as usize, facts), fproven_at: 0, code: pbody.code.clone(), acache_on, lane_on, int_ok: Vec::new(), stubs: Vec::new(), lanes_at: Vec::new(), acache_nz: false, int_static: facts.int_static, shadow_base: if int_lane { 32 } else { 0 }, resume: None, fuse: None, skip_next: false }
     };
     let out = c.a.new_label();
     // where a loop's preheader starts: the OSR dispatch enters here so a
@@ -1991,6 +1970,7 @@ pub fn compile(
         if pc > 0 && dead_const[pc - 1] {
             c.resume = Some(pc - 1);
         }
+        c.itmp_fresh = false;
         match hoisted[pc] {
             // the preheader already computed this into its home, or its
             // only reader went there and the body's store is dead
@@ -2031,7 +2011,17 @@ pub fn compile(
         // *source* for stores, branches, skips and Return, and dropping a
         // dirty register there loses the value: the home was never
         // written, so every later read sees a stale slot.
+        // `itmp_fresh` is the exception: the arm that just ran took R_ITMP
+        // for this very destination and deliberately deferred the home
+        // write. The op allowlist below cannot see that — a bitwise op in
+        // a laned loop ends in `int_dst_w` but is not on it — and clearing
+        // the claim there dropped the deferred write outright, so the
+        // slot kept whatever it held before. Nothing noticed while calls
+        // in loops never compiled: a spill is the first thing that reads
+        // the slot instead of the register (fnv, once the call-in-loop
+        // bail-out came off, passed `Math` itself to `Math.imul`).
         if c.itmp == Some(ins.a)
+            && !c.itmp_fresh
             && writes_a_op(ins.op)
             && !matches!(
                 ins.op,
