@@ -35,6 +35,7 @@ const R_CLOSURE: u32 = 22;
 /// Cached array data pointer, 0 when invalid — same discipline as the
 /// field cache in x15. Only live when `int_lane`.
 const R_ACACHE: u32 = 22;
+
 /// Realm.const_cache entries (mirrors tsr_realm::CONST_CACHE; 16-byte (key, Value) pairs).
 const CONST_CACHE: usize = 512;
 const CLOSURE_SLOT: u32 = 24;
@@ -1747,6 +1748,22 @@ pub fn compile(
             }
         }
     }
+    // A constant loaded only to be a modulo's divisor never needs its
+    // home: the arm folds the divisor into a magic multiply and reads
+    // nothing. Skipping the store means the interpreter must re-run the
+    // load if the modulo deopts, so those deopts resume one pc earlier.
+    let dead_const: Vec<bool> = (0..pbody.code.len())
+        .map(|pc| {
+            let i = pbody.code[pc];
+            let Some(j) = pbody.code.get(pc + 1) else { return false };
+            i.op == Op::LoadInt
+                && j.op == Op::Mod
+                && j.c == i.a
+                && facts.const_ops.get(pc + 1).and_then(|o| o[1]) == Some(i.sbx() as i64)
+                && !jump_targets[pc + 1]
+                && !live_at(&pbody.code, pc + 2, i.a)
+        })
+        .collect();
     let in_lane: Vec<bool> = lanes_at.iter().map(|l| !l.is_empty()).collect();
     c.lanes_at = lanes_at.clone();
     let mut fcache: Option<u8> = None;
@@ -1943,6 +1960,14 @@ pub fn compile(
             }
             _ => None,
         };
+        // the divisor below folds it: nothing reads this home
+        if dead_const[pc] {
+            continue;
+        }
+        // ... and its deopts must land on the load, not on itself
+        if pc > 0 && dead_const[pc - 1] {
+            c.resume = Some(pc - 1);
+        }
         match hoisted[pc] {
             // the preheader already computed this into its home, or its
             // only reader went there and the body's store is dead
@@ -1961,6 +1986,7 @@ pub fn compile(
             }
             _ => emit_op(&mut c, proto, pc, *ins, facts, fmod_addr, pow_addr, lit_shapes, inlines, &mut fcache, &mut acache, in_lane[pc], primary_at[pc]),
         }
+        c.resume = None;
         // ops with only cold-path blrs (which zero x15) preserve the cache;
         // everything else — calls, allocation, heap ops that clobber
         // x15/x16 outright — kills it at compile time
@@ -3680,13 +3706,15 @@ fn emit_op(
                         return x;
                     }
                     if let Some(r) = c.lane_of(v) {
-                return r;
-            }
+                        return r;
+                    }
                     if c.itmp == Some(v) {
                         return R_ITMP;
                     }
-                    c.fetch_x(v, x);
-                    x
+                    // a field read publishes the register it left the
+                    // value in; taking it saves pushing the value out to
+                    // a d-register home and pulling it straight back
+                    c.fetch_x_any(v, x)
                 };
                 let ib = opnd(c, cb, ins.b, 10);
                 let bad = c.deopt_stub(pc);
@@ -4821,8 +4849,13 @@ fn emit_op(
                         c.int32_check(9, full);
                     }
                     if let Some((sid, slot)) = baked {
-                        c.cmp_sid(16, sid);
-                        c.a.b_cond(Cond::Ne, full);
+                        // `store_proven` is exactly the claim that x16
+                        // already holds this shape id, so re-comparing it
+                        // is a compare and a branch that cannot be taken
+                        if !store_proven {
+                            c.cmp_sid(16, sid);
+                            c.a.b_cond(Cond::Ne, full);
+                        }
                         c.a.str_imm(9, 15, o.obj_inline + slot * 8);
                     } else {
                         c.a.mov_imm64(13, c.ics_base + (pc as u64) * 8);
