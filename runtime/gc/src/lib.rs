@@ -111,6 +111,7 @@ pub fn collect<'a>(
     work.extend(globals.copied());
     let verify_roots: Vec<Value> = if verify_on() { work.clone() } else { Vec::new() };
     // before the sweep: did this major inherit the corruption?
+    verify_no_stale_marks(heap, "pre-major-marks");
     verify_reachable(heap, &verify_roots, "pre-major");
 
     while let Some(v) = work.pop() {
@@ -726,7 +727,9 @@ fn bulk_promote(heap: &mut Heap, stats: &mut GcStats) {
     }
     for e in std::mem::take(&mut heap.born_elems) {
         let mt = meta_at(e);
-        set_meta(e, mt | M_AGED);
+        // same as the cells above: ageing must clear the mark, or the
+        // next major sees a chunk that is already "visited"
+        set_meta(e, (mt & !M_MARK) | M_AGED);
         promoted_bytes += size_words(mt) * 8;
     }
     heap.old.sync_top();
@@ -903,6 +906,45 @@ fn verify_marked(heap: &Heap, roots: &[Value]) {
             let mut kids: Vec<Value> = Vec::new();
             trace_cell(heap, a, &mut kids);
             work.extend(kids.into_iter().map(|k| (a, k)));
+        }
+    }
+    if bad > 0 {
+        std::process::abort();
+    }
+}
+
+/// Before the major marks anything, no old cell may already carry
+/// M_MARK: a stale mark makes `mark_cell` report "already visited" and
+/// the cell is never traced.
+fn verify_no_stale_marks(heap: &Heap, phase: &str) {
+    if !verify_on() {
+        return;
+    }
+    let mut bad = 0usize;
+    for ci in 0..heap.old.chunks.len() {
+        let (base, top) = (heap.old.chunks[ci].base, heap.old.chunks[ci].top);
+        let mut a = base;
+        while a < top {
+            let mt = meta_at(a as Ref);
+            let words = size_words(mt);
+            if words < 2 {
+                break;
+            }
+            if mt & M_MARK != 0 && kind_of(mt) != K_ELEMS {
+                eprintln!(
+                    "[verify/{phase}] STALE MARK {a:#x} kind={} size={} aged={} dirty={} in_born={}",
+                    kind_of(mt),
+                    words,
+                    mt & M_AGED != 0,
+                    mt & M_DIRTY != 0,
+                    heap.old.in_born_range(a as Ref)
+                );
+                bad += 1;
+                if bad > 12 {
+                    std::process::abort();
+                }
+            }
+            a += words * 8;
         }
     }
     if bad > 0 {
