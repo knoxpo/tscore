@@ -666,11 +666,20 @@ pub fn analyze_with(
                         body.consts.get(i.bx() as usize),
                         Some(Const::Number(n)) if n.fract() == 0.0 && n.abs() < 2147483648.0
                     ),
-                    Op::Move | Op::Neg | Op::BitNot => int_operand(i.b, 0),
+                    Op::Move | Op::Neg => int_operand(i.b, 0),
                     // a field the shape vouches for as Int32
                     Op::GetField => repr_at(pc2) == REPR_INT32,
                     // an element of an int-only array
                     Op::GetIndex => ekind_at(pc2) == EK_I32,
+                    // A bitwise op ToInt32s its operands, so its result is
+                    // an i32 whatever they were. Requiring them to be
+                    // integral too — as `keeps_int` does for arithmetic —
+                    // let one unknown value withdraw the whole chain it
+                    // fed: `acc += f(i) | 0` lost `acc` its lane because a
+                    // call result is never integral. UShr is the exception:
+                    // ToUint32 can land above i32.
+                    Op::BitAnd | Op::BitOr | Op::BitXor | Op::BitNot | Op::Shl
+                    | Op::Shr => true,
                     _ if keeps_int(i.op) => {
                         int_operand(i.b, 0) && int_operand(i.c, 1)
                     }
