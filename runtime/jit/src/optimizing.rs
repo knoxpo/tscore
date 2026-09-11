@@ -273,6 +273,10 @@ enum Stub {
     /// a zero product owes -0 when either factor is negative: deopt
     /// then, else back to `ok`
     MulZero { l: Label, ib: u32, ic: u32, ok: Label, deopt: Label },
+    /// `x % k` of a negative dividend: only a zero remainder there is the
+    /// -0 that has no integer form. Out of line because the sign test
+    /// that reaches it is the predictable one.
+    ModNegZero { l: Label, r: u32, ok: Label, deopt: Label },
     /// An index read that missed its guards: call the helper out of line
     /// so the fast path falls through instead of jumping over it.
     /// `lanes`/`itmp` are the register state at the branch, as for Deopt.
@@ -2218,6 +2222,11 @@ pub fn compile(
                 c.lanes = saved;
                 (c.itmp, c.itmp_dirty) = (si, sd);
             }
+            Stub::ModNegZero { l, r, ok, deopt } => {
+                c.a.bind(l);
+                c.a.cbnz32(r, ok);
+                c.a.b(deopt);
+            }
             Stub::MulZero { l, ib, ic, ok, deopt } => {
                 c.a.bind(l);
                 c.a.orr_reg32(12, ib, ic);
@@ -3227,11 +3236,18 @@ fn mod_int_result(c: &mut C, a_reg: u8, n: u32, r: u32, pc: usize) -> bool {
         // int — the analysis typed this result IntV)
         let bad = c.deopt_stub(pc);
         // `x % k` is -0 only for a zero remainder of a negative dividend.
-        // A nonzero remainder settles it whatever the sign, and that is
-        // the common case, so test it first and read the sign bit
-        // directly rather than comparing against zero.
-        c.a.cbnz32(r, ok);
-        c.a.tbnz32(n, 31, bad);
+        // Both tests settle it, so the one to branch on is whichever
+        // predicts. Testing the remainder first takes one fewer
+        // instruction on the common path but asks "is this trip the zero
+        // one?", which for a small divisor is unpredictable by
+        // construction -- `p.z % 7` mispredicted one trip in seven and
+        // cost 24% of that loop, while `i % 7` over a counter was free
+        // because the period is learnable. A dividend's sign changes
+        // rarely or never, so branch on that and leave the remainder
+        // test out of line.
+        let neg = c.a.new_label();
+        c.a.tbnz32(n, 31, neg);
+        c.stubs.push(Stub::ModNegZero { l: neg, r, ok, deopt: bad });
         c.a.bind(ok);
         if c.lane_of(a_reg).is_none() {
             // the caller already put the remainder in R_ITMP when it is
