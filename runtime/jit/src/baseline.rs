@@ -108,6 +108,8 @@ pub struct HeapOffsets {
     pub born_len: u32,
     pub born_cap: u32,
     pub pretenure_off: u32,
+    /// `Heap::poll` — the shared safepoint budget.
+    pub poll_off: u32,
     /// `young(a) = (a >> young_shift) == (base >> young_shift)`.
     pub young_shift: u32,
     /// Inline bump path enabled (nursery on for this process).
@@ -346,7 +348,12 @@ pub fn compile(
     c.a.mov(R_DEPTH, 4);
     c.a.mov_imm64(R_SENTINEL, JIT_ERR_SENTINEL);
     c.a.movz(R_TAGLIM, 0xFFF9, 0);
-    c.a.movz(R_POLL, SAFEPOINT_INTERVAL, 0);
+    // shared safepoint budget (see the optimizing tier): inherit rather
+    // than reset, or a short callee loop never polls
+    match c.offsets {
+        Some(o) => c.a.ldr_imm(R_POLL, R_REALM, o.poll_off),
+        None => c.a.movz(R_POLL, SAFEPOINT_INTERVAL, 0),
+    }
     // stash start_pc (x5) across the stack_ptr helper call
     c.a.mov(15, 5);
     c.a.mov_imm64(8, helpers.stack_ptr as u64);
@@ -400,6 +407,9 @@ pub fn compile(
     c.a.bind(bail);
     c.a.movz(0, 1, 0);
     c.a.bind(out);
+    if let Some(o) = c.offsets {
+        c.a.str_imm(R_POLL, R_REALM, o.poll_off);
+    }
     c.a.ldp_post(27, 28, SP, 16);
     c.a.ldp_post(25, 26, SP, 16);
     c.a.ldp_post(23, 24, SP, 16);
@@ -764,6 +774,12 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
         }
 
         Op::Call => {
+            // publish the live budget so the callee inherits it, and take
+            // back what it left (the optimizing tier does this through
+            // `spill_low` / the post-call reload)
+            if let Some(o) = c.offsets {
+                c.a.str_imm(R_POLL, R_REALM, o.poll_off);
+            }
             c.a.mov(0, R_REALM);
             c.a.mov(1, R_PROTO);
             c.a.mov_imm64(2, pc as u64);
@@ -776,6 +792,9 @@ fn emit_op(c: &mut C, pc: usize, ins: Instr) {
             c.a.cmp_reg(0, R_SENTINEL);
             c.a.b_cond(Cond::Eq, c.bail);
             c.a.add_reg(R_SLOTS, 1, R_BASE);
+            if let Some(o) = c.offsets {
+                c.a.ldr_imm(R_POLL, R_REALM, o.poll_off);
+            }
         }
         Op::Return => {
             c.load_slot(1, ins.a);

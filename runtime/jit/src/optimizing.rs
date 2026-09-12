@@ -501,6 +501,11 @@ impl C {
 
     /// Every home to its slot, laned vregs from their registers (x9).
     fn spill_low(&mut self) {
+        // a callee reads the budget from the realm, so publish the live
+        // count before handing control over
+        if let Some(o) = self.offsets {
+            self.a.str_imm(R_POLL, R_REALM, o.poll_off);
+        }
         for i in 0..self.n_low {
             self.a.str_d_imm((8 + i) as u32, R_SLOTS, Self::slot(i));
         }
@@ -1602,7 +1607,13 @@ pub fn compile(
     c.a.mov(R_REALM, 0);
     c.a.mov(R_BASE, 2);
     c.a.movz(R_TAGLIM, 0xFFF9, 0);
-    c.a.movz(R_POLL, SAFEPOINT_INTERVAL, 0);
+    // The safepoint budget is shared by every frame: a callee inherits
+    // what the caller had left rather than starting over, so a loop
+    // shorter than the interval can no longer skip polling entirely.
+    match c.offsets {
+        Some(o) => c.a.ldr_imm(R_POLL, R_REALM, o.poll_off),
+        None => c.a.movz(R_POLL, SAFEPOINT_INTERVAL, 0),
+    }
 
     c.a.mov(R_STARTPC, 5); // stash start_pc across the slots init
     if let Some(o) = c.offsets {
@@ -2141,6 +2152,11 @@ pub fn compile(
     c.a.bind(await_exit);
     c.a.movz(0, 3, 0); // suspend: info stashed in realm.jit_await
     c.a.bind(out);
+    // hand the remaining budget back to whoever resumes (x0/x1 carry the
+    // exit code and value, and this touches neither)
+    if let Some(o) = c.offsets {
+        c.a.str_imm(R_POLL, R_REALM, o.poll_off);
+    }
     let drop_bytes = if c.int_lane { 32 } else { 0 } + shadow_bytes;
     if drop_bytes > 0 {
         c.a.add_imm(SP, SP, drop_bytes); // proto, depth and LICM shadows
@@ -4703,6 +4719,10 @@ fn emit_op(
             c.a.add_reg(R_SLOTS, 1, R_BASE);
             c.a.bind(done);
             c.reload_low();
+            // the callee spent from the shared budget; take what is left
+            if let Some(o) = c.offsets {
+                c.a.ldr_imm(R_POLL, R_REALM, o.poll_off);
+            }
             let _ = inlined;
             c.a.bind(inline_done);
         }

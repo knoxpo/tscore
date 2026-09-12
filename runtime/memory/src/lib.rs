@@ -797,6 +797,12 @@ pub struct Heap {
     /// copying every one of them out of the nursery. Flipped only at the
     /// end of a minor, when the nursery is empty, so no young ref exists
     /// while allocation goes old. TSC_PRETENURE=1 pins it on.
+    /// Safepoint budget, shared by every JIT frame. It used to be a
+    /// per-frame countdown the prologue reset to SAFEPOINT_INTERVAL, so a
+    /// callee whose loop was shorter than the interval never polled at
+    /// all and nothing checked `needs_gc` until the young region filled
+    /// outright — 100MB against a 16MB soft limit, and 3x the time.
+    pub poll: usize,
     pub pretenure: usize,
     pub pretenure_fixed: bool,
     /// Minors left that may age the born log without tracing, set by a
@@ -810,6 +816,10 @@ pub struct Heap {
     /// Detached string buffers harvested from dead nursery slots.
     pub pool_str_bufs: Vec<String>,
 }
+
+/// Back-edge ticks between safepoints. Mirrored by the JIT tiers, which
+/// keep the live count in R_POLL and write it back through `Heap::poll`.
+pub const SAFEPOINT_INTERVAL: usize = 1024;
 
 impl Default for Heap {
     fn default() -> Self {
@@ -851,6 +861,7 @@ impl Default for Heap {
             nursery: Nursery::default(),
             nursery_limit,
             nursery_on: std::env::var_os("TSC_NO_NURSERY").is_none(),
+            poll: SAFEPOINT_INTERVAL,
             pretenure: std::env::var_os("TSC_PRETENURE").is_some() as usize,
             pretenure_fixed: std::env::var_os("TSC_PRETENURE").is_some()
                 || std::env::var_os("TSC_NO_PRETENURE").is_some(),
@@ -1297,6 +1308,12 @@ impl Heap {
     }
 
     pub fn needs_gc(&self) -> bool {
+        // OnceLock, not a per-call getenv: `needs_gc` runs at every
+        // safepoint and promises reaches ~2M of them.
+        static WHY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *WHY.get_or_init(|| std::env::var_os("TSC_GC_WHY").is_some()) {
+            return self.needs_gc_why();
+        }
         self.young.top >= self.young.limit
             || self.allocs_since_gc >= self.gc_threshold
             || self.nursery.bytes >= self.nursery_limit
@@ -1305,6 +1322,39 @@ impl Heap {
             // so a shorter cycle costs little and bounds the garbage held
             || self.old.bytes_since_minor() >= self.nursery_limit / 4
             || self.born_buf.is_full()
+    }
+
+    /// TSC_GC_WHY=1: which `needs_gc` condition fires, and how many calls
+    /// went by since the last one — a check that is never reached looks
+    /// exactly like a threshold that is never crossed.
+    #[cold]
+    fn needs_gc_why(&self) -> bool {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        static LAST: AtomicUsize = AtomicUsize::new(0);
+        let n = CALLS.fetch_add(1, Relaxed) + 1;
+        let why = if self.young.top >= self.young.limit {
+            "young_full"
+        } else if self.allocs_since_gc >= self.gc_threshold {
+            "alloc_count"
+        } else if self.nursery.bytes >= self.nursery_limit {
+            "nursery_limit"
+        } else if self.old.bytes_since_minor() >= self.nursery_limit / 4 {
+            "old_since_minor"
+        } else if self.born_buf.is_full() {
+            "born_full"
+        } else {
+            return false;
+        };
+        let prev = LAST.swap(n, Relaxed);
+        eprintln!(
+            "[why] {why} checks_since_last={} nursery_bytes={} young_used={} allocs={}",
+            n - prev,
+            self.nursery.bytes,
+            self.young.used(),
+            self.allocs_since_gc
+        );
+        true
     }
 
     pub fn promote_str(&mut self, s: HStr) -> Ref {

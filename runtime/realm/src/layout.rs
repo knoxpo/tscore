@@ -49,6 +49,7 @@ fn discover() -> Option<HeapOffsets> {
         born_len: (born + offset_of!(BornBuf, len)) as u32,
         born_cap: (born + offset_of!(BornBuf, cap)) as u32,
         pretenure_off: (heap + offset_of!(Heap, pretenure)) as u32,
+        poll_off: (heap + offset_of!(Heap, poll)) as u32,
         young_shift: YOUNG_RESERVE.trailing_zeros(),
         bump_alloc: std::env::var_os("TSC_NO_NURSERY").is_none(),
         obj_shape: offset_of!(Obj, shape) as u32,
