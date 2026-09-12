@@ -654,16 +654,26 @@ pub fn collect_minor<'a>(
     // decided here, with the nursery empty, so allocation never mixes
     // modes mid-cycle.
     heap.pretenure_skip = 0;
-    if heap.nursery_on && !heap.pretenure_fixed {
+    // `pretenure_fixed` pins the mode, not the pacing. Gating this whole
+    // block on it left `pretenure_skip` at 0 forever, so TSC_PRETENURE=1
+    // never took the untraced bulk path at all — 82 full minors where the
+    // adaptive policy runs 72 bulk ones. The knob measured the absence of
+    // bulk promotion and got blamed on pretenuring.
+    if heap.nursery_on {
         if heap.pretenure == 0 {
             let copied = evac_bytes.saturating_sub(m.evac_base);
-            if young_used >= 256 << 10 && copied * 4 >= young_used * 3 {
+            if !heap.pretenure_fixed
+                && young_used >= 256 << 10
+                && copied * 4 >= young_used * 3
+            {
                 heap.pretenure = 1;
             }
         } else {
             let swept = promoted + freed;
             if swept >= 4096 && promoted * 2 < swept {
-                heap.pretenure = 0;
+                if !heap.pretenure_fixed {
+                    heap.pretenure = 0;
+                }
                 heap.pretenure_run = 0;
             } else if swept >= 4096 && promoted * 10 >= swept * 9 {
                 // Nothing died. Grant twice as many untraced minors as
