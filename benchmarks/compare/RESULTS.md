@@ -1,6 +1,6 @@
 # Engine comparison: tscore vs node (V8) vs bun (JSC)
 
-- date: 2026-09-12 12:52
+- date: 2026-09-13 04:34
 - machine: Apple M5 Max, 18 logical cpus (6P + 12E)
 - tscore: tscore 0.1.0, node: v24.17.0, bun: 1.4.0
 - steady-state cells: median TIME_MS of 5 runs, first run discarded; in-program warmup pass before timing
@@ -14,32 +14,32 @@
 
 | benchmark | tscore | node | bun | winner |
 |---|---|---|---|---|
-| startup (hello.ts) | 1.8 (0.05x) | 38.5 (1.00x) | 4.4 (0.11x) | **tscore** |
-| parse+compile (~50k LOC) | 9.1 (0.09x) | 101.3 (1.00x) | 11.6 (0.11x) | **tscore** |
+| startup (hello.ts) | 1.7 (0.05x) | 37.5 (1.00x) | 4.2 (0.11x) | **tscore** |
+| parse+compile (~50k LOC) | 8.7 (0.09x) | 99.5 (1.00x) | 11.3 (0.11x) | **tscore** |
 
 ## Steady-state (shared sources, in-program TIME_MS)
 
 | benchmark | tscore | node | bun | winner | peak RSS MB (tscore / node / bun) |
 |---|---|---|---|---|---|
-| objects | 32.9 (1.37x) | 24.1 (1.00x) | 23.2 (0.96x) | **bun** | 5 / 74 / 22 |
-| closures | 57.7 (1.67x) | 34.5 (1.00x) | 50.2 (1.46x) | **node** | 23 / 83 / 44 |
-| alloc | 37.3 (0.87x) | 43.0 (1.00x) | 46.9 (1.09x) | **tscore** | 21 / 79 / 32 |
-| gc_churn | 73.7 (1.33x) | 55.2 (1.00x) | 43.0 (0.78x) | **bun** | 370 / 500 / 355 |
-| promises | 54.7 (0.87x) | 63.1 (1.00x) | 58.5 (0.93x) | **tscore** | 30 / 83 / 34 |
+| objects | 32.9 (1.40x) | 23.4 (1.00x) | 22.8 (0.97x) | **bun** | 5 / 75 / 22 |
+| closures | 57.8 (1.68x) | 34.5 (1.00x) | 46.9 (1.36x) | **node** | 22 / 83 / 45 |
+| alloc | 37.6 (0.86x) | 43.5 (1.00x) | 45.0 (1.03x) | **tscore** | 21 / 79 / 32 |
+| gc_churn | 73.3 (1.41x) | 52.0 (1.00x) | 41.6 (0.80x) | **bun** | 370 / 499 / 355 |
+| promises | 56.1 (0.89x) | 62.8 (1.00x) | 56.0 (0.89x) | **bun** | 30 / 83 / 34 |
 
 ## Async (per-engine variants, same algorithm)
 
 | benchmark | tscore | node | bun | winner |
 |---|---|---|---|---|
-| timer storm (2000x sleep 1ms) | 10.3 (0.78x) | 13.2 (1.00x) | 12.0 (0.91x) | **tscore** |
-| channel 100k msgs (vs worker postMessage) | 5.1 (0.15x) | 34.9 (1.00x) | 29.5 (0.85x) | **tscore** |
+| timer storm (2000x sleep 1ms) | 10.3 (0.84x) | 12.3 (1.00x) | 12.2 (0.99x) | **tscore** |
+| channel 100k msgs (vs worker postMessage) | 5.1 (0.15x) | 34.5 (1.00x) | 28.4 (0.82x) | **tscore** |
 
 ## Long-running (30s sustained mixed compute+alloc, single run)
 
 | metric | tscore | node | bun | winner |
 |---|---|---|---|---|
-| throughput (ops/sec) | 816531 (0.81x) | 1012539 (1.00x) | 810491 (0.80x) | **node** |
-| stability (last/first decile) | 1 | 1.005 | 1.015 | |
+| throughput (ops/sec) | 918275 (0.92x) | 992955 (1.00x) | 758758 (0.76x) | **node** |
+| stability (last/first decile) | 0.935 | 1.015 | 0.98 | |
 
 ## Multicore (tscore parallel.map vs node/bun worker_threads)
 
@@ -47,27 +47,27 @@
 
 | workers | tscore | node | bun | winner |
 |---|---|---|---|---|
-| 1 | 48.5 (0.83x) | 58.5 (1.00x) | 34.6 (0.59x) | **bun** |
-| 2 | 26.7 (0.63x) | 42.1 (1.00x) | 23.9 (0.57x) | **bun** |
-| 4 | 14.2 (0.47x) | 30.4 (1.00x) | 16.6 (0.55x) | **tscore** |
-| 8 | 7.9 (0.30x) | 25.9 (1.00x) | 14.5 (0.56x) | **tscore** |
+| 1 | 48.1 (0.81x) | 59.4 (1.00x) | 34.4 (0.58x) | **bun** |
+| 2 | 26.6 (0.62x) | 43.1 (1.00x) | 23.8 (0.55x) | **bun** |
+| 4 | 14.0 (0.47x) | 30.0 (1.00x) | 16.7 (0.56x) | **tscore** |
+| 8 | 8.0 (0.32x) | 24.8 (1.00x) | 14.0 (0.57x) | **tscore** |
 
 ### mandelbrot
 
 | workers | tscore | node | bun | winner |
 |---|---|---|---|---|
-| 1 | 24.9 (0.75x) | 33.3 (1.00x) | 32.0 (0.96x) | **tscore** |
-| 2 | 13.0 (0.53x) | 24.7 (1.00x) | 20.2 (0.82x) | **tscore** |
-| 4 | 7.3 (0.32x) | 22.9 (1.00x) | 18.4 (0.80x) | **tscore** |
-| 8 | 5.2 (0.23x) | 22.6 (1.00x) | 17.2 (0.76x) | **tscore** |
+| 1 | 24.6 (0.74x) | 33.1 (1.00x) | 29.8 (0.90x) | **tscore** |
+| 2 | 12.9 (0.55x) | 23.2 (1.00x) | 19.9 (0.86x) | **tscore** |
+| 4 | 7.1 (0.32x) | 21.9 (1.00x) | 18.2 (0.83x) | **tscore** |
+| 8 | 4.3 (0.20x) | 21.7 (1.00x) | 16.2 (0.75x) | **tscore** |
 
 ## Scoreboard
 
 | engine | wins |
 |---|---|
-| tscore | 12 |
+| tscore | 11 |
 | node | 2 |
-| bun | 4 |
+| bun | 5 |
 
 Win = fastest median (highest throughput for long-running) on that row.
 
@@ -76,12 +76,12 @@ Win = fastest median (highest throughput for long-running) on that row.
 
 | engine | req/s | cores | req/s per core |
 |---|---|---|---|
-| tscore workers:1 | 206,282 | 1.0 | 207,322 **best/core** |
-| bun x8 reusePort (darwin: 1 active, 7 idle) | 188,674 | 1.0 | 182,505 |
-| bun x1 | 183,413 | 1.0 | 178,730 |
-| node x1 | 142,490 | 1.0 | 139,886 |
-| tscore workers:8 | 239,676 | 1.9 | 125,637 |
-| node cluster x8 | 189,202 | 4.0 | 47,880 |
+| tscore workers:1 | 221,626 | 1.0 | 222,343 **best/core** |
+| bun x1 | 196,753 | 1.0 | 191,024 |
+| bun x8 reusePort (darwin: 1 active, 7 idle) | 196,885 | 1.0 | 189,975 |
+| tscore workers:8 | 250,140 | 1.6 | 153,415 |
+| node x1 | 147,478 | 1.0 | 144,821 |
+| node cluster x8 | 196,050 | 3.8 | 52,252 |
 
 Total throughput is capped by this machine's loopback stack, not
 by any engine: four independent servers with four independent
@@ -94,12 +94,12 @@ spread says how much it moved underneath the table:
 
 | engine | min | max |
 |---|---|---|
-| tscore workers:1 | 204,360 | 206,282 |
-| bun x8 reusePort (darwin: 1 active, 7 idle) | 170,361 | 188,674 |
-| bun x1 | 175,892 | 183,413 |
-| node x1 | 137,498 | 142,490 |
-| tscore workers:8 | 224,304 | 239,676 |
-| node cluster x8 | 163,852 | 189,202 |
+| tscore workers:1 | 219,817 | 221,626 |
+| bun x1 | 192,784 | 196,753 |
+| bun x8 reusePort (darwin: 1 active, 7 idle) | 185,725 | 196,885 |
+| tscore workers:8 | 222,311 | 250,140 |
+| node x1 | 127,107 | 147,478 |
+| node cluster x8 | 176,249 | 196,050 |
 
 If an engine changes places between runs, the per-core ordering is
 an artefact of when the sweep landed and the numbers are not usable.
