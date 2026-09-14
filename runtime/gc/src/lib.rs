@@ -810,29 +810,44 @@ fn for_born_range(
     promoted: &mut usize,
     promoted_bytes: &mut usize,
 ) -> usize {
+    // The dead cells used to go into a `Vec<(Ref, usize)>` and get freed
+    // in a second pass, purely because the walk borrows `old.chunks`
+    // while `push_free` wants `&mut old`. That vector reached 64k entries
+    // a minor on the closures row — about a megabyte, grown from empty,
+    // written once and read once. Snapshotting the chunk bounds (a
+    // handful of entries) borrows nothing, so the walk can free inline.
     let n = heap.old.chunks.len();
-    let mut to_free: Vec<(Ref, usize)> = Vec::new();
-    for ci in heap.old.born_chunk..n {
-        let (base, top) = (heap.old.chunks[ci].base, heap.old.chunks[ci].top);
-        let mut a = if ci == heap.old.born_chunk { heap.old.born_from.max(base) } else { base };
+    let bounds: Vec<(usize, usize)> = (heap.old.born_chunk..n)
+        .map(|ci| {
+            let c = &heap.old.chunks[ci];
+            let from = if ci == heap.old.born_chunk {
+                heap.old.born_from.max(c.base)
+            } else {
+                c.base
+            };
+            (from, c.top)
+        })
+        .collect();
+    let mut freed = 0usize;
+    for (from, top) in bounds {
+        let mut a = from;
         while a < top {
             let mt = meta_at(a as Ref);
             let words = size_words(mt);
             debug_assert!(words >= 2, "corrupt cell at {a:#x}");
+            // `words` is read before the header is overwritten, and
+            // freeing a cell never touches the next one's header
+            a += words * 8;
             if mt & M_AGED == 0 && kind_of(mt) != K_FREE {
                 if mt & M_MARK != 0 {
                     *promoted += 1;
-                    *promoted_bytes += age(a as Ref, mt);
+                    *promoted_bytes += age((a - words * 8) as Ref, mt);
                 } else {
-                    to_free.push((a as Ref, words));
+                    heap.old.push_free((a - words * 8) as Ref, words);
+                    freed += 1;
                 }
             }
-            a += words * 8;
         }
-    }
-    let freed = to_free.len();
-    for (a, words) in to_free {
-        heap.old.push_free(a, words);
     }
     freed
 }
