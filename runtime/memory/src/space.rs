@@ -274,7 +274,31 @@ impl BornBuf {
     pub fn is_full(&self) -> bool {
         self.len >= self.cap
     }
+    /// Double the log, up to `BORN_CAP_MAX`, keeping what it holds.
+    ///
+    /// Allocating the maximum up front instead costs every realm the
+    /// whole buffer: `parallel.map` builds one heap per worker, and a
+    /// 3ms mandelbrot spent 31% of itself on buffers its workers never
+    /// filled. Growing only where the log is actually the binding
+    /// collection trigger keeps that off the short-lived realms.
+    pub fn grow(&mut self) -> bool {
+        if self.cap >= BORN_CAP_MAX {
+            return false;
+        }
+        let cap = (self.cap * 2).min(BORN_CAP_MAX);
+        let mut store = vec![0u64; cap].into_boxed_slice();
+        store[..self.len].copy_from_slice(&self._store[..self.len]);
+        self.ptr = store.as_mut_ptr();
+        self.cap = cap;
+        self._store = store;
+        true
+    }
 }
+
+/// Ceiling for `BornBuf::grow`. Past this the born log stops being the
+/// binding trigger — a closure-heavy loop's minors plateau here and
+/// `young_full` takes over — so there is nothing to gain above it.
+pub const BORN_CAP_MAX: usize = 512 << 10;
 
 impl Drop for Old {
     fn drop(&mut self) {

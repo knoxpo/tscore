@@ -299,6 +299,16 @@ impl Realm {
     }
 
     pub fn maybe_gc(&mut self) {
+        // The born log filling is a collection trigger, not a limit: when
+        // it is the thing forcing minors, widen it instead of collecting
+        // more often. A closure-heavy loop collected 88 times against the
+        // 21 the same churn in objects needed, purely because old-space
+        // free-list allocation fills this log ~6x sooner than the nursery
+        // budget. Growing is per-realm and on demand, so workers that
+        // never fill it never pay for it.
+        if self.gc_enabled && self.heap.born_buf.is_full() {
+            self.heap.born_buf.grow();
+        }
         if self.gc_enabled && self.heap.needs_gc() {
             let extra: Vec<Value> = self
                 .microtasks
